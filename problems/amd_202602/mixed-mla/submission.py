@@ -976,6 +976,8 @@ def _pytorch_mla_attention(
 
 def custom_kernel(data: input_t) -> output_t:
     """Dispatch to the appropriate kernel based on QKV_DTYPE."""
+    global HAS_HIP_KERNEL
+
     q, kv_data, qo_indptr, kv_indptr, config = data
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
@@ -988,11 +990,13 @@ def custom_kernel(data: input_t) -> output_t:
     elif batch_size == 32:
       if kv_seq_len <= 1024:
         qkv_type = "mxfp4_native"
+        HAS_HIP_KERNEL = False
       else:
         qkv_type = "mxfp4_dequant"
     elif batch_size == 64:
       if kv_seq_len <= 1024:
         qkv_type = "mxfp4_native"
+        HAS_HIP_KERNEL = False
       else:
         qkv_type = "mxfp4_dequant"
     elif batch_size == 256:
