@@ -1522,26 +1522,24 @@ def custom_kernel(data: input_t) -> output_t:
     qkv_type = QKV_DTYPE
     if batch_size == 4:
       if kv_seq_len <= 1024:
-        qkv_type = "mxfp4_native"
+        qkv_type = "bf16"
       else:
-        qkv_type = "mxfp4_native"
+        qkv_type = "fp8"
     elif batch_size == 32:
       if kv_seq_len <= 1024:
-        qkv_type = "mxfp4_native"
-        HAS_HIP_KERNEL = False
+        qkv_type = "bf16"
       else:
-        qkv_type = "mxfp4_native"
+        qkv_type = "fp8"
     elif batch_size == 64:
       if kv_seq_len <= 1024:
-        qkv_type = "mxfp4_native"
-        HAS_HIP_KERNEL = False
+        qkv_type = "bf16"
       else:
-        qkv_type = "mxfp4_native"
+        qkv_type = "fp8"
     elif batch_size == 256:
       if kv_seq_len <= 1024:
-        qkv_type = "mxfp4_dequant"
+        qkv_type = "fp8"
       else:
-        qkv_type = "mxfp4_dequant"
+        qkv_type = "fp8"
 
     if qkv_type == "fp8":
         return custom_kernel_fp8(data)
