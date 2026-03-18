@@ -241,6 +241,9 @@ def custom_kernel(data: input_t) -> output_t:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
     from aiter.utility.fp4_utils import e8m0_shuffle
 
+    PROFILE = False  # Set to False for final benchmarks
+    PROFILE_INTERVAL = 100  # Print every N calls per shape
+
     A, B, B_q, B_shuffle, B_scale_sh = data
     A = A.contiguous()
     m, k = A.shape
@@ -248,7 +251,17 @@ def custom_kernel(data: input_t) -> output_t:
 
     if HAS_HIP_KERNEL:
         try:
-            # Exact same quantization as reference
+            if PROFILE:
+                if not hasattr(custom_kernel, '_stats'):
+                    custom_kernel._stats = {}
+                shape_key = (m, n, k)
+                if shape_key not in custom_kernel._stats:
+                    custom_kernel._stats[shape_key] = {'quant': 0.0, 'gemm': 0.0, 'count': 0}
+                start = torch.cuda.Event(enable_timing=True)
+                mid = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+
             x_fp4, bs_e8m0 = dynamic_mxfp4_quant(A)
             bs_e8m0 = e8m0_shuffle(bs_e8m0)
             A_q = x_fp4.view(dtypes.fp4x2)
@@ -258,17 +271,37 @@ def custom_kernel(data: input_t) -> output_t:
             A_sc = A_scale_sh.view(torch.uint8).contiguous()
             B_data = B_q.view(torch.uint8).contiguous()
             B_sc = B_scale_sh.view(torch.uint8).contiguous()
-
             K_half = k // 2
             num_blocks = (k + 31) // 32
+            scaleN = ((num_blocks + 7) // 8) * 8
 
-            return _hip_module.mfma_gemm(
+            if PROFILE:
+                mid.record()
+
+            out = _hip_module.mfma_gemm(
                 A_data, B_data, A_sc, B_sc,
-                m, n, k, K_half, num_blocks, num_blocks)
-        except Exception as e:
-            print(f"[mxfp4-mm] MFMA kernel failed: {e}")
+                m, n, k, K_half, num_blocks, scaleN)
 
-    # Fallback (same as reference)
+            if PROFILE:
+                end.record()
+                torch.cuda.synchronize()
+                s = custom_kernel._stats[shape_key]
+                s['quant'] += start.elapsed_time(mid)
+                s['gemm'] += mid.elapsed_time(end)
+                s['count'] += 1
+                if s['count'] % PROFILE_INTERVAL == 0:
+                    cnt = s['count']
+                    print(f"[PROFILE] m={m:4d} n={n:4d} k={k:4d} | "
+                          f"quant={s['quant']/cnt*1000:.1f}us  "
+                          f"gemm={s['gemm']/cnt*1000:.1f}us  "
+                          f"total={(s['quant']+s['gemm'])/cnt*1000:.1f}us  "
+                          f"(avg over {cnt} calls)", flush=True)
+
+            return out
+        except Exception as e:
+            print(f"[mxfp4-mm] MFMA kernel failed: {e}", flush=True)
+
+    # Fallback
     x_fp4, bs_e8m0 = dynamic_mxfp4_quant(A)
     bs_e8m0 = e8m0_shuffle(bs_e8m0)
     A_q = x_fp4.view(dtypes.fp4x2)
