@@ -1,7 +1,7 @@
 """
-FP4 GEMM using hardware MFMA instruction v_mfma_scale_f32_32x32x64_f8f6f4.
-A quantization done by aiter (exact match). GEMM via AMD gfx950 matrix cores.
-Uses pre-quantized B_q + B_scale_sh from input.
+FP4 GEMM using hardware MFMA. Optimized: no e8m0_shuffle, no unnecessary copies.
+A scales read with explicit strides (column-major from dynamic_mxfp4_quant).
+B scales read with shuffled offset (from input).
 """
 import torch
 from task import input_t, output_t
@@ -13,82 +13,48 @@ MXFP4_HIP_SOURCE = b'''
 #include <cstdint>
 #include <cmath>
 
-// Format code for FP4 E2M1 in mfma_scale instruction
 constexpr int FMT_FP4 = 4;
 constexpr int TILE_M = 32;
 constexpr int TILE_N = 32;
-constexpr int TILE_K = 64;  // 64 FP4 elements = 2 MXFP4 blocks per MFMA call
 constexpr int WARP_SIZE = 64;
 
-// Shuffled scale offset matching aiter SHUFFLE=True layout
 __device__ __forceinline__ int sh_scale_off(int row, int col, int scaleN) {
-    return (row % 32) / 16
-         + (col % 8) / 4 * 2
-         + (row % 16)    * 4
-         + (col % 4)     * 64
-         + (col / 8)     * 256
-         + (row / 32)    * 32 * scaleN;
+    return (row%32)/16
+         + (col%8)/4 * 2
+         + (row%16)  * 4
+         + (col%4)   * 64
+         + (col/8)   * 256
+         + (row/32)  * 32 * scaleN;
 }
 
-// Pack 4 E8M0 scale bytes into int32
-__device__ __forceinline__ int32_t pack_scales_4(uint8_t s0, uint8_t s1,
-                                                  uint8_t s2, uint8_t s3) {
-    return (int32_t)s0 | ((int32_t)s1 << 8) |
-           ((int32_t)s2 << 16) | ((int32_t)s3 << 24);
-}
-
-// =================================================================
-// MFMA-based FP4 GEMM kernel
-//
-// Uses v_mfma_scale_f32_32x32x64_f8f6f4 hardware instruction.
-// Both A and B are pre-quantized MXFP4 (by aiter) with shuffled scales.
-//
-// Grid: (ceil(M/32), ceil(N/32))   Block: (64,) = one wavefront
-//
-// Per MFMA call: processes 64 FP4 elements along K = 2 MXFP4 blocks.
-//   A operand: 4 x i32 (128 bits = 32 FP4 values per lane, zero-padded to 8xi32)
-//   B operand: 4 x i32 (128 bits = 32 FP4 values per lane, zero-padded to 8xi32)
-//   C accumulator: 16 x float per thread (32x32 tile across 64 threads)
-//   Scales: E8M0 passed via mfma_scale instruction natively
-// =================================================================
 __global__ void mfma_fp4_gemm(
-    const uint8_t* __restrict__ A_data,    // [M, K_half] packed FP4
-    const uint8_t* __restrict__ B_data,    // [N, K_half] packed FP4
-    const uint8_t* __restrict__ A_scale,   // shuffled E8M0 scales
-    const uint8_t* __restrict__ B_scale,   // shuffled E8M0 scales
-    hip_bfloat16* __restrict__ C,          // [M, N]
+    const uint8_t* __restrict__ A_data,
+    const uint8_t* __restrict__ B_data,
+    const uint8_t* __restrict__ A_scale,
+    const uint8_t* __restrict__ B_scale,
+    hip_bfloat16* __restrict__ C,
     const int M, const int N, const int K,
     const int K_half,
     const int num_blocks,
-    const int scaleN
+    const int scaleN,
+    const int a_scale_stride0,
+    const int a_scale_stride1
 ) {
     const int tile_m = blockIdx.x * TILE_M;
     const int tile_n = blockIdx.y * TILE_N;
-    const int lane = threadIdx.x;  // 0..63 within wavefront
+    const int lane = threadIdx.x;
 
-    // Accumulator: 16 floats per thread for the 32x32 output tile
     typedef float __attribute__((ext_vector_type(16))) float16_t;
-    float16_t acc = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    float16_t acc = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
-    // Number of MFMA iterations along K (each processes 64 FP4 = 2 blocks of 32)
     const int k_iters = (num_blocks + 1) / 2;
-
-    // MFMA input/output vector types
-    typedef int __attribute__((ext_vector_type(8))) int8_t_vec;
+    typedef int __attribute__((ext_vector_type(8))) int8_vec;
 
     for (int ki = 0; ki < k_iters; ki++) {
-        const int blk0 = ki * 2;       // first MXFP4 block index
-        const int blk1 = ki * 2 + 1;   // second MXFP4 block index
+        const int blk0 = ki * 2;
 
-        // --- Load A operand ---
-        // For v_mfma_f32_32x32x64 with FP4:
-        //   A is [32 rows, 64 cols] of FP4 values
-        //   Each of 64 lanes loads 4 dwords = 16 bytes = 32 FP4 values
-        //   Lane mapping: lane -> (row, k_offset)
-        //     row = lane % 32
-        //     k_group = lane / 32  (0 or 1, selects which 32 of the 64 FP4)
         int a_row = lane % 32;
-        int a_k_group = lane / 32;  // 0 or 1
+        int a_k_group = lane / 32;
         int a_m = tile_m + a_row;
         int a_blk = blk0 + a_k_group;
 
@@ -101,15 +67,14 @@ __global__ void mfma_fp4_gemm(
             a_reg[3] = *reinterpret_cast<const uint32_t*>(&A_data[a_off + 12]);
         }
 
-        // A scale (shuffled layout)
-        uint8_t a_e8m0 = 127;  // neutral
+        // A scale: linear layout with explicit strides (handles column-major)
+        uint8_t a_e8m0 = 127;
         if (a_m < M && a_blk < num_blocks) {
-            a_e8m0 = A_scale[sh_scale_off(a_m, a_blk, scaleN)];
+            a_e8m0 = A_scale[a_m * a_scale_stride0 + a_blk * a_scale_stride1];
         }
-        int32_t a_scale_packed = pack_scales_4(a_e8m0, a_e8m0, a_e8m0, a_e8m0);
+        int32_t a_sc = (int32_t)a_e8m0 | ((int32_t)a_e8m0 << 8)
+                      | ((int32_t)a_e8m0 << 16) | ((int32_t)a_e8m0 << 24);
 
-        // --- Load B operand ---
-        // Same lane mapping but for B[N, K]
         int b_row = lane % 32;
         int b_k_group = lane / 32;
         int b_n = tile_n + b_row;
@@ -124,38 +89,29 @@ __global__ void mfma_fp4_gemm(
             b_reg[3] = *reinterpret_cast<const uint32_t*>(&B_data[b_off + 12]);
         }
 
-        // B scale (shuffled layout)
+        // B scale: shuffled layout
         uint8_t b_e8m0 = 127;
         if (b_n < N && b_blk < num_blocks) {
             b_e8m0 = B_scale[sh_scale_off(b_n, b_blk, scaleN)];
         }
-        int32_t b_scale_packed = pack_scales_4(b_e8m0, b_e8m0, b_e8m0, b_e8m0);
+        int32_t b_sc = (int32_t)b_e8m0 | ((int32_t)b_e8m0 << 8)
+                      | ((int32_t)b_e8m0 << 16) | ((int32_t)b_e8m0 << 24);
 
-        // --- Zero-pad 4xi32 -> 8xi32 for the builtin ---
-        int8_t_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
-                            0, 0, 0, 0};
-        int8_t_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                            0, 0, 0, 0};
+        int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
+                          0, 0, 0, 0};
+        int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                          0, 0, 0, 0};
 
-        // --- Issue MFMA ---
-        // cbsz=4 (A=fp4), blgp=4 (B=fp4)
-        // opsel=0: use byte 0 of the packed scale
         acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
             a_vec, b_vec, acc,
             FMT_FP4, FMT_FP4,
-            0, a_scale_packed,
-            0, b_scale_packed
+            0, a_sc,
+            0, b_sc
         );
     }
 
-    // --- Write output ---
-    // CDNA 32x32 MFMA output register mapping (64 threads, 16 values each):
-    //   For each accumulator value acc[i]:
-    //     col = lane % 32
-    //     row = (i % 4) + 4 * (lane / 32) + 8 * (i / 4)
     int col = lane % 32;
-    int half = lane / 32;  // 0 or 1
-
+    int half = lane / 32;
     for (int i = 0; i < 16; i++) {
         int row = (i % 4) + 4 * half + 8 * (i / 4);
         int gm = tile_m + row;
@@ -174,17 +130,18 @@ MXFP4_CPP_SOURCE = r'''
 #include <ATen/hip/HIPContext.h>
 
 torch::Tensor mfma_gemm(
-    torch::Tensor A_data,    // [M, K_half] uint8
-    torch::Tensor B_data,    // [N, K_half] uint8
-    torch::Tensor A_scale,   // shuffled uint8
-    torch::Tensor B_scale,   // shuffled uint8
-    int M, int N, int K, int K_half, int num_blocks, int scaleN
+    torch::Tensor A_data,
+    torch::Tensor B_data,
+    torch::Tensor A_scale,
+    torch::Tensor B_scale,
+    int M, int N, int K, int K_half, int num_blocks, int scaleN,
+    int a_scale_stride0, int a_scale_stride1
 ) {
     auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kBFloat16).device(A_data.device()));
 
     dim3 grid((M + 31) / 32, (N + 31) / 32);
-    dim3 block(64);  // one wavefront per tile
+    dim3 block(64);
 
     hipLaunchKernelGGL(mfma_fp4_gemm,
         grid, block, 0, 0,
@@ -193,7 +150,8 @@ torch::Tensor mfma_gemm(
         reinterpret_cast<const uint8_t*>(A_scale.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
         reinterpret_cast<hip_bfloat16*>(C.data_ptr()),
-        M, N, K, K_half, num_blocks, scaleN);
+        M, N, K, K_half, num_blocks, scaleN,
+        a_scale_stride0, a_scale_stride1);
 
     return C;
 }
@@ -219,7 +177,7 @@ def _try_compile():
         src = MXFP4_HIP_SOURCE.decode('utf-8') + '\n' + MXFP4_CPP_SOURCE
         t0 = time.time()
         _hip_module = load_inline(
-            name='mxfp4_mfma_v2', cpp_sources='', cuda_sources=[src],
+            name='mxfp4_mfma_v3', cpp_sources='', cuda_sources=[src],
             extra_cflags=['-O3'], extra_cuda_cflags=['-O3', '--offload-arch=gfx950'],
             extra_include_paths=[f'{rocm_home}/include'], verbose=True)
         print(f"[mxfp4-mm] MFMA kernel compiled in {time.time()-t0:.1f}s")
@@ -241,8 +199,8 @@ def custom_kernel(data: input_t) -> output_t:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
     from aiter.utility.fp4_utils import e8m0_shuffle
 
-    PROFILE = False  # Set to False for final benchmarks
-    PROFILE_INTERVAL = 100  # Print every N calls per shape
+    PROFILE = False
+    PROFILE_INTERVAL = 200
 
     A, B, B_q, B_shuffle, B_scale_sh = data
     A = A.contiguous()
@@ -262,25 +220,30 @@ def custom_kernel(data: input_t) -> output_t:
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
 
+            # Quantize A — NO e8m0_shuffle, kernel reads linear scales
             x_fp4, bs_e8m0 = dynamic_mxfp4_quant(A)
-            bs_e8m0 = e8m0_shuffle(bs_e8m0)
-            A_q = x_fp4.view(dtypes.fp4x2)
-            A_scale_sh = bs_e8m0.view(dtypes.fp8_e8m0)
 
-            A_data = A_q.view(torch.uint8).contiguous()
-            A_sc = A_scale_sh.view(torch.uint8).contiguous()
-            B_data = B_q.view(torch.uint8).contiguous()
-            B_sc = B_scale_sh.view(torch.uint8).contiguous()
+            # Direct views — no copies
+            A_data = x_fp4.view(torch.uint8)
+            A_sc = bs_e8m0  # uint8, transposed (column-major), NOT shuffled
+            B_data = B_q.view(torch.uint8)
+            B_sc = B_scale_sh.view(torch.uint8)
+
             K_half = k // 2
             num_blocks = (k + 31) // 32
             scaleN = ((num_blocks + 7) // 8) * 8
+
+            # Pass A scale strides so kernel handles column-major layout
+            a_s0 = A_sc.stride(0)
+            a_s1 = A_sc.stride(1)
 
             if PROFILE:
                 mid.record()
 
             out = _hip_module.mfma_gemm(
                 A_data, B_data, A_sc, B_sc,
-                m, n, k, K_half, num_blocks, scaleN)
+                m, n, k, K_half, num_blocks, scaleN,
+                a_s0, a_s1)
 
             if PROFILE:
                 end.record()
@@ -301,10 +264,10 @@ def custom_kernel(data: input_t) -> output_t:
         except Exception as e:
             print(f"[mxfp4-mm] MFMA kernel failed: {e}", flush=True)
 
-    # Fallback
-    x_fp4, bs_e8m0 = dynamic_mxfp4_quant(A)
-    bs_e8m0 = e8m0_shuffle(bs_e8m0)
-    A_q = x_fp4.view(dtypes.fp4x2)
-    A_scale_sh = bs_e8m0.view(dtypes.fp8_e8m0)
-    return aiter.gemm_a4w4(A_q, B_shuffle, A_scale_sh, B_scale_sh,
-                           dtype=dtypes.bf16, bpreshuffle=True)
+    # # Fallback
+    # x_fp4, bs_e8m0 = dynamic_mxfp4_quant(A)
+    # bs_e8m0 = e8m0_shuffle(bs_e8m0)
+    # A_q = x_fp4.view(dtypes.fp4x2)
+    # A_scale_sh = bs_e8m0.view(dtypes.fp8_e8m0)
+    # return aiter.gemm_a4w4(A_q, B_shuffle, A_scale_sh, B_scale_sh,
+    #                        dtype=dtypes.bf16, bpreshuffle=True)
