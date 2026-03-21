@@ -18,6 +18,7 @@ constexpr int FMT_FP4 = 4;
 typedef float __attribute__((ext_vector_type(16))) float16_t;
 typedef float __attribute__((ext_vector_type(4))) float4_t;
 typedef int __attribute__((ext_vector_type(8))) int8_vec;
+typedef uint32_t __attribute__((ext_vector_type(4))) uint128_vec;
 
 // =====================================================================
 // Addressing helpers
@@ -47,17 +48,17 @@ template <int M, int K, int OUTER_M, int OUTER_K, int BLOCK_SIZE>
 __device__ __forceinline__ void quantize_a_to_reg(
     const hip_bfloat16* __restrict__ A,
     int outer_m, int tid,
-    uint32_t* data_regs, uint8_t* scale_regs
+    uint32_t* data_regs, uint8_t* scale_regs,
+    int k_offset
 ) {
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
 
-    int bi = 0;
-    for (int b = tid; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+    for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
         int row = b / OK_BLOCKS;
         int blk = b % OK_BLOCKS;
         int g_m = outer_m + row;
-        int g_k = blk * 32;
+        int g_k = k_offset + blk * 32;
         bool valid = (g_m < M);
 
         // Read 32 BF16 values, find max absolute
@@ -141,10 +142,7 @@ __device__ __forceinline__ void quantize_a_to_reg(
             pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
         }
 
-        data_regs[bi * 4 + 0] = pack[0];
-        data_regs[bi * 4 + 1] = pack[1];
-        data_regs[bi * 4 + 2] = pack[2];
-        data_regs[bi * 4 + 3] = pack[3];
+        *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) = *reinterpret_cast<uint128_vec*>(&pack);
         scale_regs[bi] = e8m0;
     }
 }
@@ -159,17 +157,12 @@ __device__ __forceinline__ void store_quant_a_to_lds(
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
 
-    int bi = 0;
-    for (int b = tid; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+    for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
         int row = b / OK_BLOCKS;
         int blk = b % OK_BLOCKS;
         int data_off = row * OK_HALF + blk * 16;
 
-        *reinterpret_cast<uint32_t*>(&smem_data[data_off + 0])  = data_regs[bi * 4 + 0];
-        *reinterpret_cast<uint32_t*>(&smem_data[data_off + 4])  = data_regs[bi * 4 + 1];
-        *reinterpret_cast<uint32_t*>(&smem_data[data_off + 8])  = data_regs[bi * 4 + 2];
-        *reinterpret_cast<uint32_t*>(&smem_data[data_off + 12]) = data_regs[bi * 4 + 3];
-
+        *reinterpret_cast<uint128_vec*>(&smem_data[data_off]) = *reinterpret_cast<const uint128_vec*>(&data_regs[bi * 4]);
         smem_scale[row * OK_BLOCKS + blk] = scale_regs[bi];
     }
 }
@@ -186,7 +179,7 @@ __device__ __forceinline__ void quantize_a_to_lds(
     uint8_t  scale_regs[Q::SCALE_REGS];
 
     quantize_a_to_reg<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>(
-        A, outer_m, tid, data_regs, scale_regs);
+        A, outer_m, tid, data_regs, scale_regs, 0);
 
     store_quant_a_to_lds<OUTER_M, OUTER_K, BLOCK_SIZE>(
         smem_data, smem_scale, tid, data_regs, scale_regs);
@@ -201,18 +194,14 @@ __device__ __forceinline__ int32_t broadcast_scale(uint8_t e8m0) {
 // =====================================================================
 
 template <int IM, int IN, int IK>
-struct MfmaTraits;
-
-// 32x32x64: 16 acc floats, 4xi32 input (zero-padded to 8)
-template <>
-struct MfmaTraits<32, 32, 64> {
-    using acc_t = float16_t;
-    static constexpr int ACC_SIZE = 16;
-    static constexpr int BLOCKS_PER_CALL = 2;   // 64 FP4 / 32
-    static constexpr int REGS = 4;
+struct MfmaTraits {
+    using acc_t = typename std::conditional<IM == 32, float16_t, float4_t>::type;
+    static constexpr int ACC_SIZE = (IM == 32) ? 16 : 4;
+    static constexpr int BLOCKS_PER_CALL = IK / 32;
+    static constexpr int REGS = (IM == 32) ? 4 : 8;
 
     static __device__ __forceinline__ acc_t zero_acc() {
-        return {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        return acc_t{};
     }
 
     static __device__ __forceinline__ acc_t mfma(
@@ -220,106 +209,76 @@ struct MfmaTraits<32, 32, 64> {
         uint32_t b_reg[REGS], int32_t b_sc,
         acc_t acc
     ) {
-        int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
-                          0, 0, 0, 0};
-        int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                          0, 0, 0, 0};
-        return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
-            a_vec, b_vec, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
+        if constexpr (IM == 32) {
+            int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
+                              0, 0, 0, 0};
+            int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                              0, 0, 0, 0};
+            return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+                a_vec, b_vec, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
+        } else {
+            int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
+                              (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
+            int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                              (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+            return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                a_vec, b_vec, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
+        }
     }
 
     static __device__ __forceinline__ void store(
         hip_bfloat16* C, const acc_t& acc,
         int tile_m, int tile_n, int lane, int M, int N
     ) {
-        int col = lane % 32;
-        int half = lane / 32;
-        for (int i = 0; i < 16; i++) {
-            int row = (i % 4) + 4 * half + 8 * (i / 4);
-            int gm = tile_m + row;
-            int gn = tile_n + col;
-            if (gm < M && gn < N)
-                C[gm * N + gn] = static_cast<hip_bfloat16>(acc[i]);
+        if constexpr (IM == 32) {
+            int col = lane % 32;
+            int half = lane / 32;
+            for (int i = 0; i < 16; i++) {
+                int row = (i % 4) + 4 * half + 8 * (i / 4);
+                int gm = tile_m + row;
+                int gn = tile_n + col;
+                if (gm < M && gn < N)
+                    C[gm * N + gn] = static_cast<hip_bfloat16>(acc[i]);
+            }
+        } else {
+            int col = lane % 16;
+            int quad = lane / 16;
+            for (int i = 0; i < 4; i++) {
+                int row = i + 4 * quad;
+                int gm = tile_m + row;
+                int gn = tile_n + col;
+                if (gm < M && gn < N)
+                    C[gm * N + gn] = static_cast<hip_bfloat16>(acc[i]);
+            }
         }
     }
 
-    static __device__ __forceinline__ void load_a(
+    static __device__ __forceinline__ void load(
         const uint8_t* src, int row_base, int blk0, int lane,
-        int k_half_stride, uint32_t reg[4], int& blk_out, int& row_out
+        int k_half_stride, uint32_t reg[REGS], int& blk_out, int& row_out
     ) {
-        row_out = row_base + (lane % 32);
-        int k_group = lane / 32;  // 0 or 1
+        row_out = row_base + (lane % IM);
+        int k_group = lane / IM;
         blk_out = blk0 + k_group;
         int off = row_out * k_half_stride + blk_out * 16;
-        reg[0] = *reinterpret_cast<const uint32_t*>(&src[off + 0]);
-        reg[1] = *reinterpret_cast<const uint32_t*>(&src[off + 4]);
-        reg[2] = *reinterpret_cast<const uint32_t*>(&src[off + 8]);
-        reg[3] = *reinterpret_cast<const uint32_t*>(&src[off + 12]);
-    }
-};
-
-// 16x16x128: 4 acc floats, 8xi32 input (fully used)
-template <>
-struct MfmaTraits<16, 16, 128> {
-    using acc_t = float4_t;
-    static constexpr int ACC_SIZE = 4;
-    static constexpr int BLOCKS_PER_CALL = 4;   // 128 FP4 / 32
-    static constexpr int REGS = 8;
-
-    static __device__ __forceinline__ acc_t zero_acc() {
-        return {0, 0, 0, 0};
-    }
-
-    static __device__ __forceinline__ acc_t mfma(
-        uint32_t a_reg[REGS], int32_t a_sc,
-        uint32_t b_reg[REGS], int32_t b_sc,
-        acc_t acc
-    ) {
-        int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
-                          (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
-        int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                          (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
-        return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-            a_vec, b_vec, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
-    }
-
-    // 16x16 output mapping: each thread holds 4 floats
-    //   col = lane % 16
-    //   row = (i % 4) + 4 * (lane / 16)  (lane/16 = 0..3)
-    static __device__ __forceinline__ void store(
-        hip_bfloat16* C, const acc_t& acc,
-        int tile_m, int tile_n, int lane, int M, int N
-    ) {
-        int col = lane % 16;
-        int quad = lane / 16;  // 0..3
-        for (int i = 0; i < 4; i++) {
-            int row = i + 4 * quad;
-            int gm = tile_m + row;
-            int gn = tile_n + col;
-            if (gm < M && gn < N)
-                C[gm * N + gn] = static_cast<hip_bfloat16>(acc[i]);
+        *reinterpret_cast<uint128_vec*>(&reg[0]) = *reinterpret_cast<const uint128_vec*>(&src[off]);
+        if constexpr (REGS == 8) {
+            *reinterpret_cast<uint128_vec*>(&reg[4]) = 0;
         }
     }
 
-    // Load 32 bytes (8 dwords) = 128 FP4 values from 4 consecutive MXFP4 blocks
-    // Lane mapping for 16x16x128:
-    //   row = lane % 16
-    //   k_group = lane / 16 (0..3, selects which of 4 blocks)
-    static __device__ __forceinline__ void load_a(
+    static __device__ __forceinline__ void load_transposed(
         const uint8_t* src, int row_base, int blk0, int lane,
-        int k_half_stride, uint32_t reg[8], int& blk_out, int& row_out
+        int outer_n, uint32_t reg[REGS], int& blk_out, int& row_out
     ) {
-        row_out = row_base + (lane % 16);
-        int k_group = lane / 16;  // 0..3
+        row_out = row_base + (lane % IM);
+        int k_group = lane / IM;
         blk_out = blk0 + k_group;
-        int off = row_out * k_half_stride + blk_out * 16;
-        reg[0] = *reinterpret_cast<const uint32_t*>(&src[off + 0]);
-        reg[1] = *reinterpret_cast<const uint32_t*>(&src[off + 4]);
-        reg[2] = *reinterpret_cast<const uint32_t*>(&src[off + 8]);
-        reg[3] = *reinterpret_cast<const uint32_t*>(&src[off + 12]);
-        // Remaining 4 dwords: zero (each lane only loads one block of 32 FP4)
-        // The 128 FP4 are distributed across 4 lane groups
-        reg[4] = reg[5] = reg[6] = reg[7] = 0;
+        int off = (blk_out * outer_n + row_out) * 16;
+        *reinterpret_cast<uint128_vec*>(&reg[0]) = *reinterpret_cast<const uint128_vec*>(&src[off]);
+        if constexpr (REGS == 8) {
+            *reinterpret_cast<uint128_vec*>(&reg[4]) = 0;
+        }
     }
 };
 
@@ -337,8 +296,8 @@ __device__ __forceinline__ void load_ab_global(
     using Traits = MfmaTraits<IM, IN, IK>;
     int a_row, a_blk, b_row, b_blk;
 
-    Traits::load_a(A_data, tile_m, blk0, lane, K_HALF,
-                   a_r, a_blk, a_row);
+    Traits::load(A_data, tile_m, blk0, lane, K_HALF,
+                a_r, a_blk, a_row);
     uint8_t a_e = 127;
     if (a_row < M && a_blk < NUM_BLOCKS)
         a_e = A_scale[a_row + a_blk * M];
@@ -346,8 +305,8 @@ __device__ __forceinline__ void load_ab_global(
         for (int r = 0; r < Traits::REGS; r++) a_r[r] = 0;
     a_s = broadcast_scale(a_e);
 
-    Traits::load_a(B_data, tile_n, blk0, lane, K_HALF,
-                   b_r, b_blk, b_row);
+    Traits::load(B_data, tile_n, blk0, lane, K_HALF,
+                b_r, b_blk, b_row);
     uint8_t b_e = 127;
     if (b_row < N && b_blk < NUM_BLOCKS)
         b_e = B_scale[sh_scale_off<SCALE_N>(b_row, b_blk)];
@@ -364,7 +323,7 @@ __device__ __forceinline__ void load_ab_global(
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1>
-__global__ void mfma_fp4_gemm_simple(
+__global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_simple(
     const uint8_t* __restrict__ A_data,
     const uint8_t* __restrict__ B_data,
     const uint8_t* __restrict__ A_scale,
@@ -423,12 +382,15 @@ __global__ void mfma_fp4_gemm_simple(
 
 template <int OUTER_M, int OUTER_N, int OUTER_K>
 struct LdsLayout {
+    static constexpr int LIMIT    = 160 * 1024;
     static constexpr int K_HALF   = OUTER_K / 2;
     static constexpr int K_BLOCKS = OUTER_K / 32;
     static constexpr int A_DATA   = OUTER_M * K_HALF;
     static constexpr int A_SCALE  = OUTER_M * K_BLOCKS;
     static constexpr int B_DATA   = OUTER_N * K_HALF;
     static constexpr int B_SCALE  = OUTER_N * K_BLOCKS;
+    static constexpr int TOTAL    = A_DATA + A_SCALE + B_DATA + B_SCALE;
+    static constexpr int OCCUPANCY= LIMIT / TOTAL;
 };
 
 // ---------- Part 1: Load A from global memory into registers ----------
@@ -586,12 +548,19 @@ __device__ __forceinline__ void store_b_reg_to_lds(
     int di = 0;
     for (int dw = tid; dw < DATA_ELEMS; dw += BLOCK_SIZE, di++) {
         int byte_off = dw * 4;
-        *reinterpret_cast<uint32_t*>(&smem_data[byte_off]) = data_regs[di];
+        int row = byte_off / OK_HALF;
+        int col = byte_off % OK_HALF;
+        int blk = col / 16;
+        int byte_in_blk = col % 16;
+        int lds_off = (blk * OUTER_N + row) * 16 + byte_in_blk;
+        *reinterpret_cast<uint32_t*>(&smem_data[lds_off]) = data_regs[di];
     }
 
     int si = 0;
     for (int s = tid; s < SCALE_ELEMS; s += BLOCK_SIZE, si++) {
-        smem_scale[s] = scale_regs[si];
+        int row = s / OK_BLOCKS;
+        int col = s % OK_BLOCKS;
+        smem_scale[col * OUTER_N + row] = scale_regs[si];
     }
 }
 
@@ -616,7 +585,11 @@ __device__ __forceinline__ void load_b_to_lds(
         uint32_t val = 0;
         if (g_n < N && g_col + 3 < K_HALF)
             val = *reinterpret_cast<const uint32_t*>(&B_data[g_n * K_HALF + g_col]);
-        *reinterpret_cast<uint32_t*>(&smem_data[byte_off]) = val;
+        // Block-transposed: [blk][row][16 bytes]
+        int blk = col / 16;
+        int byte_in_blk = col % 16;
+        int lds_off = (blk * OUTER_N + row) * 16 + byte_in_blk;
+        *reinterpret_cast<uint32_t*>(&smem_data[lds_off]) = val;
     }
 
     for (int s = tid; s < OUTER_N * OK_BLOCKS; s += BLOCK_SIZE) {
@@ -627,11 +600,12 @@ __device__ __forceinline__ void load_b_to_lds(
         uint8_t val = 127;
         if (g_n < N && g_blk < NUM_BLOCKS)
             val = B_scale[sh_scale_off<SCALE_N>(g_n, g_blk)];
-        smem_scale[s] = val;
+        // Transposed: [blk][row]
+        smem_scale[col * OUTER_N + row] = val;
     }
 }
 
-template <int OUTER_K, int IM, int IN, int IK,
+template <int OUTER_K, int OUTER_N, int IM, int IN, int IK,
           int WARP_TILES_M = 1, int WARP_TILES_N = 1>
 __device__ __forceinline__ void inner_mfma_loop(
     const uint8_t* smem_a_data, const uint8_t* smem_a_scale,
@@ -653,7 +627,7 @@ __device__ __forceinline__ void inner_mfma_loop(
             for (int wt_m = 0; wt_m < WARP_TILES_M; wt_m++) {
                 uint32_t a_reg[Traits::REGS];
                 int a_row, a_blk;
-                Traits::load_a(smem_a_data,
+                Traits::load(smem_a_data,
                     (warp_m * WARP_TILES_M + wt_m) * IM,
                     blk0, lane, OK_HALF, a_reg, a_blk, a_row);
                 int32_t a_sc = broadcast_scale(
@@ -662,11 +636,11 @@ __device__ __forceinline__ void inner_mfma_loop(
                 for (int wt_n = 0; wt_n < WARP_TILES_N; wt_n++) {
                     uint32_t b_reg[Traits::REGS];
                     int b_row, b_blk;
-                    Traits::load_a(smem_b_data,
+                    Traits::load_transposed(smem_b_data,
                         (warp_n * WARP_TILES_N + wt_n) * IN,
-                        blk0, lane, OK_HALF, b_reg, b_blk, b_row);
+                        blk0, lane, OUTER_N, b_reg, b_blk, b_row);
                     int32_t b_sc = broadcast_scale(
-                        smem_b_scale[b_row * OK_BLOCKS + b_blk]);
+                        smem_b_scale[b_blk * OUTER_N + b_row]);
 
                     acc[wt_m][wt_n] = Traits::mfma(
                         a_reg, a_sc, b_reg, b_sc, acc[wt_m][wt_n]);
@@ -677,16 +651,16 @@ __device__ __forceinline__ void inner_mfma_loop(
             for (int wt_n = 0; wt_n < WARP_TILES_N; wt_n++) {
                 uint32_t b_reg[Traits::REGS];
                 int b_row, b_blk;
-                Traits::load_a(smem_b_data,
+                Traits::load_transposed(smem_b_data,
                     (warp_n * WARP_TILES_N + wt_n) * IN,
-                    blk0, lane, OK_HALF, b_reg, b_blk, b_row);
+                    blk0, lane, OUTER_N, b_reg, b_blk, b_row);
                 int32_t b_sc = broadcast_scale(
-                    smem_b_scale[b_row * OK_BLOCKS + b_blk]);
+                    smem_b_scale[b_blk * OUTER_N + b_row]);
 
                 for (int wt_m = 0; wt_m < WARP_TILES_M; wt_m++) {
                     uint32_t a_reg[Traits::REGS];
                     int a_row, a_blk;
-                    Traits::load_a(smem_a_data,
+                    Traits::load(smem_a_data,
                         (warp_m * WARP_TILES_M + wt_m) * IM,
                         blk0, lane, OK_HALF, a_reg, a_blk, a_row);
                     int32_t a_sc = broadcast_scale(
@@ -705,12 +679,15 @@ __device__ __forceinline__ void inner_mfma_loop(
 // Tiled kernel: multi-wavefront, LDS-backed
 // =====================================================================
 
-template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
+template <int WARPS, int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
           int OUTER_M, int OUTER_N, int OUTER_K,
           int IM, int IN, int IK,
           int WARP_TILES_M = 1, int WARP_TILES_N = 1,
-          bool FUSE_A_QUANT = false>
-__global__ void mfma_fp4_gemm_tiled(
+          bool FUSE_A_QUANT = false, int BUFFERS = 1,
+          int OCCUPANCY = -1>
+__global__ void
+__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? (LdsLayout<OUTER_M, OUTER_N, OUTER_K>::OCCUPANCY) / BUFFERS : OCCUPANCY)
+mfma_fp4_gemm_tiled(
     const uint8_t* __restrict__ A_data,
     const uint8_t* __restrict__ B_data,
     const uint8_t* __restrict__ A_scale,
@@ -718,15 +695,16 @@ __global__ void mfma_fp4_gemm_tiled(
     hip_bfloat16* __restrict__ C,
     const hip_bfloat16* __restrict__ A_bf16
 ) {
+    constexpr int WARPS_M = OUTER_M / (IM * WARP_TILES_M);
+    constexpr int WARPS_N = OUTER_N / (IN * WARP_TILES_N);
+    static_assert(WARPS == WARPS_M * WARPS_N);
+
     using Traits = MfmaTraits<IM, IN, IK>;
     using Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K>;
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int K = K_HALF * 2;
     constexpr int OUTER_K_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
-    constexpr int WARPS_M = OUTER_M / (IM * WARP_TILES_M);
-    constexpr int WARPS_N = OUTER_N / (IN * WARP_TILES_N);
-    constexpr int WARPS = WARPS_M * WARPS_N;
     constexpr int BLOCK_SIZE = WARPS * 64;
     constexpr int A_DATA_ELEMS = OUTER_M * OK_HALF / 4;
     constexpr int A_DATA_PER_THREAD = (A_DATA_ELEMS + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -736,8 +714,6 @@ __global__ void mfma_fp4_gemm_tiled(
     constexpr int B_DATA_PER_THREAD = (B_DATA_ELEMS + BLOCK_SIZE - 1) / BLOCK_SIZE;
     constexpr int B_SCALE_ELEMS = OUTER_N * OK_BLOCKS;
     constexpr int B_SCALE_PER_THREAD = (B_SCALE_ELEMS + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    constexpr int TOTAL_SHARED = Lds::A_DATA + Lds::A_SCALE + Lds::B_DATA + Lds::B_SCALE;
-    constexpr int BUFFERS = TOTAL_SHARED > 80 * 1024 ? 1 : 2;
 
     const int outer_m = __builtin_amdgcn_readfirstlane(blockIdx.x * OUTER_M);
     const int outer_n = __builtin_amdgcn_readfirstlane(blockIdx.y * OUTER_N);
@@ -795,8 +771,7 @@ __global__ void mfma_fp4_gemm_tiled(
             // Quantize next A tile directly into next buffer
             // (only works cleanly with BUFFERS==2; for BUFFERS==1 need register staging)
             quantize_a_to_reg<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>(
-                A_bf16 + next_ok * (OUTER_K / 2) * 0 /*not applicable when OUTER_K==K*/,
-                outer_m, tid, data_regs, scale_regs);
+                A_bf16, outer_m, tid, data_regs, scale_regs, next_ok * OUTER_K);
         } else {
             load_a_global_to_reg<M, K_HALF, NUM_BLOCKS, OUTER_M, OUTER_K, BLOCK_SIZE>(
                 A_data, A_scale,
@@ -809,7 +784,7 @@ __global__ void mfma_fp4_gemm_tiled(
             outer_n, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
             b_data_regs, b_scale_regs);
 
-        inner_mfma_loop<OUTER_K, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
+        inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
             smem_a_data[buf], smem_a_scale[buf],
             smem_b_data[buf], smem_b_scale[buf],
             warp_m, warp_n, lane, acc);
@@ -838,7 +813,7 @@ __global__ void mfma_fp4_gemm_tiled(
     }
 
     constexpr auto buf = (OUTER_K_ITERS - 1) % BUFFERS;
-    inner_mfma_loop<OUTER_K, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
+    inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
         smem_a_data[buf], smem_a_scale[buf],
         smem_b_data[buf], smem_b_scale[buf],
         warp_m, warp_n, lane, acc);
@@ -850,45 +825,6 @@ __global__ void mfma_fp4_gemm_tiled(
                 outer_n + (warp_n * WARP_TILES_N + wt_n) * IN,
                 lane, M, N);
 }
-
-// =====================================================================
-// Instantiations
-// =====================================================================
-
-// Instantiation macro
-#define INST_S(M, N, KH, NB, SN, IM, IN, IK, WM, WN) \
-    template __global__ void mfma_fp4_gemm_simple<M,N,KH,NB,SN,IM,IN,IK,WM,WN>( \
-        const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*, hip_bfloat16*);
-
-#define INST_T(M, N, KH, NB, SN, OM, ON, OK, IM, IN, IK, WTM, WTN) \
-    template __global__ void mfma_fp4_gemm_tiled<M,N,KH,NB,SN,OM,ON,OK,IM,IN,IK,WTM,WTN,false>( \
-        const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*, hip_bfloat16*, const hip_bfloat16*);
-
-#define INST_TF(M, N, KH, NB, SN, OM, ON, OK, IM, IN, IK, WTM, WTN) \
-    template __global__ void mfma_fp4_gemm_tiled<M,N,KH,NB,SN,OM,ON,OK,IM,IN,IK,WTM,WTN,true>( \
-        const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*, hip_bfloat16*, const hip_bfloat16*);
-
-
-// Simple 32x32x64: small M, small K
-INST_S(32, 4096, 256, 16, 16,  32, 32, 64, 1, 1)
-INST_S(32, 2880, 256, 16, 16,  32, 32, 64, 1, 1)
-// INST_S(64, 7168, 1024, 64, 64, 32, 32, 64, 1, 2)
-INST_S(256, 3072, 768,  48,  48, 32, 32, 64, 1, 1)
-
-// Simple 16x16x128: small M, large K
-INST_S(4,  2880, 256,  16,  16,   16, 16, 128, 1, 1)
-INST_S(8,  2112, 3584, 224, 224,  16, 16, 128, 1, 1)
-INST_S(16, 2112, 3584, 224, 224,  16, 16, 128, 1, 1)
-INST_S(16, 3072, 768,  48,  48,   16, 16, 128, 1, 1)
-
-// Tiled: larger shapes
-//INST_T(64, 7168, 1024, 64, 64, 32,64,2048, 16, 16, 128, 1, 1)
-INST_TF(64, 7168, 1024, 64, 64, 32, 64, 2048, 16, 16, 128, 1, 1)
-INST_T(64,  3072, 768,  48,  48,  32, 32, 1536,  32, 32, 64, 1, 1)
-INST_T(256, 2880, 256,  16,  16,  128, 128, 512,  32, 32, 64, 1, 1)
-
-#undef INST_S
-#undef INST_T
 '''
 
 MXFP4_CPP_SOURCE = r'''
@@ -916,13 +852,13 @@ void launch_simple(torch::Tensor A, torch::Tensor B,
 
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
           int OM, int ON, int OK, int IM, int IN, int IK,
-          int WTM = 1, int WTN = 1>
+          int WTM = 1, int WTN = 1, int BUFFERS = 1, int OCCUPANCY = -1>
 void launch_tiled(torch::Tensor A, torch::Tensor B,
                   torch::Tensor As, torch::Tensor Bs, torch::Tensor C) {
     constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
     dim3 block(WARPS * 64);
-    hipLaunchKernelGGL((mfma_fp4_gemm_tiled<M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,false>),
+    hipLaunchKernelGGL((mfma_fp4_gemm_tiled<WARPS,M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,false,BUFFERS,OCCUPANCY>),
         grid, block, 0, 0,
         reinterpret_cast<const uint8_t*>(A.data_ptr()),
         reinterpret_cast<const uint8_t*>(B.data_ptr()),
@@ -934,13 +870,13 @@ void launch_tiled(torch::Tensor A, torch::Tensor B,
 
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
           int OM, int ON, int OK, int IM, int IN, int IK,
-          int WTM = 1, int WTN = 1>
+          int WTM = 1, int WTN = 1, int BUFFERS = 1, int OCCUPANCY = -1>
 void launch_tiled_fused(torch::Tensor A_bf16, torch::Tensor B,
                         torch::Tensor Bs, torch::Tensor C) {
     constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
     dim3 block(WARPS * 64);
-    hipLaunchKernelGGL((mfma_fp4_gemm_tiled<M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,true>),
+    hipLaunchKernelGGL((mfma_fp4_gemm_tiled<WARPS,M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,true,BUFFERS,OCCUPANCY>),
         grid, block, 0, 0,
         (const uint8_t*)nullptr,
         reinterpret_cast<const uint8_t*>(B.data_ptr()),
@@ -965,8 +901,8 @@ torch::Tensor mfma_gemm(
     if(M==m&&N==n&&K_half==kh){launch_simple<m,n,kh,nb,sn,32,32,64,wm,wn>(A_data,B_data,A_scale,B_scale,C);return C;}
 #define S16(m,n,kh,nb,sn,wm,wn) \
     if(M==m&&N==n&&K_half==kh){launch_simple<m,n,kh,nb,sn,16,16,128,wm,wn>(A_data,B_data,A_scale,B_scale,C);return C;}
-#define T(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn) \
-    if(M==m&&N==n&&K_half==kh){launch_tiled<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn>(A_data,B_data,A_scale,B_scale,C);return C;}
+#define T(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs) \
+    if(M==m&&N==n&&K_half==kh){launch_tiled<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,A_scale,B_scale,C);return C;}
 
     // Simple 32x32x64
     S32(32, 4096, 256, 16, 16, 1, 1)
@@ -981,8 +917,9 @@ torch::Tensor mfma_gemm(
     S16(16, 3072, 768,  48,  48, 1, 1)
 
     // Tiled
-    T(64,  3072, 768,  48, 48,  32,32,1536, 32,32,64, 1,1)
-    T(256, 2880, 256,  16, 16,  128,128,512, 32,32,64, 1,1)
+    T(64,  3072, 768,  48, 48,  32,32,1536, 32,32,64, 1,1,1)
+    T(256, 2880, 256,  16, 16,  128,128,512, 32,32,64, 1,1,1)
+    T(64, 7168, 1024, 64, 64, 32,64,2048, 16, 16, 128, 1, 1, 1)
 
 #undef S32
 #undef S16
@@ -999,10 +936,12 @@ torch::Tensor mfma_gemm_fused(
     auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kBFloat16).device(A_bf16.device()));
 
-#define F(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn) \
-    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn>(A_bf16,B_data,B_scale,C);return C;}
+#define F(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs) \
+    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_bf16,B_data,B_scale,C);return C;}
+#define F2(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ) \
+    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ>(A_bf16,B_data,B_scale,C);return C;}
 
-    F(64, 7168, 1024, 64, 64, 32,64,2048, 16, 16, 128, 1, 1)
+    //F(64, 7168, 1024, 64, 64, 32,64,2048, 16, 16, 128, 1, 1, 1)
 
 #undef F
 
@@ -1081,7 +1020,7 @@ def custom_kernel(data: input_t) -> output_t:
             scaleN = ((num_blocks + 7) // 8) * 8
 
             # Fused shapes: skip quantization, pass BF16 A directly
-            FUSED_SHAPES = {(64, 7168, 2048)}
+            FUSED_SHAPES = {}#{(64, 7168, 2048)}
             if (m, n, k) in FUSED_SHAPES:
                 out = _hip_module.mfma_gemm_fused(
                     A, B_data, B_sc,
