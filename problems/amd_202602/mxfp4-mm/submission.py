@@ -44,6 +44,78 @@ struct QuantAPerThread {
     static constexpr int SCALE_REGS = BLOCKS_PER_THREAD;
 };
 
+// =====================================================================
+// Reusable FP4 quantization: 32 floats -> 16 packed bytes + E8M0 scale
+// =====================================================================
+
+struct QuantBlock {
+    uint32_t data[4];  // 16 packed bytes (32 FP4 values)
+    uint8_t e8m0;
+};
+
+__device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++)
+        amax = fmaxf(amax, fabsf(vals[i]));
+
+    uint8_t e8m0;
+    float quant_scale;
+    if (amax == 0.0f) {
+        e8m0 = 0;
+        quant_scale = 0.0f;
+    } else {
+        uint32_t amax_bits = __float_as_uint(amax);
+        amax_bits = (amax_bits + 0x200000u) & 0xFF800000u;
+        int raw_exp = (int)((amax_bits >> 23) & 0xFF);
+        int e8m0_unbiased = raw_exp - 127 - 2;
+        e8m0_unbiased = max(-127, min(127, e8m0_unbiased));
+        e8m0 = (uint8_t)(e8m0_unbiased + 127);
+        quant_scale = __uint_as_float((uint32_t)(127 - e8m0_unbiased) << 23);
+    }
+
+    uint32_t pack[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 16; i++) {
+        uint8_t packed = 0;
+        for (int j = 0; j < 2; j++) {
+            float v = vals[2 * i + j];
+            float qx = v * quant_scale;
+
+            uint32_t qx_bits = __float_as_uint(qx);
+            uint32_t sign = qx_bits & 0x80000000u;
+            qx_bits ^= sign;
+            float qx_abs = __uint_as_float(qx_bits);
+
+            uint8_t fp4;
+            if (qx_abs >= 6.0f) {
+                fp4 = 0x7;
+            } else if (qx_abs < 1.0f) {
+                constexpr uint32_t denorm_magic = 149u << 23;
+                float denorm = qx_abs + __uint_as_float(denorm_magic);
+                uint32_t denorm_bits = __float_as_uint(denorm) - denorm_magic;
+                fp4 = (uint8_t)denorm_bits;
+            } else {
+                uint32_t mant_odd = (qx_bits >> (23 - 1)) & 1;
+                constexpr int32_t val_to_add = 0xC11FFFFF;
+                qx_bits = (uint32_t)((int32_t)qx_bits + val_to_add);
+                qx_bits += mant_odd;
+                fp4 = (uint8_t)(qx_bits >> (23 - 1));
+            }
+
+            uint8_t sign_fp4 = (uint8_t)(sign >> (23 + 8 - 1 - 2));
+            fp4 |= sign_fp4;
+
+            if (j == 0) packed = fp4;
+            else packed |= (fp4 << 4);
+        }
+        pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
+    }
+
+    QuantBlock result;
+    *reinterpret_cast<uint128_vec*>(&result.data) = *reinterpret_cast<uint128_vec*>(&pack);
+    result.e8m0 = e8m0;
+    return result;
+}
+
 template <int M, int K, int OUTER_M, int OUTER_K, int BLOCK_SIZE>
 __device__ __forceinline__ void quantize_a_to_reg(
     const hip_bfloat16* __restrict__ A,
@@ -61,89 +133,17 @@ __device__ __forceinline__ void quantize_a_to_reg(
         int g_k = k_offset + blk * 32;
         bool valid = (g_m < M);
 
-        // Read 32 BF16 values, find max absolute
         float vals[32];
-        float amax = 0.0f;
         for (int i = 0; i < 32; i++) {
             float v = 0.0f;
             if (valid && g_k + i < K)
                 v = float(A[g_m * K + g_k + i]);
             vals[i] = v;
-            amax = fmaxf(amax, fabsf(v));
         }
 
-        // E8M0 computation matching dynamic_mxfp4_quant:
-        // 1. Round amax to nearest power of 2
-        // 2. e8m0 = biased_exponent(rounded) - 2
-        uint8_t e8m0;
-        float quant_scale;
-        if (amax == 0.0f) {
-            e8m0 = 0;
-            quant_scale = 0.0f;
-        } else {
-            uint32_t amax_bits = __float_as_uint(amax);
-            amax_bits = (amax_bits + 0x200000u) & 0xFF800000u;
-            // floor(log2(rounded_amax)) = biased_exp - 127
-            int raw_exp = (int)((amax_bits >> 23) & 0xFF);
-            int e8m0_unbiased = raw_exp - 127 - 2;
-            e8m0_unbiased = max(-127, min(127, e8m0_unbiased));
-            e8m0 = (uint8_t)(e8m0_unbiased + 127);
-            // quant_scale = 2^(-e8m0_unbiased)
-            quant_scale = __uint_as_float((uint32_t)(127 - e8m0_unbiased) << 23);
-        }
-
-        // Quantize to FP4 E2M1 using IEEE-style rounding (matching reference)
-        uint32_t pack[4] = {0, 0, 0, 0};
-        for (int i = 0; i < 16; i++) {
-            uint8_t packed = 0;
-            for (int j = 0; j < 2; j++) {
-                float v = vals[2 * i + j];
-                float qx = v * quant_scale;
-
-                // Extract sign and work with absolute value
-                uint32_t qx_bits = __float_as_uint(qx);
-                uint32_t sign = qx_bits & 0x80000000u;
-                qx_bits = qx_bits ^ sign;
-                float qx_abs = __uint_as_float(qx_bits);
-
-                uint8_t fp4;
-                if (qx_abs >= 6.0f) {
-                    // Saturate
-                    fp4 = 0x7;
-                } else if (qx_abs < 1.0f) {
-                    // Denormal: add magic number, subtract, extract
-                    // denorm_exp = (127 - 1) + (23 - 1) + 1 = 149
-                    // magic = 2^149 as float bits = 149 << 23
-                    constexpr uint32_t denorm_magic = 149u << 23;
-                    float denorm = qx_abs + __uint_as_float(denorm_magic);
-                    uint32_t denorm_bits = __float_as_uint(denorm) - denorm_magic;
-                    fp4 = (uint8_t)denorm_bits;
-                } else {
-                    // Normal: IEEE rounding with round-to-nearest-even
-                    uint32_t mant_odd = (qx_bits >> (23 - 1)) & 1;
-                    // val_to_add = ((1 - 127) << 23) + (1 << 21) - 1
-                    // = (-126 << 23) + 0x200000 - 1
-                    // = 0xC1000000 + 0x1FFFFF = 0xC11FFFFF
-                    constexpr int32_t val_to_add = 0xC11FFFFF;
-                    qx_bits = (uint32_t)((int32_t)qx_bits + val_to_add);
-                    qx_bits += mant_odd;
-                    fp4 = (uint8_t)(qx_bits >> (23 - 1));
-                }
-
-                // Add sign (bit 3)
-                uint8_t sign_fp4 = (uint8_t)(sign >> (23 + 8 - 1 - 2));
-                fp4 |= sign_fp4;
-
-                if (j == 0)
-                    packed = fp4;
-                else
-                    packed |= (fp4 << 4);
-            }
-            pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
-        }
-
-        *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) = *reinterpret_cast<uint128_vec*>(&pack);
-        scale_regs[bi] = e8m0;
+        QuantBlock qb = quantize_fp4_block(vals);
+        *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) = *reinterpret_cast<uint128_vec*>(&qb.data);
+        scale_regs[bi] = qb.e8m0;
     }
 }
 
@@ -315,6 +315,42 @@ __device__ __forceinline__ void load_ab_global(
     b_s = broadcast_scale(b_e);
 }
 
+// =====================================================================
+// Standalone A quantization kernel: BF16 -> MXFP4 (packed FP4 + E8M0 scales)
+// One thread per 32-element MX block.
+// Output data: row-major [M, K/2] packed uint8
+// Output scale: column-major [row + blk * M] uint8
+// =====================================================================
+
+template <int M, int K, int K_HALF, int NUM_BLOCKS>
+__global__ void quant_a_kernel(
+    const hip_bfloat16* __restrict__ A,
+    uint8_t* __restrict__ out_data,
+    uint8_t* __restrict__ out_scale
+) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int total = M * NUM_BLOCKS;
+    if (gid >= total) return;
+
+    int row = gid / NUM_BLOCKS;
+    int blk = gid % NUM_BLOCKS;
+    int k_start = blk * 32;
+
+    float vals[32];
+    for (int i = 0; i < 32; i++) {
+        float v = 0.0f;
+        if (k_start + i < K)
+            v = float(A[row * K + k_start + i]);
+        vals[i] = v;
+    }
+
+    QuantBlock qb = quantize_fp4_block(vals);
+
+    int data_off = row * K_HALF + blk * 16;
+    *reinterpret_cast<uint128_vec*>(&out_data[data_off]) =
+        *reinterpret_cast<uint128_vec*>(&qb.data);
+    out_scale[row + blk * M] = qb.e8m0;
+}
 
 // =====================================================================
 // Simple kernel: 1 wavefront, direct global->register, double-buffered
@@ -833,6 +869,27 @@ MXFP4_CPP_SOURCE = r'''
 #include <hip/hip_bfloat16.h>
 #include <ATen/hip/HIPContext.h>
 
+template <int M, int K, int K_HALF, int NUM_BLOCKS>
+std::vector<torch::Tensor> launch_quant_a(torch::Tensor A) {
+    auto A_data = torch::empty({M, K_HALF},
+        torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
+    auto A_scale = torch::empty({NUM_BLOCKS * M},
+        torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
+
+    constexpr int total = M * NUM_BLOCKS;
+    constexpr int block_size = 256;
+    constexpr int grid_size = (total + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL((quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>),
+        dim3(grid_size), dim3(block_size), 0, 0,
+        reinterpret_cast<const hip_bfloat16*>(A.data_ptr()),
+        reinterpret_cast<uint8_t*>(A_data.data_ptr()),
+        reinterpret_cast<uint8_t*>(A_scale.data_ptr()));
+
+    return {A_data, A_scale};
+}
+
+
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1>
@@ -886,6 +943,28 @@ void launch_tiled_fused(torch::Tensor A_bf16, torch::Tensor B,
         reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr()));
 }
 
+std::vector<torch::Tensor> quant_a(torch::Tensor A, int M, int N, int K) {
+    int K_half = K / 2;
+    int num_blocks = (K + 31) / 32;
+
+#define Q(m,k,kh,nb) \
+    if(M==m&&K==k){return launch_quant_a<m,k,kh,nb>(A);}
+
+    Q(4,   512,  256,  16)
+    Q(8,  7168, 3584, 224)
+    Q(16, 7168, 3584, 224)
+    Q(16, 1536,  768,  48)
+    Q(32,  512,  256,  16)
+    Q(64, 1536,  768,  48)
+    Q(64, 2048, 1024,  64)
+    Q(256, 512,  256,  16)
+    Q(256,1536,  768,  48)
+
+#undef Q
+
+    TORCH_CHECK(false, "No quant_a template for M=", M, " K=", K);
+    return {};
+}
 
 torch::Tensor mfma_gemm(
     torch::Tensor A_data, torch::Tensor B_data,
@@ -952,6 +1031,7 @@ torch::Tensor mfma_gemm_fused(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mfma_gemm", &mfma_gemm);
     m.def("mfma_gemm_fused", &mfma_gemm_fused);
+    m.def("quant_a", &quant_a);
 }
 '''
 
@@ -1026,17 +1106,16 @@ def custom_kernel(data: input_t) -> output_t:
                     A, B_data, B_sc,
                     m, n, k, K_half, num_blocks, scaleN)
             else:
-                # Non-fused: quantize A first
-                x_fp4, bs_e8m0 = dynamic_mxfp4_quant(A)
-                A_data = x_fp4.view(torch.uint8)
-                A_sc = bs_e8m0
-                a_s0 = A_sc.stride(0)
-                a_s1 = A_sc.stride(1)
+                # Non-fused: quantize A with custom HIP kernel
+                quant_out = _hip_module.quant_a(A, m, n, k)
+                A_data = quant_out[0]
+                A_sc = quant_out[1]
 
                 out = _hip_module.mfma_gemm(
                     A_data, B_data, A_sc, B_sc,
                     m, n, k, K_half, num_blocks, scaleN,
-                    a_s0, a_s1)
+                    1, m)
+
 
             if PROFILE:
                 end.record()

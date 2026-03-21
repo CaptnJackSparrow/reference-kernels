@@ -1,0 +1,89 @@
+"**MI355X on GitHub ✅ success**
+> Workflow [23385012654](<https://github.com/gpu-mode/kernelbot/actions/runs/23385012654>) completed
+> Downloading artifacts... done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+
+Running on:
+* GPU: `AMD Instinct MI355X`
+* CPU: `AMD EPYC 9575F 64-Core Processor`
+* Device count: `1`
+* Runtime: `ROCm`
+* Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
+* Torch: `2.10.0+rocm7.1`
+* Hostname: `arc-runner-set-h82gb-runner-x4895`
+
+
+## ✅ Passed 4/4 tests:
+```
+✅ k: 7168; m: 8; n: 2112; seed: 124
+> Maximum error: 0.0
+✅ k: 1536; m: 16; n: 3072; seed: 6635
+> Maximum error: 0.0
+✅ k: 1536; m: 64; n: 3072; seed: 45
+> Maximum error: 0.0
+✅ k: 512; m: 256; n: 2880; seed: 78
+> Maximum error: 0.0```
+
+## Benchmarks:
+```
+k: 512; m: 4; n: 2880; seed: 4565
+ ⏱ 10.7 ± 0.02 µs
+ ⚡ 10.2 µs 🐌 19.2 µs
+
+k: 7168; m: 16; n: 2112; seed: 15
+ ⏱ 37.7 ± 0.04 µs
+ ⚡ 37.0 µs 🐌 42.7 µs
+
+k: 512; m: 32; n: 4096; seed: 457
+ ⏱ 13.2 ± 0.02 µs
+ ⚡ 12.7 µs 🐌 18.4 µs
+
+k: 512; m: 32; n: 2880; seed: 54
+ ⏱ 13.0 ± 0.02 µs
+ ⚡ 12.6 µs 🐌 18.4 µs
+
+k: 2048; m: 64; n: 7168; seed: 687
+ ⏱ 33.9 ± 0.03 µs
+ ⚡ 32.9 µs 🐌 37.9 µs
+
+k: 1536; m: 256; n: 3072; seed: 7856
+ ⏱ 24.8 ± 0.02 µs
+ ⚡ 23.9 µs 🐌 31.2 µs
+```
+
+## Ranked Benchmark:
+```
+k: 512; m: 4; n: 2880; seed: 4565
+ ⏱ 11.0 ± 0.04 µs
+ ⚡ 10.4 µs 🐌 13.1 µs
+
+k: 7168; m: 16; n: 2112; seed: 15
+ ⏱ 38.6 ± 0.11 µs
+ ⚡ 37.2 µs 🐌 43.0 µs
+
+k: 512; m: 32; n: 4096; seed: 457
+ ⏱ 13.6 ± 0.05 µs
+ ⚡ 13.1 µs 🐌 16.6 µs
+
+k: 512; m: 32; n: 2880; seed: 54
+ ⏱ 13.8 ± 0.05 µs
+ ⚡ 13.4 µs 🐌 17.1 µs
+
+k: 2048; m: 64; n: 7168; seed: 687
+ ⏱ 34.6 ± 0.09 µs
+ ⚡ 33.4 µs 🐌 39.2 µs
+
+k: 1536; m: 256; n: 3072; seed: 7856
+ ⏱ 25.2 ± 0.04 µs
+ ⚡ 24.6 µs 🐌 27.5 µs
+```","**MI355X on GitHub (secret) ✅ success**
+> Workflow [23385012772](<https://github.com/gpu-mode/kernelbot/actions/runs/23385012772>) completed
+> Downloading artifacts... done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+"
