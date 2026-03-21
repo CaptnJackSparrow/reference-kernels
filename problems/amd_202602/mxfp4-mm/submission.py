@@ -104,8 +104,7 @@ __device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
             uint8_t sign_fp4 = (uint8_t)(sign >> (23 + 8 - 1 - 2));
             fp4 |= sign_fp4;
 
-            if (j == 0) packed = fp4;
-            else packed |= (fp4 << 4);
+            packed |= fp4 << (4 * j);
         }
         pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
     }
@@ -131,12 +130,12 @@ __device__ __forceinline__ void quantize_a_to_reg(
         int blk = b % OK_BLOCKS;
         int g_m = outer_m + row;
         int g_k = k_offset + blk * 32;
-        bool valid = (g_m < M);
+        //bool valid = (g_m < M);
 
         float vals[32];
         for (int i = 0; i < 32; i++) {
             float v = 0.0f;
-            if (valid && g_k + i < K)
+            //if (valid && g_k + i < K)
                 v = float(A[g_m * K + g_k + i]);
             vals[i] = v;
         }
@@ -330,7 +329,7 @@ __global__ void quant_a_kernel(
 ) {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     constexpr int total = M * NUM_BLOCKS;
-    if (gid >= total) return;
+    //if (gid >= total) return;
 
     int row = gid / NUM_BLOCKS;
     int blk = gid % NUM_BLOCKS;
@@ -339,7 +338,7 @@ __global__ void quant_a_kernel(
     float vals[32];
     for (int i = 0; i < 32; i++) {
         float v = 0.0f;
-        if (k_start + i < K)
+        //if (k_start + i < K)
             v = float(A[row * K + k_start + i]);
         vals[i] = v;
     }
@@ -372,15 +371,14 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_simple(
 
     const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / 64);
     const int lane = threadIdx.x % 64;
-    const int warp_m = warp_id / WARPS_N;
-    const int warp_n = warp_id % WARPS_N;
-
+    const int warp_m = __builtin_amdgcn_readfirstlane(warp_id / WARPS_N);
+    const int warp_n = __builtin_amdgcn_readfirstlane(warp_id % WARPS_N);
     const int tile_m = __builtin_amdgcn_readfirstlane(blockIdx.x * (IM * WARPS_M)) + warp_m * IM;
     const int tile_n = __builtin_amdgcn_readfirstlane(blockIdx.y * (IN * WARPS_N)) + warp_n * IN;
 
     auto acc = Traits::zero_acc();
 
-    if (K_ITERS > 0) {
+    if constexpr (K_ITERS > 0) {
         uint32_t a_cur[Traits::REGS], b_cur[Traits::REGS];
         uint32_t a_nxt[Traits::REGS], b_nxt[Traits::REGS];
         int32_t a_sc_cur, b_sc_cur, a_sc_nxt, b_sc_nxt;
@@ -391,11 +389,12 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_simple(
             a_cur, a_sc_cur, b_cur, b_sc_cur);
 
         for (int ki = 0; ki < K_ITERS; ki++) {
-            if (ki + 1 < K_ITERS)
+            if (ki + 1 < K_ITERS) {
                 load_ab_global<M, N, K_HALF, NUM_BLOCKS, SCALE_N, IM, IN, IK>(
                     A_data, B_data, A_scale, B_scale,
                     tile_m, tile_n, (ki + 1) * BPC, lane,
                     a_nxt, a_sc_nxt, b_nxt, b_sc_nxt);
+            }
 
             acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
 
@@ -451,7 +450,7 @@ __device__ __forceinline__ void load_a_global_to_reg(
         int g_m = outer_m + row;
         int g_col = k_half_base + col;
         uint32_t val = 0;
-        if (g_m < M && g_col + 3 < K_HALF)
+        //if (g_m < M && g_col + 3 < K_HALF)
             val = *reinterpret_cast<const uint32_t*>(&A_data[g_m * K_HALF + g_col]);
         data_regs[di] = val;
     }
@@ -463,7 +462,7 @@ __device__ __forceinline__ void load_a_global_to_reg(
         int g_m = outer_m + row;
         int g_blk = blk_base + col;
         uint8_t val = 127;
-        if (g_m < M && g_blk < NUM_BLOCKS)
+        //if (g_m < M && g_blk < NUM_BLOCKS)
             val = A_scale[g_m + g_blk * M];
         scale_regs[si] = val;
     }
@@ -512,7 +511,7 @@ __device__ __forceinline__ void load_a_to_lds(
         int g_m = outer_m + row;
         int g_col = k_half_base + col;
         uint32_t val = 0;
-        if (g_m < M && g_col + 3 < K_HALF)
+        //if (g_m < M && g_col + 3 < K_HALF)
             val = *reinterpret_cast<const uint32_t*>(&A_data[g_m * K_HALF + g_col]);
         *reinterpret_cast<uint32_t*>(&smem_data[byte_off]) = val;
     }
@@ -523,7 +522,7 @@ __device__ __forceinline__ void load_a_to_lds(
         int g_m = outer_m + row;
         int g_blk = blk_base + col;
         uint8_t val = 127;
-        if (g_m < M && g_blk < NUM_BLOCKS)
+        //if (g_m < M && g_blk < NUM_BLOCKS)
             val = A_scale[g_m + g_blk * M];
         smem_scale[s] = val;
     }
@@ -551,7 +550,7 @@ __device__ __forceinline__ void load_b_global_to_reg(
         int g_n = outer_n + row;
         int g_col = k_half_base + col;
         uint32_t val = 0;
-        if (g_n < N && g_col + 3 < K_HALF)
+        //if (g_n < N && g_col + 3 < K_HALF)
             val = *reinterpret_cast<const uint32_t*>(&B_data[g_n * K_HALF + g_col]);
         data_regs[di] = val;
     }
@@ -563,7 +562,7 @@ __device__ __forceinline__ void load_b_global_to_reg(
         int g_n = outer_n + row;
         int g_blk = blk_base + col;
         uint8_t val = 127;
-        if (g_n < N && g_blk < NUM_BLOCKS)
+        //if (g_n < N && g_blk < NUM_BLOCKS)
             val = B_scale[sh_scale_off<SCALE_N>(g_n, g_blk)];
         scale_regs[si] = val;
     }
@@ -619,7 +618,7 @@ __device__ __forceinline__ void load_b_to_lds(
         int g_n = outer_n + row;
         int g_col = k_half_base + col;
         uint32_t val = 0;
-        if (g_n < N && g_col + 3 < K_HALF)
+        //if (g_n < N && g_col + 3 < K_HALF)
             val = *reinterpret_cast<const uint32_t*>(&B_data[g_n * K_HALF + g_col]);
         // Block-transposed: [blk][row][16 bytes]
         int blk = col / 16;
@@ -634,7 +633,7 @@ __device__ __forceinline__ void load_b_to_lds(
         int g_n = outer_n + row;
         int g_blk = blk_base + col;
         uint8_t val = 127;
-        if (g_n < N && g_blk < NUM_BLOCKS)
+        //if (g_n < N && g_blk < NUM_BLOCKS)
             val = B_scale[sh_scale_off<SCALE_N>(g_n, g_blk)];
         // Transposed: [blk][row]
         smem_scale[col * OUTER_N + row] = val;
@@ -877,7 +876,7 @@ std::vector<torch::Tensor> launch_quant_a(torch::Tensor A) {
         torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
 
     constexpr int total = M * NUM_BLOCKS;
-    constexpr int block_size = 256;
+    constexpr int block_size = 64;
     constexpr int grid_size = (total + block_size - 1) / block_size;
 
     hipLaunchKernelGGL((quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>),
@@ -1088,8 +1087,9 @@ def custom_kernel(data: input_t) -> output_t:
                     custom_kernel._stats = {}
                 shape_key = (m, n, k)
                 if shape_key not in custom_kernel._stats:
-                    custom_kernel._stats[shape_key] = {'total': 0.0, 'count': 0}
+                    custom_kernel._stats[shape_key] = {'total': 0.0, 'quant': 0.0, 'count': 0}
                 start = torch.cuda.Event(enable_timing=True)
+                mid = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
 
@@ -1111,6 +1111,9 @@ def custom_kernel(data: input_t) -> output_t:
                 A_data = quant_out[0]
                 A_sc = quant_out[1]
 
+                if PROFILE:
+                    mid.record()
+
                 out = _hip_module.mfma_gemm(
                     A_data, B_data, A_sc, B_sc,
                     m, n, k, K_half, num_blocks, scaleN,
@@ -1121,11 +1124,13 @@ def custom_kernel(data: input_t) -> output_t:
                 end.record()
                 torch.cuda.synchronize()
                 s = custom_kernel._stats[shape_key]
+                s['quant'] += start.elapsed_time(mid)
                 s['total'] += start.elapsed_time(end)
                 s['count'] += 1
                 if s['count'] % PROFILE_INTERVAL == 0:
                     cnt = s['count']
                     print(f"[PROFILE] m={m:4d} n={n:4d} k={k:4d} | "
+                          f"quant={s['quant']/cnt*1000:.1f}us  "
                           f"total={s['total']/cnt*1000:.1f}us  "
                           f"(avg over {cnt} calls)", flush=True)
 
