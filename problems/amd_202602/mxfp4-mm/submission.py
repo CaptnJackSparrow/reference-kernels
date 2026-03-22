@@ -53,6 +53,22 @@ struct QuantBlock {
     uint8_t e8m0;
 };
 
+__device__ __forceinline__ void load_bf16x32(const hip_bfloat16* ptr, float vals[32]) {
+    for (int chunk_off = 0; chunk_off < 32; chunk_off += 8) {
+        // Load 8 BF16 values at once (16 bytes)
+        uint32_t raw[4];
+        *reinterpret_cast<uint128_vec*>(&raw[0]) =
+            *reinterpret_cast<const uint128_vec*>(&ptr[chunk_off]);
+        // Unpack BF16 to float: bf16 bits << 16 = float bits
+        for (int j = 0; j < 4; j++) {
+            uint32_t pair = raw[j];
+            float2 lo_hi = {__uint_as_float((pair & 0xFFFF) << 16),
+                            __uint_as_float(pair & 0xFFFF0000u)};
+            *(&reinterpret_cast<float2*>(&vals[chunk_off])[j]) = lo_hi;
+        }
+    }
+}
+
 __device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
     float amax = 0.0f;
     for (int i = 0; i < 32; i++)
@@ -133,13 +149,7 @@ __device__ __forceinline__ void quantize_a_to_reg(
         //bool valid = (g_m < M);
 
         float vals[32];
-        for (int i = 0; i < 32; i++) {
-            float v = 0.0f;
-            //if (valid && g_k + i < K)
-                v = float(A[g_m * K + g_k + i]);
-            vals[i] = v;
-        }
-
+        load_bf16x32(&A[g_m * K + g_k], vals);
         QuantBlock qb = quantize_fp4_block(vals);
         *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) = *reinterpret_cast<uint128_vec*>(&qb.data);
         scale_regs[bi] = qb.e8m0;
@@ -198,9 +208,6 @@ __device__ __forceinline__ void load_tile(
     blk_out = blk0 + k_group;
     int off = row_out * K_HALF_STRIDE + blk_out * 16;
     *reinterpret_cast<uint128_vec*>(&reg[0]) = *reinterpret_cast<const uint128_vec*>(&src[off]);
-    if constexpr (REGS == 8) {
-        *reinterpret_cast<uint128_vec*>(&reg[4]) = 0;
-    }
 }
 
 template <int IM, int OUTER_N, int REGS = (IM == 32) ? 4 : 8>
@@ -213,9 +220,6 @@ __device__ __forceinline__ void load_transposed(
     blk_out = blk0 + k_group;
     int off = (blk_out * OUTER_N + row_out) * 16;
     *reinterpret_cast<uint128_vec*>(&reg[0]) = *reinterpret_cast<const uint128_vec*>(&src[off]);
-    if constexpr (REGS == 8) {
-        *reinterpret_cast<uint128_vec*>(&reg[4]) = 0;
-    }
 }
 
 // =====================================================================
@@ -239,10 +243,8 @@ struct MfmaTraits {
         acc_t acc
     ) {
         if constexpr (IM == 32) {
-            int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
-                              0, 0, 0, 0};
-            int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                              0, 0, 0, 0};
+            int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3]};
+            int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3]};
             return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
                 a_vec, b_vec, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
         } else {
@@ -299,20 +301,12 @@ __device__ __forceinline__ void load_ab_global(
 
     load_tile<IM, K_HALF>(A_data, tile_m, blk0, lane,
                             a_r, a_blk, a_row);
-    uint8_t a_e = 127;
-    if (a_row < M && a_blk < NUM_BLOCKS)
-        a_e = A_scale[a_row + a_blk * M];
-    else
-        for (int r = 0; r < Traits::REGS; r++) a_r[r] = 0;
+    uint8_t a_e = A_scale[a_row + a_blk * M];
     a_s = broadcast_scale(a_e);
 
     load_tile<IM, K_HALF>(B_data, tile_n, blk0, lane,
                             b_r, b_blk, b_row);
-    uint8_t b_e = 127;
-    if (b_row < N && b_blk < NUM_BLOCKS)
-        b_e = B_scale[sh_scale_off<SCALE_N>(b_row, b_blk)];
-    else
-        for (int r = 0; r < Traits::REGS; r++) b_r[r] = 0;
+    uint8_t b_e = B_scale[sh_scale_off<SCALE_N>(b_row, b_blk)];
     b_s = broadcast_scale(b_e);
 }
 
@@ -338,13 +332,7 @@ __global__ void quant_a_kernel(
     int k_start = blk * 32;
 
     float vals[32];
-    for (int i = 0; i < 32; i++) {
-        float v = 0.0f;
-        //if (k_start + i < K)
-            v = float(A[row * K + k_start + i]);
-        vals[i] = v;
-    }
-
+    load_bf16x32(&A[row * K + k_start], vals);
     QuantBlock qb = quantize_fp4_block(vals);
 
     int data_off = row * K_HALF + blk * 16;
@@ -441,20 +429,19 @@ __device__ __forceinline__ void load_a_global_to_reg(
 ) {
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_ELEMS = OUTER_M * OK_HALF / 4;
+    // Now iterate over 16-byte chunks (4 uint32 = one MX block's packed data)
+    constexpr int DATA_CHUNKS = OUTER_M * OK_BLOCKS;  // one 16-byte chunk per block
     constexpr int SCALE_ELEMS = OUTER_M * OK_BLOCKS;
 
     int di = 0;
-    for (int dw = tid; dw < DATA_ELEMS; dw += BLOCK_SIZE, di++) {
-        int byte_off = dw * 4;
-        int row = byte_off / OK_HALF;
-        int col = byte_off % OK_HALF;
+    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
+        int row = c / OK_BLOCKS;
+        int blk = c % OK_BLOCKS;
         int g_m = outer_m + row;
-        int g_col = k_half_base + col;
-        uint32_t val = 0;
-        //if (g_m < M && g_col + 3 < K_HALF)
-            val = *reinterpret_cast<const uint32_t*>(&A_data[g_m * K_HALF + g_col]);
-        data_regs[di] = val;
+        int g_col = k_half_base + blk * 16;
+        uint128_vec val = {0, 0, 0, 0};
+        val = *reinterpret_cast<const uint128_vec*>(&A_data[g_m * K_HALF + g_col]);
+        *reinterpret_cast<uint128_vec*>(&data_regs[di * 4]) = val;
     }
 
     int si = 0;
@@ -464,8 +451,7 @@ __device__ __forceinline__ void load_a_global_to_reg(
         int g_m = outer_m + row;
         int g_blk = blk_base + col;
         uint8_t val = 127;
-        //if (g_m < M && g_blk < NUM_BLOCKS)
-            val = A_scale[g_m + g_blk * M];
+        val = A_scale[g_m + g_blk * M];
         scale_regs[si] = val;
     }
 }
@@ -479,13 +465,16 @@ __device__ __forceinline__ void store_a_reg_to_lds(
 ) {
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_ELEMS = OUTER_M * OK_HALF / 4;
+    constexpr int DATA_CHUNKS = OUTER_M * OK_BLOCKS;
     constexpr int SCALE_ELEMS = OUTER_M * OK_BLOCKS;
 
     int di = 0;
-    for (int dw = tid; dw < DATA_ELEMS; dw += BLOCK_SIZE, di++) {
-        int byte_off = dw * 4;
-        *reinterpret_cast<uint32_t*>(&smem_data[byte_off]) = data_regs[di];
+    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
+        int row = c / OK_BLOCKS;
+        int blk = c % OK_BLOCKS;
+        int data_off = row * OK_HALF + blk * 16;
+        *reinterpret_cast<uint128_vec*>(&smem_data[data_off]) =
+            *reinterpret_cast<const uint128_vec*>(&data_regs[di * 4]);
     }
 
     int si = 0;
@@ -505,17 +494,16 @@ __device__ __forceinline__ void load_a_to_lds(
 ) {
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OK_BLOCKS = OUTER_K / 32;
+    constexpr int DATA_CHUNKS = OUTER_M * OK_BLOCKS;
 
-    for (int dw = tid; dw < OUTER_M * OK_HALF / 4; dw += BLOCK_SIZE) {
-        int byte_off = dw * 4;
-        int row = byte_off / OK_HALF;
-        int col = byte_off % OK_HALF;
+    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE) {
+        int row = c / OK_BLOCKS;
+        int blk = c % OK_BLOCKS;
         int g_m = outer_m + row;
-        int g_col = k_half_base + col;
-        uint32_t val = 0;
-        //if (g_m < M && g_col + 3 < K_HALF)
-            val = *reinterpret_cast<const uint32_t*>(&A_data[g_m * K_HALF + g_col]);
-        *reinterpret_cast<uint32_t*>(&smem_data[byte_off]) = val;
+        int g_col = k_half_base + blk * 16;
+        int lds_off = row * OK_HALF + blk * 16;
+        *reinterpret_cast<uint128_vec*>(&smem_data[lds_off]) =
+            *reinterpret_cast<const uint128_vec*>(&A_data[g_m * K_HALF + g_col]);
     }
 
     for (int s = tid; s < OUTER_M * OK_BLOCKS; s += BLOCK_SIZE) {
@@ -523,10 +511,7 @@ __device__ __forceinline__ void load_a_to_lds(
         int col = s % OK_BLOCKS;
         int g_m = outer_m + row;
         int g_blk = blk_base + col;
-        uint8_t val = 127;
-        //if (g_m < M && g_blk < NUM_BLOCKS)
-            val = A_scale[g_m + g_blk * M];
-        smem_scale[s] = val;
+        smem_scale[s] = A_scale[g_m + g_blk * M];
     }
 }
 
@@ -539,22 +524,18 @@ __device__ __forceinline__ void load_b_global_to_reg(
     int outer_n, int k_half_base, int blk_base, int tid,
     uint32_t* data_regs, uint8_t* scale_regs
 ) {
-    constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_ELEMS = OUTER_N * OK_HALF / 4;
+    constexpr int DATA_CHUNKS = OUTER_N * OK_BLOCKS;
     constexpr int SCALE_ELEMS = OUTER_N * OK_BLOCKS;
 
     int di = 0;
-    for (int dw = tid; dw < DATA_ELEMS; dw += BLOCK_SIZE, di++) {
-        int byte_off = dw * 4;
-        int row = byte_off / OK_HALF;
-        int col = byte_off % OK_HALF;
+    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
+        int row = c / OK_BLOCKS;
+        int blk = c % OK_BLOCKS;
         int g_n = outer_n + row;
-        int g_col = k_half_base + col;
-        uint32_t val = 0;
-        //if (g_n < N && g_col + 3 < K_HALF)
-            val = *reinterpret_cast<const uint32_t*>(&B_data[g_n * K_HALF + g_col]);
-        data_regs[di] = val;
+        int g_col = k_half_base + blk * 16;
+        *reinterpret_cast<uint128_vec*>(&data_regs[di * 4]) =
+            *reinterpret_cast<const uint128_vec*>(&B_data[g_n * K_HALF + g_col]);
     }
 
     int si = 0;
@@ -563,10 +544,7 @@ __device__ __forceinline__ void load_b_global_to_reg(
         int col = s % OK_BLOCKS;
         int g_n = outer_n + row;
         int g_blk = blk_base + col;
-        uint8_t val = 127;
-        //if (g_n < N && g_blk < NUM_BLOCKS)
-            val = B_scale[sh_scale_off<SCALE_N>(g_n, g_blk)];
-        scale_regs[si] = val;
+        scale_regs[si] = B_scale[sh_scale_off<SCALE_N>(g_n, g_blk)];
     }
 }
 
@@ -577,20 +555,18 @@ __device__ __forceinline__ void store_b_reg_to_lds(
     int tid,
     const uint32_t* data_regs, const uint8_t* scale_regs
 ) {
-    constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_ELEMS = OUTER_N * OK_HALF / 4;
+    constexpr int DATA_CHUNKS = OUTER_N * OK_BLOCKS;
     constexpr int SCALE_ELEMS = OUTER_N * OK_BLOCKS;
 
     int di = 0;
-    for (int dw = tid; dw < DATA_ELEMS; dw += BLOCK_SIZE, di++) {
-        int byte_off = dw * 4;
-        int row = byte_off / OK_HALF;
-        int col = byte_off % OK_HALF;
-        int blk = col / 16;
-        int byte_in_blk = col % 16;
-        int lds_off = (blk * OUTER_N + row) * 16 + byte_in_blk;
-        *reinterpret_cast<uint32_t*>(&smem_data[lds_off]) = data_regs[di];
+    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
+        int row = c / OK_BLOCKS;
+        int blk = c % OK_BLOCKS;
+        // Block-transposed: [blk][row][16 bytes]
+        int lds_off = (blk * OUTER_N + row) * 16;
+        *reinterpret_cast<uint128_vec*>(&smem_data[lds_off]) =
+            *reinterpret_cast<const uint128_vec*>(&data_regs[di * 4]);
     }
 
     int si = 0;
@@ -610,23 +586,17 @@ __device__ __forceinline__ void load_b_to_lds(
     uint8_t* smem_data, uint8_t* smem_scale,
     int outer_n, int k_half_base, int blk_base, int tid
 ) {
-    constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OK_BLOCKS = OUTER_K / 32;
+    constexpr int DATA_CHUNKS = OUTER_N * OK_BLOCKS;
 
-    for (int dw = tid; dw < OUTER_N * OK_HALF / 4; dw += BLOCK_SIZE) {
-        int byte_off = dw * 4;
-        int row = byte_off / OK_HALF;
-        int col = byte_off % OK_HALF;
+    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE) {
+        int row = c / OK_BLOCKS;
+        int blk = c % OK_BLOCKS;
         int g_n = outer_n + row;
-        int g_col = k_half_base + col;
-        uint32_t val = 0;
-        //if (g_n < N && g_col + 3 < K_HALF)
-            val = *reinterpret_cast<const uint32_t*>(&B_data[g_n * K_HALF + g_col]);
-        // Block-transposed: [blk][row][16 bytes]
-        int blk = col / 16;
-        int byte_in_blk = col % 16;
-        int lds_off = (blk * OUTER_N + row) * 16 + byte_in_blk;
-        *reinterpret_cast<uint32_t*>(&smem_data[lds_off]) = val;
+        int g_col = k_half_base + blk * 16;
+        int lds_off = (blk * OUTER_N + row) * 16;
+        *reinterpret_cast<uint128_vec*>(&smem_data[lds_off]) =
+            *reinterpret_cast<const uint128_vec*>(&B_data[g_n * K_HALF + g_col]);
     }
 
     for (int s = tid; s < OUTER_N * OK_BLOCKS; s += BLOCK_SIZE) {
@@ -634,11 +604,7 @@ __device__ __forceinline__ void load_b_to_lds(
         int col = s % OK_BLOCKS;
         int g_n = outer_n + row;
         int g_blk = blk_base + col;
-        uint8_t val = 127;
-        //if (g_n < N && g_blk < NUM_BLOCKS)
-            val = B_scale[sh_scale_off<SCALE_N>(g_n, g_blk)];
-        // Transposed: [blk][row]
-        smem_scale[col * OUTER_N + row] = val;
+        smem_scale[col * OUTER_N + row] = B_scale[sh_scale_off<SCALE_N>(g_n, g_blk)];
     }
 }
 
@@ -743,8 +709,8 @@ mfma_fp4_gemm_tiled(
     constexpr int K = K_HALF * 2;
     constexpr int OUTER_K_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
     constexpr int BLOCK_SIZE = WARPS * 64;
-    constexpr int A_DATA_ELEMS = OUTER_M * OK_HALF / 4;
-    constexpr int A_DATA_PER_THREAD = (A_DATA_ELEMS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    constexpr int A_DATA_PER_THREAD = ((OUTER_M * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    constexpr int A_CHUNKS_PER_THREAD = ((OUTER_M * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
     constexpr int A_SCALE_ELEMS = OUTER_M * OK_BLOCKS;
     constexpr int A_SCALE_PER_THREAD = (A_SCALE_ELEMS + BLOCK_SIZE - 1) / BLOCK_SIZE;
     constexpr int B_DATA_ELEMS = OUTER_N * OK_HALF / 4;
@@ -791,7 +757,7 @@ mfma_fp4_gemm_tiled(
             __syncthreads();
         }
 
-        uint32_t a_data_regs[A_DATA_PER_THREAD];
+        uint32_t a_data_regs[A_CHUNKS_PER_THREAD * 4];
         uint8_t  a_scale_regs[A_SCALE_PER_THREAD];
         uint32_t b_data_regs[B_DATA_PER_THREAD];
         uint8_t  b_scale_regs[B_SCALE_PER_THREAD];
