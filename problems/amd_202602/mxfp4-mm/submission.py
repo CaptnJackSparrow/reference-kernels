@@ -861,34 +861,33 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
 
     auto acc = Traits::zero_acc();
 
-    if (ki_start < ki_end) {
-        uint32_t a_cur[Traits::REGS], b_cur[Traits::REGS];
-        uint32_t a_nxt[Traits::REGS], b_nxt[Traits::REGS];
-        int32_t a_sc_cur, b_sc_cur, a_sc_nxt, b_sc_nxt;
+    uint32_t a_cur[Traits::REGS], b_cur[Traits::REGS];
+    uint32_t a_nxt[Traits::REGS], b_nxt[Traits::REGS];
+    int32_t a_sc_cur, b_sc_cur, a_sc_nxt, b_sc_nxt;
 
+    load_ab_global<M, N, K_HALF, NUM_BLOCKS, SCALE_N, IM, IN, IK>(
+        A_data, B_data, A_scale, B_scale,
+        tile_m, tile_n, ki_start * BPC, lane,
+        a_cur, a_sc_cur, b_cur, b_sc_cur);
+
+    for (int ki = ki_start; ki < ki_end - 1; ki++) {
         load_ab_global<M, N, K_HALF, NUM_BLOCKS, SCALE_N, IM, IN, IK>(
             A_data, B_data, A_scale, B_scale,
-            tile_m, tile_n, ki_start * BPC, lane,
-            a_cur, a_sc_cur, b_cur, b_sc_cur);
+            tile_m, tile_n, (ki + 1) * BPC, lane,
+            a_nxt, a_sc_nxt, b_nxt, b_sc_nxt);
 
-        for (int ki = ki_start; ki < ki_end; ki++) {
-            if (ki + 1 < ki_end) {
-                load_ab_global<M, N, K_HALF, NUM_BLOCKS, SCALE_N, IM, IN, IK>(
-                    A_data, B_data, A_scale, B_scale,
-                    tile_m, tile_n, (ki + 1) * BPC, lane,
-                    a_nxt, a_sc_nxt, b_nxt, b_sc_nxt);
-            }
+        acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
 
-            acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
-
-            for (int r = 0; r < Traits::REGS; r++) {
-                a_cur[r] = a_nxt[r];
-                b_cur[r] = b_nxt[r];
-            }
-            a_sc_cur = a_sc_nxt;
-            b_sc_cur = b_sc_nxt;
+        for (int r = 0; r < Traits::REGS; r++) {
+            a_cur[r] = a_nxt[r];
+            b_cur[r] = b_nxt[r];
         }
+        a_sc_cur = a_sc_nxt;
+        b_sc_cur = b_sc_nxt;
     }
+
+    // Last tile
+    acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
 
     // Store fp32 partial sums to workspace[split_id * M * N + ...]
     float* ws = workspace + split_id * M * N;
@@ -899,7 +898,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
             int row = (i % 4) + 4 * half + 8 * (i / 4);
             int gm = tile_m + row;
             int gn = tile_n + col;
-            if (gm < M && gn < N)
+            //if (gm < M && gn < N)
                 ws[gm * N + gn] = acc[i];
         }
     } else {
@@ -909,7 +908,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
             int row = i + 4 * quad;
             int gm = tile_m + row;
             int gn = tile_n + col;
-            if (gm < M && gn < N)
+            //if (gm < M && gn < N)
                 ws[gm * N + gn] = acc[i];
         }
     }
@@ -1096,8 +1095,16 @@ torch::Tensor mfma_gemm(
     torch::Tensor B_scale,
     int M, int N, int K, int K_half, int num_blocks, int scaleN
 ) {
-    auto C = torch::empty({M, N},
-        torch::TensorOptions().dtype(torch::kBFloat16).device(A_data.device()));
+    static torch::Tensor C;
+    static bool init = false;
+    static int sM, sN;
+    if (!init || M != sM || N != sN) {
+        C = torch::empty({M, N},
+            torch::TensorOptions().dtype(torch::kBFloat16).device(A_data.device()));
+        init = true;
+        sM = M;
+        sN = N;
+    }
 
 // Dispatch macro — add WM, WN
 #define S32(m,n,kh,nb,sn,wm,wn) \
@@ -1107,14 +1114,14 @@ torch::Tensor mfma_gemm(
 #define T(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs) \
     if(M==m&&N==n&&K_half==kh){launch_tiled<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C);return C;}
 #define F(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs) \
-    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_bf16,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C);return C;}
 #define F2(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ) \
-    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ>(A_bf16,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ>(A_data,B_data,B_scale,C);return C;}
 #define SK(m,n,kh,nb,sn,im,in,ik,wm,wn,ksplits) \
     if(M==m&&N==n&&K_half==kh){launch_splitk<m,n,kh,nb,sn,im,in,ik,wm,wn,ksplits>(A_data,B_data,B_scale,C);return C;}
 
     // Simple 32x32x64
-    S32(32, 4096, 256, 16, 16, 1, 1)
+    S16(32, 4096, 256, 16, 16, 1, 1)
     S32(32, 2880, 256, 16, 16, 1, 1)
     // S32(64, 7168, 1024, 64, 64, 1, 2)
     S32(256, 3072, 768,  48, 48, 1, 1)
@@ -1124,11 +1131,16 @@ torch::Tensor mfma_gemm(
     S16(8,  2112, 3584, 224, 224, 1, 1)
     //S16(16, 2112, 3584, 224, 224, 1, 1)
     S16(16, 3072, 768,  48,  48, 1, 1)
+    S16(64, 7168, 1024, 64, 64, 1, 1)
 
     // Tiled
     T(64,  3072, 768,  48, 48,  32,32,1536, 32,32,64, 1,1,1)
     T(256, 2880, 256,  16, 16,  128,128,512, 32,32,64, 1,1,1)
-    T(64, 7168, 1024, 64, 64, 32,64,2048, 16, 16, 128, 1, 1, 1)
+    //T(64, 7168, 1024, 64, 64, 64,32,2048, 16,16,128, 1,1,1)
+    //T(256, 3072, 768,  48, 48, 32, 32, 768, 32, 32, 64, 1, 1, 1)
+
+    // Tiled fused
+    //F2(32, 4096, 256, 16, 16, 32, 32, 512, 16, 16, 128, 1, 1, 1, 1)
 
     // Split-K
     SK(16, 2112, 3584, 224, 224, 16,16,128, 1,1, 28)
@@ -1179,10 +1191,6 @@ except: pass
 
 def custom_kernel(data: input_t) -> output_t:
     global HAS_HIP_KERNEL, _hip_module
-    import aiter
-    from aiter import dtypes
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-    from aiter.utility.fp4_utils import e8m0_shuffle
 
     PROFILE = False
     PROFILE_INTERVAL = 200
@@ -1192,39 +1200,68 @@ def custom_kernel(data: input_t) -> output_t:
     m, k = A.shape
     n, _ = B.shape
 
+    if not hasattr(custom_kernel, '_graph_cache'):
+        custom_kernel._graph_cache = {}
+
+    B_data = B_q.view(torch.uint8)
+    B_sc = B_scale_sh.view(torch.uint8)
+    K_half = k // 2
+    num_blocks = (k + 31) // 32
+    scaleN = ((num_blocks + 7) // 8) * 8
+
+    key = (m, n, k)
+
     if HAS_HIP_KERNEL:
         try:
             if PROFILE:
                 if not hasattr(custom_kernel, '_stats'):
                     custom_kernel._stats = {}
-                shape_key = (m, n, k)
-                if shape_key not in custom_kernel._stats:
-                    custom_kernel._stats[shape_key] = {'total': 0.0, 'quant': 0.0, 'count': 0}
+                if key not in custom_kernel._stats:
+                    custom_kernel._stats[key] = {'total': 0.0, 'count': 0}
                 start = torch.cuda.Event(enable_timing=True)
-                mid = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
 
-            B_data = B_q.view(torch.uint8)
-            B_sc = B_scale_sh.view(torch.uint8)
-            K_half = k // 2
-            num_blocks = (k + 31) // 32
-            scaleN = ((num_blocks + 7) // 8) * 8
+            if key not in custom_kernel._graph_cache:
+                A_buf = torch.empty_like(A)
+                B_data_buf = torch.empty_like(B_data)
+                B_sc_buf = torch.empty_like(B_sc)
 
-            out = _hip_module.mfma_gemm(A, B_data, B_sc, m, n, k, K_half, num_blocks, scaleN)
+                A_buf.copy_(A)
+                B_data_buf.copy_(B_data)
+                B_sc_buf.copy_(B_sc)
 
+                # Warmup
+                _hip_module.mfma_gemm(
+                    A_buf, B_data_buf, B_sc_buf,
+                    m, n, k, K_half, num_blocks, scaleN)
+
+                # Capture
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    out = _hip_module.mfma_gemm(
+                        A_buf, B_data_buf, B_sc_buf,
+                        m, n, k, K_half, num_blocks, scaleN)
+
+                custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, out)
+
+            g, A_buf, B_data_buf, B_sc_buf, out = custom_kernel._graph_cache[key]
+
+            A_buf.copy_(A)
+            B_data_buf.copy_(B_data)
+            B_sc_buf.copy_(B_sc)
+
+            g.replay()
 
             if PROFILE:
                 end.record()
                 torch.cuda.synchronize()
-                s = custom_kernel._stats[shape_key]
-                s['quant'] += start.elapsed_time(mid)
+                s = custom_kernel._stats[key]
                 s['total'] += start.elapsed_time(end)
                 s['count'] += 1
                 if s['count'] % PROFILE_INTERVAL == 0:
                     cnt = s['count']
                     print(f"[PROFILE] m={m:4d} n={n:4d} k={k:4d} | "
-                          f"quant={s['quant']/cnt*1000:.1f}us  "
                           f"total={s['total']/cnt*1000:.1f}us  "
                           f"(avg over {cnt} calls)", flush=True)
 
