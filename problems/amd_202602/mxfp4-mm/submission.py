@@ -1092,20 +1092,9 @@ void launch_splitk(torch::Tensor A_bf16,
 
 torch::Tensor mfma_gemm(
     torch::Tensor A_data, torch::Tensor B_data,
-    torch::Tensor B_scale,
+    torch::Tensor B_scale, torch::Tensor C,
     int M, int N, int K, int K_half, int num_blocks, int scaleN
 ) {
-    static torch::Tensor C;
-    static bool init = false;
-    static int sM, sN;
-    if (!init || M != sM || N != sN) {
-        C = torch::empty({M, N},
-            torch::TensorOptions().dtype(torch::kBFloat16).device(A_data.device()));
-        init = true;
-        sM = M;
-        sN = N;
-    }
-
 // Dispatch macro — add WM, WN
 #define S32(m,n,kh,nb,sn,wm,wn) \
     if(M==m&&N==n&&K_half==kh){launch_simple<m,n,kh,nb,sn,32,32,64,wm,wn>(A_data,B_data,B_scale,C);return C;}
@@ -1226,21 +1215,22 @@ def custom_kernel(data: input_t) -> output_t:
                 A_buf = torch.empty_like(A)
                 B_data_buf = torch.empty_like(B_data)
                 B_sc_buf = torch.empty_like(B_sc)
+                C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
 
                 A_buf.copy_(A)
                 B_data_buf.copy_(B_data)
                 B_sc_buf.copy_(B_sc)
 
                 # Warmup
-                _hip_module.mfma_gemm(
-                    A_buf, B_data_buf, B_sc_buf,
-                    m, n, k, K_half, num_blocks, scaleN)
+                # _hip_module.mfma_gemm(
+                #     A_buf, B_data_buf, B_sc_buf,
+                #     m, n, k, K_half, num_blocks, scaleN)
 
                 # Capture
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
                     out = _hip_module.mfma_gemm(
-                        A_buf, B_data_buf, B_sc_buf,
+                        A_buf, B_data_buf, B_sc_buf, C,
                         m, n, k, K_half, num_blocks, scaleN)
 
                 custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, out)
