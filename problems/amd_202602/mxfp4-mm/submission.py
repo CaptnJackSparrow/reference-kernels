@@ -1090,24 +1090,24 @@ void launch_splitk(torch::Tensor A_bf16,
         reinterpret_cast<hip_bfloat16*>(C.data_ptr()));
 }
 
-torch::Tensor mfma_gemm(
+void mfma_gemm(
     torch::Tensor A_data, torch::Tensor B_data,
     torch::Tensor B_scale, torch::Tensor C,
     int M, int N, int K, int K_half, int num_blocks, int scaleN
 ) {
 // Dispatch macro — add WM, WN
 #define S32(m,n,kh,nb,sn,wm,wn) \
-    if(M==m&&N==n&&K_half==kh){launch_simple<m,n,kh,nb,sn,32,32,64,wm,wn>(A_data,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){return launch_simple<m,n,kh,nb,sn,32,32,64,wm,wn>(A_data,B_data,B_scale,C);}
 #define S16(m,n,kh,nb,sn,wm,wn) \
-    if(M==m&&N==n&&K_half==kh){launch_simple<m,n,kh,nb,sn,16,16,128,wm,wn>(A_data,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){return launch_simple<m,n,kh,nb,sn,16,16,128,wm,wn>(A_data,B_data,B_scale,C);}
 #define T(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs) \
-    if(M==m&&N==n&&K_half==kh){launch_tiled<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){return launch_tiled<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C);}
 #define F(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs) \
-    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){return launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C);}
 #define F2(m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ) \
-    if(M==m&&N==n&&K_half==kh){launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ>(A_data,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){return launch_tiled_fused<m,n,kh,nb,sn,om,on,ok,im,in,ik,wtm,wtn,bufs,occ>(A_data,B_data,B_scale,C);}
 #define SK(m,n,kh,nb,sn,im,in,ik,wm,wn,ksplits) \
-    if(M==m&&N==n&&K_half==kh){launch_splitk<m,n,kh,nb,sn,im,in,ik,wm,wn,ksplits>(A_data,B_data,B_scale,C);return C;}
+    if(M==m&&N==n&&K_half==kh){return launch_splitk<m,n,kh,nb,sn,im,in,ik,wm,wn,ksplits>(A_data,B_data,B_scale,C);}
 
     // Simple 32x32x64
     S16(32, 4096, 256, 16, 16, 1, 1)
@@ -1139,7 +1139,6 @@ torch::Tensor mfma_gemm(
 #undef SK
 
     TORCH_CHECK(false, "No template for M=", M, " N=", N, " K_half=", K_half);
-    return C;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1188,6 +1187,7 @@ def custom_kernel(data: input_t) -> output_t:
     A = A.contiguous()
     m, k = A.shape
     n, _ = B.shape
+    # C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
 
     if not hasattr(custom_kernel, '_graph_cache'):
         custom_kernel._graph_cache = {}
@@ -1215,33 +1215,35 @@ def custom_kernel(data: input_t) -> output_t:
                 A_buf = torch.empty_like(A)
                 B_data_buf = torch.empty_like(B_data)
                 B_sc_buf = torch.empty_like(B_sc)
-                C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+                C_buf = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
 
                 A_buf.copy_(A)
                 B_data_buf.copy_(B_data)
                 B_sc_buf.copy_(B_sc)
 
                 # Warmup
-                # _hip_module.mfma_gemm(
-                #     A_buf, B_data_buf, B_sc_buf,
-                #     m, n, k, K_half, num_blocks, scaleN)
+                _hip_module.mfma_gemm(
+                    A_buf, B_data_buf, B_sc_buf, C_buf,
+                    m, n, k, K_half, num_blocks, scaleN)
 
                 # Capture
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
-                    out = _hip_module.mfma_gemm(
-                        A_buf, B_data_buf, B_sc_buf, C,
+                    _hip_module.mfma_gemm(
+                        A_buf, B_data_buf, B_sc_buf, C_buf,
                         m, n, k, K_half, num_blocks, scaleN)
 
-                custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, out)
+                custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, C_buf)
 
-            g, A_buf, B_data_buf, B_sc_buf, out = custom_kernel._graph_cache[key]
+            g, A_buf, B_data_buf, B_sc_buf, C_buf = custom_kernel._graph_cache[key]
 
             A_buf.copy_(A)
             B_data_buf.copy_(B_data)
             B_sc_buf.copy_(B_sc)
 
             g.replay()
+
+            # C.copy_(C_buf)
 
             if PROFILE:
                 end.record()
@@ -1255,7 +1257,7 @@ def custom_kernel(data: input_t) -> output_t:
                           f"total={s['total']/cnt*1000:.1f}us  "
                           f"(avg over {cnt} calls)", flush=True)
 
-            return out
+            return C_buf
         except Exception as e:
             print(f"[mxfp4-mm] MFMA kernel failed for m={m} n={n} k={k}: {e}", flush=True)
 
