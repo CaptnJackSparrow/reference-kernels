@@ -1190,7 +1190,10 @@ def custom_kernel(data: input_t) -> output_t:
     # C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
 
     if not hasattr(custom_kernel, '_graph_cache'):
-        custom_kernel._graph_cache = {}
+        custom_kernel._graph_cache = None
+
+    if not hasattr(custom_kernel, '_prev_shape'):
+        custom_kernel._prev_shape = None
 
     B_data = B_q.view(torch.uint8)
     B_sc = B_scale_sh.view(torch.uint8)
@@ -1201,6 +1204,7 @@ def custom_kernel(data: input_t) -> output_t:
     key = (m, n, k)
 
     if HAS_HIP_KERNEL:
+        sync = False
         try:
             if PROFILE:
                 if not hasattr(custom_kernel, '_stats'):
@@ -1211,7 +1215,7 @@ def custom_kernel(data: input_t) -> output_t:
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
 
-            if key not in custom_kernel._graph_cache:
+            if custom_kernel._prev_shape != key:
                 A_buf = torch.empty_like(A)
                 B_data_buf = torch.empty_like(B_data)
                 B_sc_buf = torch.empty_like(B_sc)
@@ -1233,15 +1237,23 @@ def custom_kernel(data: input_t) -> output_t:
                         A_buf, B_data_buf, B_sc_buf, C_buf,
                         m, n, k, K_half, num_blocks, scaleN)
 
-                custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, C_buf)
+                custom_kernel._graph_cache = (g, A_buf, B_data_buf, B_sc_buf, C_buf)
+                custom_kernel._prev_shape = key
+                sync = True
 
-            g, A_buf, B_data_buf, B_sc_buf, C_buf = custom_kernel._graph_cache[key]
+            g, A_buf, B_data_buf, B_sc_buf, C_buf = custom_kernel._graph_cache
 
             A_buf.copy_(A)
             B_data_buf.copy_(B_data)
             B_sc_buf.copy_(B_sc)
 
             g.replay()
+
+            if sync:
+                torch.cuda.synchronize()
+                C = torch.empty_like(C_buf)
+                C.copy_(C_buf)
+                return C
 
             # C.copy_(C_buf)
 
