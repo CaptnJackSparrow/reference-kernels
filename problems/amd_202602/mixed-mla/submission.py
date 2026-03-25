@@ -744,6 +744,227 @@ void mla_mxfp4_decode_kernel_bs4_kv1024(
         }
     }
 }
+
+// =====================================================================
+// MFMA FP4 types and helpers (from mxfp4-mm)
+// =====================================================================
+
+constexpr int FMT_FP4_MFMA = 4;
+
+typedef float __attribute__((ext_vector_type(4))) mla_float4_t;
+typedef int __attribute__((ext_vector_type(8))) mla_int8_vec;
+typedef uint32_t __attribute__((ext_vector_type(4))) mla_uint128_vec;
+
+struct MlaQuantBlock {
+    uint32_t data[4];
+    uint8_t e8m0;
+};
+
+__device__ __forceinline__ void mla_load_bf16x32(const hip_bfloat16* ptr, float vals[32]) {
+    for (int chunk_off = 0; chunk_off < 32; chunk_off += 8) {
+        uint32_t raw[4];
+        *reinterpret_cast<mla_uint128_vec*>(&raw[0]) =
+            *reinterpret_cast<const mla_uint128_vec*>(&ptr[chunk_off]);
+        for (int j = 0; j < 4; j++) {
+            uint32_t pair = raw[j];
+            vals[chunk_off + j * 2 + 0] = __uint_as_float((pair & 0xFFFF) << 16);
+            vals[chunk_off + j * 2 + 1] = __uint_as_float(pair & 0xFFFF0000u);
+        }
+    }
+}
+
+__device__ __forceinline__ MlaQuantBlock mla_quantize_fp4_block(const float vals[32]) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++)
+        amax = fmaxf(amax, fabsf(vals[i]));
+
+    uint8_t e8m0;
+    float quant_scale;
+    if (amax == 0.0f) {
+        e8m0 = 0; quant_scale = 0.0f;
+    } else {
+        uint32_t amax_bits = __float_as_uint(amax);
+        amax_bits = (amax_bits + 0x200000u) & 0xFF800000u;
+        int raw_exp = (int)((amax_bits >> 23) & 0xFF);
+        int e8m0_unbiased = raw_exp - 127 - 2;
+        e8m0_unbiased = max(-127, min(127, e8m0_unbiased));
+        e8m0 = (uint8_t)(e8m0_unbiased + 127);
+        quant_scale = __uint_as_float((uint32_t)(127 - e8m0_unbiased) << 23);
+    }
+
+    uint32_t pack[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 16; i++) {
+        uint8_t packed = 0;
+        for (int j = 0; j < 2; j++) {
+            float v = vals[2 * i + j];
+            float qx = v * quant_scale;
+            uint32_t qx_bits = __float_as_uint(qx);
+            uint32_t sign = qx_bits & 0x80000000u;
+            qx_bits ^= sign;
+            float qx_abs = __uint_as_float(qx_bits);
+
+            uint8_t fp4;
+            if (qx_abs >= 6.0f) {
+                fp4 = 0x7;
+            } else if (qx_abs < 1.0f) {
+                constexpr uint32_t denorm_magic = 149u << 23;
+                float denorm = qx_abs + __uint_as_float(denorm_magic);
+                uint32_t denorm_bits = __float_as_uint(denorm) - denorm_magic;
+                fp4 = (uint8_t)denorm_bits;
+            } else {
+                uint32_t mant_odd = (qx_bits >> 22) & 1;
+                constexpr int32_t val_to_add = 0xC11FFFFF;
+                qx_bits = (uint32_t)((int32_t)qx_bits + val_to_add);
+                qx_bits += mant_odd;
+                fp4 = (uint8_t)(qx_bits >> 22);
+            }
+            fp4 |= (uint8_t)(sign >> 28);
+            packed |= fp4 << (4 * j);
+        }
+        pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
+    }
+
+    MlaQuantBlock result;
+    *reinterpret_cast<mla_uint128_vec*>(&result.data) = *reinterpret_cast<mla_uint128_vec*>(&pack);
+    result.e8m0 = e8m0;
+    return result;
+}
+
+// Quantize Q: one thread per 32-element block
+template <int M, int K, int K_HALF, int NUM_BLOCKS_Q>
+__global__ void mla_quant_q_kernel(
+    const hip_bfloat16* __restrict__ Q,
+    uint8_t* __restrict__ out_data,
+    uint8_t* __restrict__ out_scale
+) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = gid / NUM_BLOCKS_Q;
+    int blk = gid % NUM_BLOCKS_Q;
+
+    float vals[32];
+    int k_start = blk * 32;
+    if (k_start + 31 < K) {
+        mla_load_bf16x32(&Q[row * K + k_start], vals);
+    } else {
+        // Partial block at end (K=576: last block has 576%32=0, but for padded K)
+        for (int i = 0; i < 32; i++) {
+            vals[i] = (k_start + i < K) ? float(Q[row * K + k_start + i]) : 0.0f;
+        }
+    }
+
+    MlaQuantBlock qb = mla_quantize_fp4_block(vals);
+    int data_off = row * (NUM_BLOCKS_Q * 16) + blk * 16;
+    *reinterpret_cast<mla_uint128_vec*>(&out_data[data_off]) =
+        *reinterpret_cast<mla_uint128_vec*>(&qb.data);
+    out_scale[row + blk * M] = qb.e8m0;  // column-major
+}
+
+// =====================================================================
+// MLA QK^T kernel: MFMA FP4, fp32 output, batched, linear B scales
+// =====================================================================
+
+__device__ __forceinline__ int32_t mla_broadcast_scale(uint8_t e8m0) {
+    return (int32_t)e8m0 * 0x01010101;
+}
+
+template <int M, int N, int K_HALF, int NUM_BLOCKS, int B_SCALE_STRIDE,
+          int A_K_HALF>
+__global__ void __launch_bounds__(64) mla_qkt_mxfp4_kernel(
+    const uint8_t* __restrict__ A_data,
+    const uint8_t* __restrict__ B_data,
+    const uint8_t* __restrict__ A_scale,
+    const uint8_t* __restrict__ B_scale,
+    float* __restrict__ C
+) {
+    constexpr int IM = 16;
+    constexpr int IN = 16;
+    constexpr int IK = 128;
+    constexpr int BPC = IK / 32;  // 4
+    constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;  // ceil(18/4)=5
+
+    const int lane = threadIdx.x % 64;
+    const int batch_idx = blockIdx.z;
+    const int tile_n = blockIdx.y * IN;
+
+    const uint8_t* a_data = A_data + batch_idx * M * A_K_HALF;
+    const uint8_t* a_scale = A_scale + batch_idx * (NUM_BLOCKS * M);
+    const uint8_t* b_data = B_data + batch_idx * N * K_HALF;
+    const uint8_t* b_scale = B_scale + batch_idx * N * B_SCALE_STRIDE;
+    float* c_out = C + batch_idx * M * N;
+
+    mla_float4_t acc = {};
+
+    uint32_t a_cur[8], b_cur[8];
+    uint32_t a_nxt[8], b_nxt[8];
+    int32_t a_sc_cur, b_sc_cur, a_sc_nxt, b_sc_nxt;
+
+    // Helper: safe load tile - clamps OOB block reads
+    auto load_safe = [&](const uint8_t* src, int row_base, int blk0,
+                         int stride, int max_rows, int max_blks,
+                         uint32_t reg[8], int& blk_out, int& row_out,
+                         const uint8_t* scale_src, int scale_stride, bool is_col_major_scale,
+                         int scale_M, int32_t& sc_out) {
+        row_out = row_base + (lane % IM);
+        int k_group = lane / IM;
+        blk_out = blk0 + k_group;
+
+        // Clamp to safe range
+        int safe_row = min(row_out, max(max_rows - 1, 0));
+        int safe_blk = min(blk_out, max(max_blks - 1, 0));
+        int off = safe_row * stride + safe_blk * 16;
+        *reinterpret_cast<mla_uint128_vec*>(&reg[0]) = *reinterpret_cast<const mla_uint128_vec*>(&src[off]);
+        reg[4] = reg[5] = reg[6] = reg[7] = 0;
+
+        uint8_t e = 127;
+        if (row_out < max_rows && blk_out < max_blks) {
+            if (is_col_major_scale)
+                e = scale_src[row_out + blk_out * scale_M];
+            else
+                e = scale_src[row_out * scale_stride + blk_out];
+        } else {
+            reg[0] = reg[1] = reg[2] = reg[3] = 0;
+        }
+        sc_out = mla_broadcast_scale(e);
+    };
+
+    // Load first K tile
+    int a_row, a_blk, b_row, b_blk;
+    load_safe(a_data, 0, 0, A_K_HALF, M, NUM_BLOCKS, a_cur, a_blk, a_row,
+              a_scale, 0, true, M, a_sc_cur);
+    load_safe(b_data, tile_n, 0, K_HALF, N, NUM_BLOCKS, b_cur, b_blk, b_row,
+              b_scale, B_SCALE_STRIDE, false, 0, b_sc_cur);
+
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        if (ki + 1 < K_ITERS) {
+            int next_blk0 = (ki + 1) * BPC;
+            load_safe(a_data, 0, next_blk0, A_K_HALF, M, NUM_BLOCKS, a_nxt, a_blk, a_row,
+                      a_scale, 0, true, M, a_sc_nxt);
+            load_safe(b_data, tile_n, next_blk0, K_HALF, N, NUM_BLOCKS, b_nxt, b_blk, b_row,
+                      b_scale, B_SCALE_STRIDE, false, 0, b_sc_nxt);
+        }
+
+        // 16x16x128 MFMA FP4
+        mla_int8_vec a_vec = {(int)a_cur[0], (int)a_cur[1], (int)a_cur[2], (int)a_cur[3],
+                              (int)a_cur[4], (int)a_cur[5], (int)a_cur[6], (int)a_cur[7]};
+        mla_int8_vec b_vec = {(int)b_cur[0], (int)b_cur[1], (int)b_cur[2], (int)b_cur[3],
+                              (int)b_cur[4], (int)b_cur[5], (int)b_cur[6], (int)b_cur[7]};
+        acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+            a_vec, b_vec, acc, FMT_FP4_MFMA, FMT_FP4_MFMA, 0, a_sc_cur, 0, b_sc_cur);
+
+        for (int r = 0; r < 8; r++) { a_cur[r] = a_nxt[r]; b_cur[r] = b_nxt[r]; }
+        a_sc_cur = a_sc_nxt; b_sc_cur = b_sc_nxt;
+    }
+
+    // Store fp32 output: (M, N)
+    int col = lane % 16;
+    int quad = lane / 16;
+    for (int i = 0; i < 4; i++) {
+        int row = i + 4 * quad;
+        int gn = tile_n + col;
+        if (row < M && gn < N)
+            c_out[row * N + gn] = acc[i];
+    }
+}
 '''
 
 # C++ wrapper for PyTorch load_inline compilation - optimized for MI355X
@@ -830,8 +1051,100 @@ torch::Tensor mla_mxfp4_decode_forward(
     return output;
 }
 
+torch::Tensor mla_qkt_forward(
+    torch::Tensor Q_bf16,       // (batch_size * 16, 576) bf16
+    torch::Tensor KV_data,      // (batch_size * kv_seq_len, 288) uint8
+    torch::Tensor KV_scale,     // (batch_size * kv_seq_len, scale_stride) uint8
+    int batch_size, int kv_seq_len
+) {
+    constexpr int M = 16;           // num_heads
+    constexpr int K = 576;          // qk_head_dim
+    constexpr int K_HALF = 288;
+    constexpr int NUM_BLOCKS = 18;  // 576/32
+    constexpr int IN = 16;
+
+    int N = kv_seq_len;
+    int B_SCALE_STRIDE = KV_scale.stride(0);
+
+    // Static scratch buffers for Q quantization
+    static torch::Tensor q_data_buf, q_scale_buf;
+    static bool init = false;
+    static int last_batch = 0;
+    if (!init || batch_size != last_batch) {
+        auto u8opts = torch::TensorOptions().dtype(torch::kUInt8).device(Q_bf16.device());
+        q_data_buf = torch::empty({batch_size * M, NUM_BLOCKS * 16}, u8opts);
+        q_scale_buf = torch::empty({batch_size * NUM_BLOCKS * M}, u8opts);
+        init = true;
+        last_batch = batch_size;
+    }
+
+    // 1. Quantize Q to MXFP4 — per batch so scale layout matches GEMM (M=16)
+    constexpr int A_K_HALF = NUM_BLOCKS * 16;  // 288 (matches K_HALF for K=576)
+    constexpr int q_per_batch = M * NUM_BLOCKS;  // 16 * 18 = 288 threads per batch
+    constexpr int q_block = 64;
+    for (int b = 0; b < batch_size; b++) {
+        constexpr int q_grid_per_batch = (q_per_batch + q_block - 1) / q_block;
+        hipLaunchKernelGGL((mla_quant_q_kernel<M, K, K_HALF, NUM_BLOCKS>),
+            dim3(q_grid_per_batch), dim3(q_block), 0, 0,
+            reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()) + b * M * K,
+            reinterpret_cast<uint8_t*>(q_data_buf.data_ptr()) + b * M * A_K_HALF,
+            reinterpret_cast<uint8_t*>(q_scale_buf.data_ptr()) + b * NUM_BLOCKS * M);
+    }
+
+    // 2. QK^T GEMM
+    auto scores = torch::empty({batch_size, M, N},
+        torch::TensorOptions().dtype(torch::kFloat32).device(Q_bf16.device()));
+
+    dim3 grid(1, (N + IN - 1) / IN, batch_size);
+    dim3 block(64);
+
+    if (B_SCALE_STRIDE == 18 || B_SCALE_STRIDE == 24) {
+        // Common cases
+        if (B_SCALE_STRIDE == 18) {
+            if (N == 1024) {
+                hipLaunchKernelGGL((mla_qkt_mxfp4_kernel<M, 1024, K_HALF, NUM_BLOCKS, 18, A_K_HALF>),
+                    grid, block, 0, 0,
+                    reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+                    reinterpret_cast<float*>(scores.data_ptr()));
+            } else if (N == 8192) {
+                hipLaunchKernelGGL((mla_qkt_mxfp4_kernel<M, 8192, K_HALF, NUM_BLOCKS, 18, A_K_HALF>),
+                    grid, block, 0, 0,
+                    reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+                    reinterpret_cast<float*>(scores.data_ptr()));
+            }
+        } else {
+            if (N == 1024) {
+                hipLaunchKernelGGL((mla_qkt_mxfp4_kernel<M, 1024, K_HALF, NUM_BLOCKS, 24, A_K_HALF>),
+                    grid, block, 0, 0,
+                    reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+                    reinterpret_cast<float*>(scores.data_ptr()));
+            } else if (N == 8192) {
+                hipLaunchKernelGGL((mla_qkt_mxfp4_kernel<M, 8192, K_HALF, NUM_BLOCKS, 24, A_K_HALF>),
+                    grid, block, 0, 0,
+                    reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
+                    reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+                    reinterpret_cast<float*>(scores.data_ptr()));
+            }
+        }
+    }
+
+    return scores;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &mla_mxfp4_decode_forward, "MLA MXFP4 Decode Forward (MI355X Optimized)");
+    m.def("mla_qkt_forward", &mla_qkt_forward);
 }
 '''
 
@@ -1511,46 +1824,55 @@ def _pytorch_mla_attention(
 # ---------------------------------------------------------------------------
 # Dispatcher: select kernel based on QKV_DTYPE
 # ---------------------------------------------------------------------------
-
 def custom_kernel(data: input_t) -> output_t:
-    """Dispatch to the appropriate kernel based on QKV_DTYPE."""
-    global HAS_HIP_KERNEL
-
     q, kv_data, qo_indptr, kv_indptr, config = data
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
-    qkv_type = QKV_DTYPE
-    if batch_size == 4:
-      if kv_seq_len <= 1024:
-        qkv_type = "bf16"
-      else:
-        qkv_type = "fp8"
-    elif batch_size == 32:
-      if kv_seq_len <= 1024:
-        qkv_type = "bf16"
-      else:
-        qkv_type = "fp8"
-    elif batch_size == 64:
-      if kv_seq_len <= 1024:
-        qkv_type = "bf16"
-      else:
-        qkv_type = "fp8"
-    elif batch_size == 256:
-      if kv_seq_len <= 1024:
-        qkv_type = "fp8"
-      else:
-        qkv_type = "fp8"
 
-    if qkv_type == "fp8":
-        return custom_kernel_fp8(data)
-    elif qkv_type == "bf16":
+    if batch_size <= 4 and kv_seq_len <= 1024:
         return custom_kernel_bf16(data)
-    elif qkv_type == "mxfp4_dequant":
-        return custom_kernel_mxfp4_dequant(data)
-    elif qkv_type == "mxfp4_native":
-        return custom_kernel_mxfp4_native(data)
     else:
-        raise ValueError(f"Invalid QKV_DTYPE: {qkv_type}")
+        return custom_kernel_mxfp4_qkt(data)
+
+# def custom_kernel(data: input_t) -> output_t:
+#     """Dispatch to the appropriate kernel based on QKV_DTYPE."""
+#     global HAS_HIP_KERNEL
+
+#     q, kv_data, qo_indptr, kv_indptr, config = data
+#     batch_size = config["batch_size"]
+#     kv_seq_len = config["kv_seq_len"]
+#     qkv_type = QKV_DTYPE
+#     if batch_size == 4:
+#       if kv_seq_len <= 1024:
+#         qkv_type = "bf16"
+#       else:
+#         qkv_type = "fp8"
+#     elif batch_size == 32:
+#       if kv_seq_len <= 1024:
+#         qkv_type = "bf16"
+#       else:
+#         qkv_type = "fp8"
+#     elif batch_size == 64:
+#       if kv_seq_len <= 1024:
+#         qkv_type = "bf16"
+#       else:
+#         qkv_type = "fp8"
+#     elif batch_size == 256:
+#       if kv_seq_len <= 1024:
+#         qkv_type = "fp8"
+#       else:
+#         qkv_type = "fp8"
+
+#     if qkv_type == "fp8":
+#         return custom_kernel_fp8(data)
+#     elif qkv_type == "bf16":
+#         return custom_kernel_bf16(data)
+#     elif qkv_type == "mxfp4_dequant":
+#         return custom_kernel_mxfp4_dequant(data)
+#     elif qkv_type == "mxfp4_native":
+#         return custom_kernel_mxfp4_native(data)
+#     else:
+#         raise ValueError(f"Invalid QKV_DTYPE: {qkv_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -1558,27 +1880,64 @@ def custom_kernel(data: input_t) -> output_t:
 # ---------------------------------------------------------------------------
 
 def custom_kernel_fp8(data: input_t) -> output_t:
-    """
-    MLA decode using aiter's a8w8 persistent kernel (fp8 Q + fp8 KV).
-
-    For small batches, uses fast SDPA path to avoid aiter overhead.
-    For larger batches, uses aiter's a8w8 kernel for better throughput.
-    """
     q, kv_data, qo_indptr, kv_indptr, config = data
     batch_size = config["batch_size"]
+    kv_seq_len = config["kv_seq_len"]
 
-    # Use fast path for small batches to avoid aiter overhead
-    if batch_size <= 4:
+    # Only use fast SDPA for small batches AND short KV
+    if batch_size <= 4 and kv_seq_len <= 1024:
         kv_buffer_bf16 = kv_data["bf16"]
         return _fast_mla_attention(q, kv_buffer_bf16, config)
 
+    # Use aiter fp8 for everything else
     q_fp8, q_scale = quantize_fp8(q)
     kv_buffer_fp8, kv_scale_fp8 = kv_data["fp8"]
-
     return _aiter_mla_decode(
         q_fp8, kv_buffer_fp8, qo_indptr, kv_indptr, config,
         q_scale=q_scale, kv_scale=kv_scale_fp8,
     )
+
+def custom_kernel_mxfp4_qkt(data: input_t) -> output_t:
+    """MLA decode using MFMA FP4 for QK^T, bf16 for attn·V."""
+    q, kv_data, qo_indptr, kv_indptr, config = data
+    batch_size = config["batch_size"]
+    num_heads = config["num_heads"]
+    kv_seq_len = config["kv_seq_len"]
+    v_head_dim = config["v_head_dim"]
+    sm_scale = config["sm_scale"]
+
+    kv_buffer_mxfp4, kv_scale_mxfp4 = kv_data["mxfp4"]
+    total_q = q.shape[0]
+
+    # Reshape Q: (total_q, 16, 576) → (batch_size * 16, 576)
+    q_flat = q.view(batch_size * num_heads, 576).contiguous()
+
+    # KV data: (total_kv, 1, 288) → (total_kv, 288)
+    kv_data_flat = kv_buffer_mxfp4.view(-1, 288).contiguous()
+    kv_scale_flat = kv_scale_mxfp4.view(-1, kv_scale_mxfp4.shape[-1]).contiguous()
+    if batch_size == 32 and kv_seq_len == 8192:
+        print(f"kv_scale shape={kv_scale_flat.shape} stride={kv_scale_flat.stride()} dtype={kv_scale_flat.dtype}", flush=True)
+
+    # 1-2. Quantize Q + QK^T GEMM → fp32 scores (batch, 16, kv_seq_len)
+    scores = _torch_hip_module.mla_qkt_forward(
+        q_flat, kv_data_flat, kv_scale_flat,
+        batch_size, kv_seq_len)
+
+    # 3. Softmax
+    scores = scores * sm_scale
+    attn_weights = torch.softmax(scores, dim=-1)  # (batch, 16, kv_seq_len)
+
+    # 4. Dequant V to bf16
+    total_kv = kv_buffer_mxfp4.shape[0]
+    v_bf16 = dequantize_mxfp4(
+        kv_buffer_mxfp4, kv_scale_mxfp4,
+        (total_kv, 1, 576), dtype=torch.bfloat16
+    )[:, 0, :v_head_dim].view(batch_size, kv_seq_len, v_head_dim)
+
+    # 5. attn × V: (batch, 16, kv_seq_len) @ (batch, kv_seq_len, 512) → (batch, 16, 512)
+    output = torch.bmm(attn_weights.to(torch.bfloat16), v_bf16)
+
+    return output.view(total_q, num_heads, v_head_dim)
 
 
 # ---------------------------------------------------------------------------

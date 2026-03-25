@@ -1,0 +1,96 @@
+"**MI355X on GitHub ✅ success**
+> Workflow [23529057420](<https://github.com/gpu-mode/kernelbot/actions/runs/23529057420>) completed
+> Downloading artifacts... done
+> ✅ Compilation successful
+> ❌ Benchmarking failed
+
+Running on:
+* GPU: `AMD Instinct MI355X`
+* CPU: `AMD EPYC 9575F 64-Core Processor`
+* Device count: `1`
+* Runtime: `ROCm`
+* Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
+* Torch: `2.10.0+rocm7.1`
+* Hostname: `arc-runner-set-h82gb-runner-9wds8`
+
+
+## Benchmarks:
+```
+seed: 4217; qseqlen: 1; kvseqlen: 1024; batchsize: 4
+ ⏱ 63.8 ± 0.06 µs
+ ⚡ 62.2 µs 🐌 96.6 µs
+
+seed: 4220; qseqlen: 1; kvseqlen: 8192; batchsize: 4
+ ⏱ 273 ± 0.9 µs
+ ⚡ 263 µs 🐌 810 µs
+
+seed: 5412; qseqlen: 1; kvseqlen: 1024; batchsize: 32
+ ⏱ 384 ± 0.8 µs
+ ⚡ 368 µs 🐌 566 µs
+
+❌ seed: 5415; qseqlen: 1; kvseqlen: 8192; batchsize: 32 failed testing:
+
+Number of mismatched elements: 14807\
+ERROR at (0, 0, 0): -0.25 0.025634765625\
+ERROR at (0, 0, 1): 0.5 0.0181884765625\
+ERROR at (0, 0, 2): -1.5 -0.047119140625\
+ERROR at (0, 0, 3): -1.0 0.068359375\
+ERROR at (0, 0, 4): 0.25 -0.04443359375\
+... and 14802 more mismatched elements.
+
+seed: 1357; qseqlen: 1; kvseqlen: 1024; batchsize: 64
+ ⏱ 714 ± 0.7 µs
+ ⚡ 702 µs 🐌 737 µs
+
+seed: 1360; qseqlen: 1; kvseqlen: 8192; batchsize: 64
+ ⏱ 3.87 ± 0.003 ms
+ ⚡ 3.86 ms 🐌 3.88 ms
+
+seed: 9823; qseqlen: 1; kvseqlen: 1024; batchsize: 256
+ ⏱ 2.73 ± 0.003 ms
+ ⚡ 2.72 ms 🐌 2.76 ms
+
+seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
+ ⏱ 15.2 ± 0.01 ms
+ ⚡ 15.2 ms 🐌 15.2 ms
+```
+
+## Program stderr:
+```
+[aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
+\u001b[92mSuccessfully preprocessed all matching files.\u001b[0m
+[aiter] start build [module_mla_metadata] under /home/runner/aiter/aiter/jit/build/module_mla_metadata
+[aiter] \u001b[32mfinish build [module_mla_metadata], cost 32.0s \u001b[0m
+[aiter] import [module_mla_metadata] under /home/runner/aiter/aiter/jit/module_mla_metadata.so
+[aiter] type hints mismatch, override to --> get_mla_metadata_v1(seqlens_qo_indptr: torch.Tensor, seqlens_kv_indptr: torch.Tensor, kv_last_page_lens: torch.Tensor, num_heads_per_head_k: int | typing.SupportsIndex, num_heads_k: int | typing.SupportsIndex, is_causal: bool, work_metadata_ptrs: torch.Tensor, work_info_set: torch.Tensor, work_indptr: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: torch.Tensor, reduce_partial_map: torch.Tensor, page_size: int | typing.SupportsIndex = 1, kv_granularity: int | typing.SupportsIndex = 16, max_seqlen_qo: int | typing.SupportsIndex = -1, uni_seqlen_qo: int | typing.SupportsIndex = -1, fast_mode: bool = True, topk: int | typing.SupportsIndex = -1, max_split_per_batch: int | typing.SupportsIndex = -1, intra_batch_mode: bool = False, dtype_q: Optional[torch.dtype] = None, dtype_kv: Optional[torch.dtype] = None) -> None
+[aiter] start build [module_mla_asm] under /home/runner/aiter/aiter/jit/build/module_mla_asm
+/home/runner/aiter/hsa/codegen.py:13: Pandas4Warning: 'future.no_silent_downcasting' is deprecated, please refrain from using it.
+  pd.set_option(\"future.no_silent_downcasting\", True)
+/home/runner/aiter/hsa/codegen.py:86: Pandas4Warning: The copy keyword is deprecated and will be removed in a future version. Copy-on-Write is active in pandas since 3.0 which utilizes a lazy copy mechanism that defers copies until necessary. Use .copy() to make an eager copy if necessary.
+  pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
+[aiter] \u001b[32mfinish build [module_mla_asm], cost 21.0s \u001b[0m
+[aiter] import [module_mla_asm] under /home/runner/aiter/aiter/jit/module_mla_asm.so
+[aiter] type hints mismatch, override to --> mla_decode_stage1_asm_fwd(Q: torch.Tensor, KV: torch.Tensor, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_page_indices: torch.Tensor, kv_last_page_lens: torch.Tensor, num_kv_splits_indptr: Optional[torch.Tensor], work_meta_data: Optional[torch.Tensor], work_indptr: Optional[torch.Tensor], work_info_set: Optional[torch.Tensor], max_seqlen_q: int | typing.SupportsIndex, page_size: int | typing.SupportsIndex, nhead_kv: int | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, splitData: torch.Tensor, splitLse: torch.Tensor, output: torch.Tensor, q_scale: Optional[torch.Tensor] = None, kv_scale: Optional[torch.Tensor] = None) -> None
+[aiter] start build [module_mla_reduce] under /home/runner/aiter/aiter/jit/build/module_mla_reduce
+[aiter] \u001b[32mfinish build [module_mla_reduce], cost 174.2s \u001b[0m
+[aiter] import [module_mla_reduce] under /home/runner/aiter/aiter/jit/module_mla_reduce.so
+[aiter] type hints mismatch, override to --> mla_reduce_v1(partial_output: torch.Tensor, partial_lse: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: Optional[torch.Tensor], reduce_partial_map: torch.Tensor, max_seqlen_q: int | typing.SupportsIndex, final_output: torch.Tensor, final_lse: Optional[torch.Tensor] = None) -> None```
+
+## Program stdout:
+```
+[PyTorch] Starting compilation...
+[PyTorch] Setup took 0.00s
+[PyTorch] Starting load_inline...
+/home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/main.cpp -> /home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/main.cpp [skipped, no changes]
+/home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/cuda.cu -> /home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/hip.hip [skipped, already hipified]
+Total number of unsupported CUDA function calls: 0
+
+
+Total number of replaced kernel launches: 0
+ninja: no work to do.
+[PyTorch] load_inline took 0.42s
+[PyTorch] Total compilation time: 0.42s
+[aiter] hipModuleLoad: /home/runner/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co GetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE
+[aiter] hipModuleGetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE Success
+kv_scale shape=torch.Size([262144, 24]) stride=(24, 1) dtype=torch.float8_e8m0fnu```"

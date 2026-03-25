@@ -941,6 +941,12 @@ MXFP4_CPP_SOURCE = r'''
 #include <hip/hip_bfloat16.h>
 #include <ATen/hip/HIPContext.h>
 
+static int g_generation = 0;
+
+void reset_buffers() {
+    g_generation++;
+}
+
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1>
@@ -949,12 +955,12 @@ void launch_simple(torch::Tensor A_bf16,
                     torch::Tensor C) {
     // Pre-allocated scratch (allocated once, reused)
     static torch::Tensor A_data_buf, A_scale_buf;
-    static bool init = false;
-    if (!init) {
+    static int local_gen = -1;
+    if (local_gen != g_generation) {
         auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(A_bf16.device());
         A_data_buf = torch::empty({M, K_HALF}, opts);
         A_scale_buf = torch::empty({NUM_BLOCKS * M}, opts);
-        init = true;
+        local_gen = g_generation;
     }
 
     // Launch quant kernel
@@ -988,12 +994,12 @@ void launch_tiled(torch::Tensor A_bf16,
                     torch::Tensor C) {
     // Pre-allocated scratch (allocated once, reused)
     static torch::Tensor A_data_buf, A_scale_buf;
-    static bool init = false;
-    if (!init) {
+    static int local_gen = -1;
+    if (local_gen != g_generation) {
         auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(A_bf16.device());
         A_data_buf = torch::empty({M, K_HALF}, opts);
         A_scale_buf = torch::empty({NUM_BLOCKS * M}, opts);
-        init = true;
+        local_gen = g_generation;
     }
 
     // Launch quant kernel
@@ -1046,14 +1052,14 @@ void launch_splitk(torch::Tensor A_bf16,
                    torch::Tensor C) {
     // Pre-allocated scratch
     static torch::Tensor A_data_buf, A_scale_buf, ws_buf;
-    static bool init = false;
-    if (!init) {
+    static int local_gen = -1;
+    if (local_gen != g_generation) {
         auto u8opts = torch::TensorOptions().dtype(torch::kUInt8).device(A_bf16.device());
         auto f32opts = torch::TensorOptions().dtype(torch::kFloat32).device(A_bf16.device());
         A_data_buf = torch::empty({M, K_HALF}, u8opts);
         A_scale_buf = torch::empty({NUM_BLOCKS * M}, u8opts);
         ws_buf = torch::empty({K_SPLITS * M * N}, f32opts);
-        init = true;
+        local_gen = g_generation;
     }
 
     // Launch quant kernel
@@ -1143,6 +1149,7 @@ void mfma_gemm(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mfma_gemm", &mfma_gemm);
+    m.def("reset_buffers", &reset_buffers);
 }
 '''
 
@@ -1180,6 +1187,7 @@ except: pass
 def custom_kernel(data: input_t) -> output_t:
     global HAS_HIP_KERNEL, _hip_module
 
+    USE_GRAPHS = True
     PROFILE = False
     PROFILE_INTERVAL = 200
 
@@ -1187,13 +1195,6 @@ def custom_kernel(data: input_t) -> output_t:
     A = A.contiguous()
     m, k = A.shape
     n, _ = B.shape
-    # C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
-
-    if not hasattr(custom_kernel, '_graph_cache'):
-        custom_kernel._graph_cache = None
-
-    if not hasattr(custom_kernel, '_prev_shape'):
-        custom_kernel._prev_shape = None
 
     B_data = B_q.view(torch.uint8)
     B_sc = B_scale_sh.view(torch.uint8)
@@ -1203,80 +1204,71 @@ def custom_kernel(data: input_t) -> output_t:
 
     key = (m, n, k)
 
-    if HAS_HIP_KERNEL:
-        sync = False
-        try:
-            if PROFILE:
-                if not hasattr(custom_kernel, '_stats'):
-                    custom_kernel._stats = {}
-                if key not in custom_kernel._stats:
-                    custom_kernel._stats[key] = {'total': 0.0, 'count': 0}
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
+    if not HAS_HIP_KERNEL:
+        return
 
-            if custom_kernel._prev_shape != key:
-                A_buf = torch.empty_like(A)
-                B_data_buf = torch.empty_like(B_data)
-                B_sc_buf = torch.empty_like(B_sc)
-                C_buf = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+    if PROFILE:
+        if not hasattr(custom_kernel, '_stats'):
+            custom_kernel._stats = {}
+        if key not in custom_kernel._stats:
+            custom_kernel._stats[key] = {'total': 0.0, 'count': 0}
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
 
-                A_buf.copy_(A)
-                B_data_buf.copy_(B_data)
-                B_sc_buf.copy_(B_sc)
+    if USE_GRAPHS:
+        if not hasattr(custom_kernel, '_graph_cache'):
+            custom_kernel._graph_cache = {}
 
-                # Warmup
-                _hip_module.mfma_gemm(
-                    A_buf, B_data_buf, B_sc_buf, C_buf,
-                    m, n, k, K_half, num_blocks, scaleN)
+        # Detect if B changed (new benchmark phase) — invalidate everything
+        if key in custom_kernel._graph_cache:
+            _, _, B_data_old, _, _ = custom_kernel._graph_cache[key]
+            if B_data_old.data_ptr() != B_data.data_ptr():
+                custom_kernel._graph_cache.clear()
+                _hip_module.reset_buffers()
 
-                # Capture
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    _hip_module.mfma_gemm(
-                        A_buf, B_data_buf, B_sc_buf, C_buf,
-                        m, n, k, K_half, num_blocks, scaleN)
-
-                custom_kernel._graph_cache = (g, A_buf, B_data_buf, B_sc_buf, C_buf)
-                custom_kernel._prev_shape = key
-                sync = True
-
-            g, A_buf, B_data_buf, B_sc_buf, C_buf = custom_kernel._graph_cache
+        if key not in custom_kernel._graph_cache:
+            A_buf = torch.empty_like(A)
+            B_data_buf = torch.empty_like(B_data)
+            B_sc_buf = torch.empty_like(B_sc)
+            C_buf = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
 
             A_buf.copy_(A)
             B_data_buf.copy_(B_data)
             B_sc_buf.copy_(B_sc)
 
-            g.replay()
+            _hip_module.mfma_gemm(
+                A_buf, B_data_buf, B_sc_buf, C_buf,
+                m, n, k, K_half, num_blocks, scaleN)
 
-            if sync:
-                torch.cuda.synchronize()
-                C = torch.empty_like(C_buf)
-                C.copy_(C_buf)
-                return C
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                _hip_module.mfma_gemm(
+                    A_buf, B_data_buf, B_sc_buf, C_buf,
+                    m, n, k, K_half, num_blocks, scaleN)
 
-            # C.copy_(C_buf)
+            custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, C_buf)
 
-            if PROFILE:
-                end.record()
-                torch.cuda.synchronize()
-                s = custom_kernel._stats[key]
-                s['total'] += start.elapsed_time(end)
-                s['count'] += 1
-                if s['count'] % PROFILE_INTERVAL == 0:
-                    cnt = s['count']
-                    print(f"[PROFILE] m={m:4d} n={n:4d} k={k:4d} | "
-                          f"total={s['total']/cnt*1000:.1f}us  "
-                          f"(avg over {cnt} calls)", flush=True)
+        g, A_buf, B_data_buf, B_sc_buf, C_buf = custom_kernel._graph_cache[key]
+        A_buf.copy_(A)
+        B_data_buf.copy_(B_data)
+        B_sc_buf.copy_(B_sc)
+        g.replay()
+        C = C_buf
+    else:
+        C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+        _hip_module.mfma_gemm(A, B_data, B_sc, C, m, n, k, K_half, num_blocks, scaleN)
 
-            return C_buf
-        except Exception as e:
-            print(f"[mxfp4-mm] MFMA kernel failed for m={m} n={n} k={k}: {e}", flush=True)
+    if PROFILE:
+        end.record()
+        torch.cuda.synchronize()
+        s = custom_kernel._stats[key]
+        s['total'] += start.elapsed_time(end)
+        s['count'] += 1
+        if s['count'] % PROFILE_INTERVAL == 0:
+            cnt = s['count']
+            print(f"[PROFILE] m={m:4d} n={n:4d} k={k:4d} | "
+                  f"total={s['total']/cnt*1000:.1f}us  "
+                  f"(avg over {cnt} calls)", flush=True)
 
-    # # Fallback
-    # x_fp4, bs_e8m0 = dynamic_mxfp4_quant(A)
-    # bs_e8m0 = e8m0_shuffle(bs_e8m0)
-    # A_q = x_fp4.view(dtypes.fp4x2)
-    # A_scale_sh = bs_e8m0.view(dtypes.fp8_e8m0)
-    # return aiter.gemm_a4w4(A_q, B_shuffle, A_scale_sh, B_scale_sh,
-    #                        dtype=dtypes.bf16, bpreshuffle=True)
+    return C
