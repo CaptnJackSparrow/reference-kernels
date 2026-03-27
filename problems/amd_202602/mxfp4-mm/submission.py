@@ -947,6 +947,14 @@ void reset_buffers() {
     g_generation++;
 }
 
+// ---- Profiling ----
+struct PerfStats {
+    float t_quant = 0, t_gemm = 0, t_reduce = 0;
+    int count = 0;
+};
+
+constexpr int PROFILE_INTERVAL = 10;
+
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1>
@@ -963,27 +971,59 @@ void launch_simple(torch::Tensor A_bf16,
         local_gen = g_generation;
     }
 
+    static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
+    auto& stats = perf_map[M][N][K_HALF];
+    stats.count++;
+    bool do_profile = (stats.count % PROFILE_INTERVAL == 0);
+
+    hipEvent_t e0, e1, e2;
+    if (do_profile) {
+        hipEventCreate(&e0); hipEventCreate(&e1); hipEventCreate(&e2);
+        hipEventRecord(e0);
+    }
+
     // Launch quant kernel
     constexpr int q_total = M * NUM_BLOCKS;
     constexpr int q_block = 64;
     constexpr int K = K_HALF * 2;
     constexpr int q_grid = (q_total + q_block - 1) / q_block;
-    hipLaunchKernelGGL((quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>),
-        dim3(q_grid), dim3(q_block), 0, 0,
+    quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>
+    <<<q_grid, q_block>>>(
         reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr()),
         reinterpret_cast<uint8_t*>(A_data_buf.data_ptr()),
         reinterpret_cast<uint8_t*>(A_scale_buf.data_ptr()));
 
+    if (do_profile) hipEventRecord(e1);
+
     dim3 grid((M + IM * WARPS_M - 1) / (IM * WARPS_M),
               (N + IN * WARPS_N - 1) / (IN * WARPS_N));
     dim3 block(64 * WARPS_M * WARPS_N);
-    hipLaunchKernelGGL((mfma_fp4_gemm_simple<M,N,K_HALF,NUM_BLOCKS,SCALE_N,IM,IN,IK,WARPS_M,WARPS_N>),
-        grid, block, 0, 0,
+    mfma_fp4_gemm_simple<M,N,K_HALF,NUM_BLOCKS,SCALE_N,IM,IN,IK,WARPS_M,WARPS_N>
+        <<<grid, block>>>(
         reinterpret_cast<const uint8_t*>(A_data_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(A_scale_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
         reinterpret_cast<hip_bfloat16*>(C.data_ptr()));
+
+    if (do_profile) {
+        hipEventRecord(e2);
+        hipEventSynchronize(e2);
+        float d01, d12;
+        hipEventElapsedTime(&d01, e0, e1);
+        hipEventElapsedTime(&d12, e1, e2);
+        stats.t_quant += d01; stats.t_gemm += d12;
+        int n = stats.count / PROFILE_INTERVAL;
+        if (n < 5) {
+            printf("[Simple GEMM] m=%d n=%d k=%d | "
+                "quant=%.1fus gemm=%.1fus | "
+                "total=%.1fus (avg over %d)\n",
+                M, N, K,
+                stats.t_quant/n*1000, stats.t_gemm/n*1000,
+                (stats.t_quant+stats.t_gemm)/n*1000, n);
+        }
+        hipEventDestroy(e0); hipEventDestroy(e1); hipEventDestroy(e2);
+    }
 }
 
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
@@ -1002,28 +1042,60 @@ void launch_tiled(torch::Tensor A_bf16,
         local_gen = g_generation;
     }
 
+    static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
+    auto& stats = perf_map[M][N][K_HALF];
+    stats.count++;
+    bool do_profile = (stats.count % PROFILE_INTERVAL == 0);
+
+    hipEvent_t e0, e1, e2;
+    if (do_profile) {
+        hipEventCreate(&e0); hipEventCreate(&e1); hipEventCreate(&e2);
+        hipEventRecord(e0);
+    }
+
     // Launch quant kernel
     constexpr int q_total = M * NUM_BLOCKS;
     constexpr int q_block = 64;
     constexpr int K = K_HALF * 2;
     constexpr int q_grid = (q_total + q_block - 1) / q_block;
-    hipLaunchKernelGGL((quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>),
-        dim3(q_grid), dim3(q_block), 0, 0,
+    quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>
+        <<<dim3(q_grid), dim3(q_block)>>>(
         reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr()),
         reinterpret_cast<uint8_t*>(A_data_buf.data_ptr()),
         reinterpret_cast<uint8_t*>(A_scale_buf.data_ptr()));
 
+    if (do_profile) hipEventRecord(e1);
+
     constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
     dim3 block(WARPS * 64);
-    hipLaunchKernelGGL((mfma_fp4_gemm_tiled<WARPS,M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,false,BUFFERS,OCCUPANCY>),
-        grid, block, 0, 0,
+    mfma_fp4_gemm_tiled<WARPS,M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,false,BUFFERS,OCCUPANCY>
+        <<<grid, block>>>(
         reinterpret_cast<const uint8_t*>(A_data_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(A_scale_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
         reinterpret_cast<hip_bfloat16*>(C.data_ptr()),
         (const hip_bfloat16*)nullptr);
+
+    if (do_profile) {
+        hipEventRecord(e2);
+        hipEventSynchronize(e2);
+        float d01, d12;
+        hipEventElapsedTime(&d01, e0, e1);
+        hipEventElapsedTime(&d12, e1, e2);
+        stats.t_quant += d01; stats.t_gemm += d12;
+        int n = stats.count / PROFILE_INTERVAL;
+        if (n < 5) {
+            printf("[Tiled GEMM] m=%d n=%d k=%d | "
+                "quant=%.1fus gemm=%.1fus | "
+                "total=%.1fus (avg over %d)\n",
+                M, N, K,
+                stats.t_quant/n*1000, stats.t_gemm/n*1000,
+                (stats.t_quant+stats.t_gemm)/n*1000, n);
+        }
+        hipEventDestroy(e0); hipEventDestroy(e1); hipEventDestroy(e2);
+    }
 }
 
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int SCALE_N,
@@ -1034,8 +1106,8 @@ void launch_tiled_fused(torch::Tensor A_bf16, torch::Tensor B,
     constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
     dim3 block(WARPS * 64);
-    hipLaunchKernelGGL((mfma_fp4_gemm_tiled<WARPS,M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,true,BUFFERS,OCCUPANCY>),
-        grid, block, 0, 0,
+    mfma_fp4_gemm_tiled<WARPS,M,N,K_HALF,NUM_BLOCKS,SCALE_N,OM,ON,OK,IM,IN,IK,WTM,WTN,true,BUFFERS,OCCUPANCY>
+        <<<grid, block>>>(
         (const uint8_t*)nullptr,
         reinterpret_cast<const uint8_t*>(B.data_ptr()),
         (const uint8_t*)nullptr,
@@ -1062,38 +1134,73 @@ void launch_splitk(torch::Tensor A_bf16,
         local_gen = g_generation;
     }
 
+    static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
+    auto& stats = perf_map[M][N][K_HALF];
+    stats.count++;
+    bool do_profile = (stats.count % PROFILE_INTERVAL == 0);
+
+    hipEvent_t e0, e1, e2, e3;
+    if (do_profile) {
+        hipEventCreate(&e0); hipEventCreate(&e1); hipEventCreate(&e2); hipEventCreate(&e3);
+        hipEventRecord(e0);
+    }
+
     // Launch quant kernel
     constexpr int q_total = M * NUM_BLOCKS;
     constexpr int q_block = 64;
     constexpr int K = K_HALF * 2;
     constexpr int q_grid = (q_total + q_block - 1) / q_block;
-    hipLaunchKernelGGL((quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>),
-        dim3(q_grid), dim3(q_block), 0, 0,
+    quant_a_kernel<M, K, K_HALF, NUM_BLOCKS>
+        <<<dim3(q_grid), dim3(q_block)>>>(
         reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr()),
         reinterpret_cast<uint8_t*>(A_data_buf.data_ptr()),
         reinterpret_cast<uint8_t*>(A_scale_buf.data_ptr()));
+
+    if (do_profile) hipEventRecord(e1);
 
     // Launch split-K GEMM
     dim3 grid((M + IM * WARPS_M - 1) / (IM * WARPS_M),
               (N + IN * WARPS_N - 1) / (IN * WARPS_N),
               K_SPLITS);
     dim3 block(64 * WARPS_M * WARPS_N);
-    hipLaunchKernelGGL((mfma_fp4_gemm_splitk<M,N,K_HALF,NUM_BLOCKS,SCALE_N,IM,IN,IK,WARPS_M,WARPS_N,K_SPLITS>),
-        grid, block, 0, 0,
+    mfma_fp4_gemm_splitk<M,N,K_HALF,NUM_BLOCKS,SCALE_N,IM,IN,IK,WARPS_M,WARPS_N,K_SPLITS>
+        <<<grid, block>>>(
         reinterpret_cast<const uint8_t*>(A_data_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(A_scale_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
         reinterpret_cast<float*>(ws_buf.data_ptr()));
 
+    if (do_profile) hipEventRecord(e2);
+
     // Launch reduction
     constexpr int r_total = M * N;
     constexpr int r_block = 256;
     constexpr int r_grid = (r_total + r_block - 1) / r_block;
-    hipLaunchKernelGGL((reduce_splitk_kernel<M, N, K_SPLITS>),
-        dim3(r_grid), dim3(r_block), 0, 0,
+    reduce_splitk_kernel<M, N, K_SPLITS>
+        <<<dim3(r_grid), dim3(r_block)>>>(
         reinterpret_cast<const float*>(ws_buf.data_ptr()),
         reinterpret_cast<hip_bfloat16*>(C.data_ptr()));
+
+    if (do_profile) {
+        hipEventRecord(e3);
+        hipEventSynchronize(e3);
+        float d01, d12, d23;
+        hipEventElapsedTime(&d01, e0, e1);
+        hipEventElapsedTime(&d12, e1, e2);
+        hipEventElapsedTime(&d23, e2, e3);
+        stats.t_quant += d01; stats.t_gemm += d12; stats.t_reduce += d23;
+        int n = stats.count / PROFILE_INTERVAL;
+        if (n < 5) {
+            printf("[Split-K GEMM] m=%d n=%d k=%d | "
+                "quant=%.1fus gemm=%.1fus reduce=%.1fus | "
+                "total=%.1fus (avg over %d)\n",
+                M, N, K,
+                stats.t_quant/n*1000, stats.t_gemm/n*1000, stats.t_reduce/n*1000,
+                (stats.t_quant+stats.t_gemm)/n*1000, n);
+        }
+        hipEventDestroy(e0); hipEventDestroy(e1); hipEventDestroy(e2);  hipEventDestroy(e3);
+    }
 }
 
 void mfma_gemm(
@@ -1184,12 +1291,59 @@ try: _try_compile()
 except: pass
 
 
+# def custom_kernel(data: input_t) -> output_t:
+#     global HAS_HIP_KERNEL, _hip_module
+
+#     A, B, B_q, B_shuffle, B_scale_sh = data
+#     A = A.contiguous()
+#     m, k = A.shape
+#     n, _ = B.shape
+
+#     B_data = B_q.view(torch.uint8)
+#     B_sc = B_scale_sh.view(torch.uint8)
+#     K_half = k // 2
+#     num_blocks = (k + 31) // 32
+#     scaleN = ((num_blocks + 7) // 8) * 8
+
+#     if not HAS_HIP_KERNEL:
+#         return
+
+#     if not hasattr(custom_kernel, '_graph_cache'):
+#         custom_kernel._graph_cache = {}
+
+#     key = (m, n, k)
+
+#     if key not in custom_kernel._graph_cache:
+#         A_buf = torch.empty_like(A)
+#         B_data_buf = torch.empty_like(B_data)
+#         B_sc_buf = torch.empty_like(B_sc)
+#         C_buf = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+
+#         A_buf.copy_(A)
+#         B_data_buf.copy_(B_data)
+#         B_sc_buf.copy_(B_sc)
+
+#         _hip_module.mfma_gemm(
+#             A_buf, B_data_buf, B_sc_buf, C_buf,
+#             m, n, k, K_half, num_blocks, scaleN)
+
+#         g = torch.cuda.CUDAGraph()
+#         with torch.cuda.graph(g):
+#             _hip_module.mfma_gemm(
+#                 A_buf, B_data_buf, B_sc_buf, C_buf,
+#                 m, n, k, K_half, num_blocks, scaleN)
+
+#         custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, C_buf)
+
+#     g, A_buf, B_data_buf, B_sc_buf, C_buf = custom_kernel._graph_cache[key]
+#     A_buf.copy_(A)
+#     B_data_buf.copy_(B_data)
+#     B_sc_buf.copy_(B_sc)
+#     g.replay()
+#     return C_buf
+
 def custom_kernel(data: input_t) -> output_t:
     global HAS_HIP_KERNEL, _hip_module
-
-    USE_GRAPHS = True
-    PROFILE = False
-    PROFILE_INTERVAL = 200
 
     A, B, B_q, B_shuffle, B_scale_sh = data
     A = A.contiguous()
@@ -1202,73 +1356,9 @@ def custom_kernel(data: input_t) -> output_t:
     num_blocks = (k + 31) // 32
     scaleN = ((num_blocks + 7) // 8) * 8
 
-    key = (m, n, k)
-
     if not HAS_HIP_KERNEL:
         return
 
-    if PROFILE:
-        if not hasattr(custom_kernel, '_stats'):
-            custom_kernel._stats = {}
-        if key not in custom_kernel._stats:
-            custom_kernel._stats[key] = {'total': 0.0, 'count': 0}
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-
-    if USE_GRAPHS:
-        if not hasattr(custom_kernel, '_graph_cache'):
-            custom_kernel._graph_cache = {}
-
-        # Detect if B changed (new benchmark phase) — invalidate everything
-        if key in custom_kernel._graph_cache:
-            _, _, B_data_old, _, _ = custom_kernel._graph_cache[key]
-            if B_data_old.data_ptr() != B_data.data_ptr():
-                custom_kernel._graph_cache.clear()
-                _hip_module.reset_buffers()
-
-        if key not in custom_kernel._graph_cache:
-            A_buf = torch.empty_like(A)
-            B_data_buf = torch.empty_like(B_data)
-            B_sc_buf = torch.empty_like(B_sc)
-            C_buf = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
-
-            A_buf.copy_(A)
-            B_data_buf.copy_(B_data)
-            B_sc_buf.copy_(B_sc)
-
-            _hip_module.mfma_gemm(
-                A_buf, B_data_buf, B_sc_buf, C_buf,
-                m, n, k, K_half, num_blocks, scaleN)
-
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                _hip_module.mfma_gemm(
-                    A_buf, B_data_buf, B_sc_buf, C_buf,
-                    m, n, k, K_half, num_blocks, scaleN)
-
-            custom_kernel._graph_cache[key] = (g, A_buf, B_data_buf, B_sc_buf, C_buf)
-
-        g, A_buf, B_data_buf, B_sc_buf, C_buf = custom_kernel._graph_cache[key]
-        A_buf.copy_(A)
-        B_data_buf.copy_(B_data)
-        B_sc_buf.copy_(B_sc)
-        g.replay()
-        C = C_buf
-    else:
-        C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
-        _hip_module.mfma_gemm(A, B_data, B_sc, C, m, n, k, K_half, num_blocks, scaleN)
-
-    if PROFILE:
-        end.record()
-        torch.cuda.synchronize()
-        s = custom_kernel._stats[key]
-        s['total'] += start.elapsed_time(end)
-        s['count'] += 1
-        if s['count'] % PROFILE_INTERVAL == 0:
-            cnt = s['count']
-            print(f"[PROFILE] m={m:4d} n={n:4d} k={k:4d} | "
-                  f"total={s['total']/cnt*1000:.1f}us  "
-                  f"(avg over {cnt} calls)", flush=True)
-
+    C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+    _hip_module.mfma_gemm(A, B_data, B_sc, C, m, n, k, K_half, num_blocks, scaleN)
     return C
