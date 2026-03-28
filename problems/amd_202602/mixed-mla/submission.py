@@ -299,8 +299,8 @@ void mla_mxfp4_decode_kernel(
     constexpr int BYTES_PER_KV_ROW = QK_HEAD_DIM / 2;  // 288 bytes
     constexpr int SCALES_PER_KV_ROW = NUM_MXFP4_BLOCKS;  // 18 scales
 
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int head_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
     const int tid = threadIdx.x;
 
     // Shared memory layout (optimized for bank conflict avoidance):
@@ -339,8 +339,8 @@ void mla_mxfp4_decode_kernel(
     }
     __syncthreads();
 
-    const int64_t kv_batch_offset = static_cast<int64_t>(batch_idx) * kv_seq_len * BYTES_PER_KV_ROW;
-    const int64_t scale_batch_offset = static_cast<int64_t>(batch_idx) * kv_seq_len * SCALES_PER_KV_ROW;
+    const int64_t kv_batch_offset = __builtin_amdgcn_readfirstlane(static_cast<int64_t>(batch_idx) * kv_seq_len * BYTES_PER_KV_ROW);
+    const int64_t scale_batch_offset = __builtin_amdgcn_readfirstlane(static_cast<int64_t>(batch_idx) * kv_seq_len * SCALES_PER_KV_ROW);
 
     // Process each query token
     for (int q_idx = 0; q_idx < q_seq_len; q_idx++) {
@@ -466,8 +466,8 @@ void mla_mxfp4_decode_kernel_large_kv(
     constexpr int SCALES_PER_KV_ROW = NUM_MXFP4_BLOCKS;
     constexpr int KV_TILE = 256;  // Larger tile for long sequences
 
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int head_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
     const int tid = threadIdx.x;
 
     extern __shared__ char shared_bytes[];
@@ -649,8 +649,8 @@ void mla_mxfp4_decode_kernel_bs4_kv1024(
     constexpr int V_PER_THREAD = 4;    // Each thread handles 4 V dimensions
     constexpr int KV_TILE = 32;        // Smaller tile for double buffering
 
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int head_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
     const int tid = threadIdx.x;
     const int warp_id = tid >> 6;      // 64-wide warps
     const int lane = tid & 63;
@@ -675,15 +675,15 @@ void mla_mxfp4_decode_kernel_bs4_kv1024(
     lut[4] = 2.0f; lut[5] = 3.0f; lut[6] = 4.0f; lut[7] = 6.0f;
 
     // Load query into shared memory with vectorized access
-    const int q_offset = (batch_idx * NUM_HEADS + head_idx) * QK_HEAD_DIM;
+    const int q_offset = __builtin_amdgcn_readfirstlane((batch_idx * NUM_HEADS + head_idx) * QK_HEAD_DIM);
     // #pragma unroll 4
     for (int i = tid; i < QK_HEAD_DIM; i += THREADS) {
         smem_q[i] = static_cast<float>(q[q_offset + i]);
     }
     __syncthreads();
 
-    const int64_t kv_base = static_cast<int64_t>(batch_idx) * KV_LEN * BYTES_PER_KV;
-    const int64_t scale_base = static_cast<int64_t>(batch_idx) * KV_LEN * SCALES_PER_KV;
+    const int64_t kv_base = __builtin_amdgcn_readfirstlane(static_cast<int64_t>(batch_idx) * KV_LEN * BYTES_PER_KV);
+    const int64_t scale_base = __builtin_amdgcn_readfirstlane(static_cast<int64_t>(batch_idx) * KV_LEN * SCALES_PER_KV);
 
     // Online softmax state - track running max and sum
     float running_max = -INFINITY;
@@ -920,8 +920,8 @@ mla_qkt_mxfp4_kernel(
     constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;  // ceil(18/4)=5
 
     const int lane = threadIdx.x % 64;
-    const int batch_idx = blockIdx.z;
-    const int tile_n = blockIdx.y * IN;
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.z);
+    const int tile_n = __builtin_amdgcn_readfirstlane(blockIdx.y * IN);
 
     const uint8_t* a_data = A_data + batch_idx * M * A_K_HALF;
     const uint8_t* a_scale = A_scale + batch_idx * (NUM_BLOCKS * M);
@@ -1052,8 +1052,8 @@ mla_qkt_tiled_kernel(
     constexpr int BLOCK_SIZE = WARPS * 64;          // 256
     constexpr int OUTER_K_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;  // ceil(18/4) = 5
 
-    const int batch_idx = blockIdx.z;
-    const int outer_n = blockIdx.y * OUTER_N;
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.z);
+    const int outer_n = __builtin_amdgcn_readfirstlane(blockIdx.y * OUTER_N);
     const int tid = threadIdx.x;
     const int warp_id = tid / 64;
     const int lane = tid % 64;
@@ -1200,8 +1200,8 @@ void mla_attn_v_fused_kernel(
     constexpr int KV_BYTES_PER_ROW = 288;  // QK_HEAD_DIM / 2
     constexpr int KV_TILE = 128;           // Cache this many attn weights at a time
 
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int head_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
     const int v_dim = threadIdx.x;  // 0..511, one thread per V dimension
 
     // Pre-compute this thread's V position in MXFP4 layout
@@ -1215,8 +1215,8 @@ void mla_attn_v_fused_kernel(
 
     // Pointers
     const float* attn_ptr = attn_weights + ((int64_t)batch_idx * 16 + head_idx) * kv_seq_len;
-    const int64_t kv_base = (int64_t)batch_idx * kv_seq_len * KV_BYTES_PER_ROW;
-    const int64_t sc_base = (int64_t)batch_idx * kv_seq_len * scale_stride;
+    const int64_t kv_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * kv_seq_len * KV_BYTES_PER_ROW);
+    const int64_t sc_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * kv_seq_len * scale_stride);
 
     float acc = 0.0f;
 
@@ -1304,13 +1304,13 @@ void mla_scale_softmax_kernel(
 ) {
     constexpr int THREADS = 256;
 
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int head_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
     const int tid = threadIdx.x;
     const int lane = tid & 63;
     const int warp_id = tid >> 6;
 
-    const int64_t row_offset = ((int64_t)batch_idx * 16 + head_idx) * N;
+    const int64_t row_offset = __builtin_amdgcn_readfirstlane(((int64_t)batch_idx * 16 + head_idx) * N);
     const float* row_in = scores + row_offset;
     float* row_out = attn_out + row_offset;
 
@@ -1455,8 +1455,8 @@ void mla_attn_v_splitk_lds_v2_kernel(
     __shared__ uint8_t scale_tile[KV_TILE * V_SCALES];
 
     const float* attn_ptr = attn_weights + ((int64_t)batch_idx * 16 + head_idx) * N;
-    const int64_t kv_base = (int64_t)batch_idx * N * KV_BYTES_PER_ROW;
-    const int64_t sc_base = (int64_t)batch_idx * N * B_SCALE_STRIDE;
+    const int64_t kv_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * N * KV_BYTES_PER_ROW);
+    const int64_t sc_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * N * B_SCALE_STRIDE);
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
@@ -1526,6 +1526,444 @@ void mla_attn_v_splitk_lds_v2_kernel(
 
     partial_out[out_idx_base + v_dim0] = acc0;
     partial_out[out_idx_base + v_dim1] = acc1;
+}
+
+// =============================================================================
+// HEAD-MERGED Split-K attn x V kernel
+//
+// Key optimization: Grid is (batch, split) instead of (batch, head, split).
+// Each block loads KV data ONCE and processes ALL 16 heads, eliminating
+// 16x redundant global memory reads (MQA: all heads share same KV).
+//
+// LDS layout (~22 KB total):
+//   kv_tile:    KV_TILE * 256 bytes = 16,384 B (V portion of KV data)
+//   scale_tile: KV_TILE * 16 bytes  =  1,024 B (V scales)
+//   attn_cache: 16 * KV_TILE * 4 B  =  4,096 B (all heads' attn weights)
+//   Total: ~21.5 KB - excellent occupancy
+//
+// Thread mapping: 256 threads, each handles 2 V dims x 16 heads = 32 accumulators
+// =============================================================================
+
+template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS>
+__global__ __launch_bounds__(BLOCK_SIZE)
+void mla_attn_v_splitk_head_merged_kernel(
+    const float* __restrict__ attn_weights,  // (batch, 16, N)
+    const uint8_t* __restrict__ kv_mxfp4,    // (batch * N, 288)
+    const uint8_t* __restrict__ kv_scale,    // (batch * N, B_SCALE_STRIDE)
+    float* __restrict__ partial_out           // (batch, KV_SPLITS, 16, 512)
+) {
+    constexpr int V_DIM = 512;
+    constexpr int KV_BYTES_PER_ROW = 288;
+    constexpr int THREADS = BLOCK_SIZE;  // 256
+    constexpr int KV_TILE = 64;
+    constexpr int V_BYTES = 256;   // first 256 bytes of each KV row = first 512 FP4 values = V
+    constexpr int V_SCALES = 16;   // first 16 scale blocks = V portion
+    constexpr int HEADS = 16;
+    constexpr int KV_PER_SPLIT = (N + KV_SPLITS - 1) / KV_SPLITS;
+
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int split_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
+    const int tid = threadIdx.x;  // 0..255
+
+    const int kv_start_global = split_idx * KV_PER_SPLIT;
+    const int kv_end_global = min(kv_start_global + KV_PER_SPLIT, N);
+
+    // Output layout: (batch, KV_SPLITS, 16, 512)
+    // Base offset for this (batch, split)
+    const int64_t out_base = __builtin_amdgcn_readfirstlane(((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM);
+
+    // Each thread handles 2 adjacent V dimensions across all 16 heads
+    const int v_dim0 = tid * 2;
+    const int v_dim1 = v_dim0 + 1;
+
+    // Pre-compute V position in MXFP4 layout (same for all heads since MQA)
+    const int v_block = v_dim0 / 32;
+    const int v_within = v_dim0 % 32;
+    const int v_byte_offset = v_block * 16 + v_within / 2;
+
+    // 32 accumulators: 2 V dims x 16 heads
+    float acc[HEADS * 2];
+    for (int i = 0; i < HEADS * 2; i++) acc[i] = 0.0f;
+
+    if (kv_start_global >= N) {
+        // Zero output for OOB splits
+        for (int h = 0; h < HEADS; h++) {
+            partial_out[out_base + (int64_t)h * V_DIM + v_dim0] = 0.0f;
+            partial_out[out_base + (int64_t)h * V_DIM + v_dim1] = 0.0f;
+        }
+        return;
+    }
+
+    // LDS layout
+    __shared__ uint8_t kv_tile[KV_TILE * V_BYTES];          // 16 KB
+    __shared__ uint8_t scale_tile[KV_TILE * V_SCALES];       // 1 KB
+    __shared__ float attn_cache[HEADS * KV_TILE];             // 4 KB
+
+    const int64_t kv_base = (int64_t)batch_idx * N * KV_BYTES_PER_ROW;
+    const int64_t sc_base = (int64_t)batch_idx * N * B_SCALE_STRIDE;
+
+    for (int kv_start = kv_start_global; kv_start < kv_end_global; kv_start += KV_TILE) {
+        const int tile_end = min(kv_start + KV_TILE, kv_end_global);
+        const int tile_size = tile_end - kv_start;
+
+        // ---- Cooperative load: KV data (V portion only: first 256 bytes) ----
+        {
+            const int total_vec = (tile_size * V_BYTES) / 16;
+            for (int i = tid; i < total_vec; i += THREADS) {
+                const int row = i / (V_BYTES / 16);  // V_BYTES/16 = 16
+                const int vec_in_row = i % (V_BYTES / 16);
+                const int kv_idx = kv_start + row;
+                const int64_t src_off = kv_base + (int64_t)kv_idx * KV_BYTES_PER_ROW + vec_in_row * 16;
+                const int dst_off = row * V_BYTES + vec_in_row * 16;
+                *reinterpret_cast<uint128_vec*>(&kv_tile[dst_off]) =
+                    *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[src_off]);
+            }
+        }
+
+        // ---- Cooperative load: V scales ----
+        {
+            const int total_scales = tile_size * V_SCALES;
+            for (int i = tid; i < total_scales; i += THREADS) {
+                const int row = i / V_SCALES;
+                const int blk = i % V_SCALES;
+                const int kv_idx = kv_start + row;
+                scale_tile[row * V_SCALES + blk] =
+                    kv_scale[sc_base + (int64_t)kv_idx * B_SCALE_STRIDE + blk];
+            }
+        }
+
+        // ---- Cooperative load: attn weights for ALL 16 heads ----
+        // Total: 16 * tile_size floats. With 256 threads, need ceil(16*64/256)=4 rounds
+        {
+            const int total_attn = HEADS * tile_size;
+            for (int i = tid; i < total_attn; i += THREADS) {
+                const int h = i / tile_size;
+                const int ki = i % tile_size;
+                attn_cache[h * KV_TILE + ki] =
+                    attn_weights[((int64_t)batch_idx * HEADS + h) * N + kv_start + ki];
+            }
+        }
+
+        __syncthreads();
+
+        // ---- Compute: for each KV position, load V data once, apply to all heads ----
+        for (int ki = 0; ki < tile_size; ki++) {
+            // Load and dequantize V value ONCE (shared across all heads)
+            const float block_scale = e8m0_to_float_fast(
+                scale_tile[ki * V_SCALES + v_block]);
+            const uint8_t packed = kv_tile[ki * V_BYTES + v_byte_offset];
+            const float v_val0 = FP4_E2M1_LUT[packed & 0x0F] * block_scale;
+            const float v_val1 = FP4_E2M1_LUT[(packed >> 4) & 0x0F] * block_scale;
+
+            // Apply to all 16 heads (each head has different attn weight)
+            for (int h = 0; h < HEADS; h++) {
+                const float w = attn_cache[h * KV_TILE + ki];
+                acc[h * 2]     += w * v_val0;
+                acc[h * 2 + 1] += w * v_val1;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write partial output: (batch, KV_SPLITS, 16, 512)
+    for (int h = 0; h < HEADS; h++) {
+        partial_out[out_base + (int64_t)h * V_DIM + v_dim0] = acc[h * 2];
+        partial_out[out_base + (int64_t)h * V_DIM + v_dim1] = acc[h * 2 + 1];
+    }
+}
+
+// =============================================================================
+// MFMA FP4xFP4 Head-Merged Attn x V kernel
+//
+// Replaces scalar inner loop with MFMA 16x16x128 FP4 matrix multiply.
+// A = attn_weights (quantized FP32 -> FP4), B = V (native MXFP4)
+// M=16 (heads), N=16 (V dim chunk), K=128 (KV positions)
+// 32 MFMA calls per K-batch to cover all 512 V dimensions.
+//
+// 4 warps = 256 threads. Each warp handles 8 V-dim chunks.
+// KV_TILE = 128 to match MFMA K dimension exactly.
+//
+// V data gathered per-lane from LDS (padded stride to avoid bank conflicts).
+// Attention weights quantized once per tile, reused across all V-dim chunks.
+// =============================================================================
+
+template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS>
+__global__ __launch_bounds__(BLOCK_SIZE)
+void mla_attn_v_mfma_head_merged_kernel(
+    const float* __restrict__ attn_weights,  // (batch, 16, N) post-softmax
+    const uint8_t* __restrict__ kv_mxfp4,    // (batch * N, 288) packed KV
+    const uint8_t* __restrict__ kv_scale,    // (batch * N, B_SCALE_STRIDE) E8M0
+    float* __restrict__ partial_out           // (batch, KV_SPLITS, 16, 512)
+) {
+    constexpr int V_DIM = 512;
+    constexpr int KV_BYTES_PER_ROW = 288;
+    constexpr int THREADS = BLOCK_SIZE;  // 256
+    constexpr int KV_TILE = 128;         // matches MFMA K=128
+    constexpr int HEADS = 16;
+    constexpr int KV_PER_SPLIT = (N + KV_SPLITS - 1) / KV_SPLITS;
+    constexpr int V_CHUNKS = V_DIM / 16; // 32 chunks of 16 V dims
+    constexpr int WARPS = THREADS / 64;  // 4
+    constexpr int CHUNKS_PER_WARP = V_CHUNKS / WARPS; // 8
+    constexpr int NUM_K_BLOCKS = KV_TILE / 32; // 4 blocks of 32 for MXFP4 scaling
+    // Padded stride for V rows in LDS to avoid bank conflicts
+    // 256 bytes + 4 bytes padding = 260, gcd(260/4, 32) = gcd(65,32) = 1
+    constexpr int V_LDS_STRIDE = 256;
+
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int split_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 64;
+    const int lane = tid % 64;
+
+    const int kv_start_global = __builtin_amdgcn_readfirstlane(split_idx * KV_PER_SPLIT);
+    const int kv_end_global = __builtin_amdgcn_readfirstlane(min(kv_start_global + KV_PER_SPLIT, N));
+
+    const int64_t out_base = __builtin_amdgcn_readfirstlane(((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM);
+
+    // ======================================================================
+    // Scale-absorption MFMA: absorb per-position V scales into A operand
+    //
+    // output[h,v] = sum_k attn[h,k] * (FP4_nib[k,v] * v_scale[k,v_block])
+    //             = sum_k (attn[h,k] * v_scale[k,v_block]) * FP4_nib[k,v]
+    //
+    // A operand = quantize_fp4(attn[h,k] * v_scale[k,v_block]) per-lane
+    // B operand = raw V FP4 nibbles, scale = 1.0 (E8M0=127)
+    // No V dequant/requant. A computed in registers per-lane.
+    // Adjacent chunks share V-scale-block -> quantize A once per pair.
+    // Only 1 syncthreads per tile.
+    //
+    // LDS (~43.5 KB, fits 3 blocks/CU at 160KB):
+    //   v_lds:       128 * 260 = 33,280 B (V data, padded stride)
+    //   v_scale_lds: 128 * 16  =  2,048 B (V scales)
+    //   attn_f32:    16 * 128  =  8,192 B (fp32 attn, all heads, 4B each)
+    // ======================================================================
+
+    __shared__ uint8_t v_lds[KV_TILE * V_LDS_STRIDE];
+    __shared__ uint8_t v_scale_lds[KV_TILE * 16];
+    __shared__ float attn_f32[HEADS * KV_TILE];
+
+    float4_t warp_acc[CHUNKS_PER_WARP];
+    for (int c = 0; c < CHUNKS_PER_WARP; c++) {
+        warp_acc[c] = {};
+    }
+
+    if (kv_start_global >= N) {
+        for (int i = tid; i < HEADS * V_DIM; i += THREADS) {
+            partial_out[out_base + i] = 0.0f;
+        }
+        return;
+    }
+
+    const int64_t kv_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * N * KV_BYTES_PER_ROW);
+    const int64_t sc_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * N * B_SCALE_STRIDE);
+
+    // MFMA lane indices (constant)
+    const int a_row = lane % 16;   // head index for A
+    const int a_kgrp = lane / 16;  // K group (0..3) for A
+    const int b_col = lane % 16;   // V dim within chunk for B
+    const int b_kgrp = lane / 16;  // K group (0..3) for B
+
+    // B scale is always 1.0 (E8M0=127) since V scale absorbed into A
+    const int32_t b_sc_one = mla_broadcast_scale(127);
+
+    for (int kv_start = kv_start_global; kv_start < kv_end_global; kv_start += KV_TILE) {
+        const int tile_end = min(kv_start + KV_TILE, kv_end_global);
+        const int tile_size = tile_end - kv_start;
+
+        // ---- Cooperative load: V data (padded stride) ----
+        {
+            const int total_vec = tile_size * 16;
+            for (int i = tid; i < total_vec; i += THREADS) {
+                const int row = i / 16;
+                const int vec = i % 16;
+                const int64_t src = kv_base + (int64_t)(kv_start + row) * KV_BYTES_PER_ROW + vec * 16;
+                *reinterpret_cast<uint128_vec*>(&v_lds[row * V_LDS_STRIDE + vec * 16]) =
+                    *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[src]);
+            }
+        }
+
+        // ---- Cooperative load: V scales ----
+        {
+            const int total_sc = tile_size * 16;
+            for (int i = tid; i < total_sc; i += THREADS) {
+                const int row = i / 16;
+                const int blk = i % 16;
+                v_scale_lds[row * 16 + blk] =
+                    kv_scale[sc_base + (int64_t)(kv_start + row) * B_SCALE_STRIDE + blk];
+            }
+        }
+
+        // ---- Cooperative load: FP32 attention weights ----
+        {
+            const int total_attn = HEADS * tile_size;
+            for (int i = tid; i < total_attn; i += THREADS) {
+                const int h = i / tile_size;
+                const int k = i % tile_size;
+                attn_f32[h * KV_TILE + k] =
+                    attn_weights[((int64_t)batch_idx * HEADS + h) * N + kv_start + k];
+            }
+            // Zero-fill unused portion
+            for (int i = tid; i < HEADS * (KV_TILE - tile_size); i += THREADS) {
+                const int h = i / (KV_TILE - tile_size);
+                const int k = tile_size + i % (KV_TILE - tile_size);
+                attn_f32[h * KV_TILE + k] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // ---- Per-warp MFMA: each warp processes 8 chunks (4 V-scale-blocks x 2 chunks) ----
+        // Warp 0: chunks 0-7 (V dims 0-127, V-scale-blocks 0-3)
+        // Warp 1: chunks 8-15 (V dims 128-255, V-scale-blocks 4-7)
+        // etc.
+        for (int ci = 0; ci < CHUNKS_PER_WARP; ci += 2) {
+            // Two adjacent chunks share the same V-scale-block
+            const int chunk0 = warp_id * CHUNKS_PER_WARP + ci;
+            const int vscale_blk = chunk0 / 2;  // V-scale-block index (0..15)
+
+            // ---- Compute A operand: attn * v_scale, per-lane in registers ----
+            // Lane a_row=head, a_kgrp=K_group
+            // Load 32 attn weights and 32 V scales, multiply, quantize
+            const int k_base_a = a_kgrp * 32;
+            float scaled_attn[32];
+            for (int j = 0; j < 32; j++) {
+                const float aw = attn_f32[a_row * KV_TILE + k_base_a + j];
+                const float vs = e8m0_to_float_fast(
+                    v_scale_lds[(k_base_a + j) * 16 + vscale_blk]);
+                scaled_attn[j] = aw * vs;
+            }
+            QuantBlock aqb = quantize_fp4_block(scaled_attn);
+
+            uint32_t a_reg[8];
+            *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
+                *reinterpret_cast<uint128_vec*>(&aqb.data);
+            a_reg[4] = a_reg[5] = a_reg[6] = a_reg[7] = 0;
+            int32_t a_sc = mla_broadcast_scale(aqb.e8m0);
+
+            int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
+                              (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
+
+            // ---- Chunk 0: gather B, execute MFMA ----
+            {
+                const int v_d = chunk0 * 16 + b_col;
+                const int v_byte = v_d / 2;
+                const int v_nib_shift = (v_d & 1) * 4;
+                const int k_base_b = b_kgrp * 32;
+
+                uint8_t packed[16];
+                for (int j = 0; j < 16; j++) {
+                    const int k0 = k_base_b + j * 2;
+                    const int k1 = k_base_b + j * 2 + 1;
+                    uint8_t n0 = (k0 < tile_size) ?
+                        ((v_lds[k0 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
+                    uint8_t n1 = (k1 < tile_size) ?
+                        ((v_lds[k1 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
+                    packed[j] = n0 | (n1 << 4);
+                }
+
+                uint32_t b_reg[8];
+                *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                    *reinterpret_cast<uint128_vec*>(&packed[0]);
+                b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+
+                int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                  (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                warp_acc[ci] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                    a_vec, b_vec, warp_acc[ci],
+                    FMT_FP4_MFMA, FMT_FP4_MFMA,
+                    0, a_sc, 0, b_sc_one);
+            }
+
+            // ---- Chunk 1: gather B, execute MFMA (same A operand) ----
+            {
+                const int v_d = (chunk0 + 1) * 16 + b_col;
+                const int v_byte = v_d / 2;
+                const int v_nib_shift = (v_d & 1) * 4;
+                const int k_base_b = b_kgrp * 32;
+
+                uint8_t packed[16];
+                for (int j = 0; j < 16; j++) {
+                    const int k0 = k_base_b + j * 2;
+                    const int k1 = k_base_b + j * 2 + 1;
+                    uint8_t n0 = (k0 < tile_size) ?
+                        ((v_lds[k0 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
+                    uint8_t n1 = (k1 < tile_size) ?
+                        ((v_lds[k1 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
+                    packed[j] = n0 | (n1 << 4);
+                }
+
+                uint32_t b_reg[8];
+                *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                    *reinterpret_cast<uint128_vec*>(&packed[0]);
+                b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+
+                int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                  (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                warp_acc[ci + 1] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                    a_vec, b_vec, warp_acc[ci + 1],
+                    FMT_FP4_MFMA, FMT_FP4_MFMA,
+                    0, a_sc, 0, b_sc_one);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ---- Store output ----
+    const int out_col = lane % 16;
+    const int out_quad = lane / 16;
+
+    for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
+        const int chunk = warp_id * CHUNKS_PER_WARP + ci;
+        for (int i = 0; i < 4; i++) {
+            const int head = i + 4 * out_quad;
+            const int v_dim = chunk * 16 + out_col;
+            if (head < HEADS && v_dim < V_DIM) {
+                partial_out[out_base + (int64_t)head * V_DIM + v_dim] = warp_acc[ci][i];
+            }
+        }
+    }
+}
+
+// ---- Head-merged reduce kernel ----
+// Input:  partial_out (batch, KV_SPLITS, 16, 512) fp32
+// Output: output (batch * 16, 512) bf16
+template <int BLOCK_SIZE, int KV_SPLITS>
+__global__ __launch_bounds__(BLOCK_SIZE)
+void mla_attn_v_reduce_head_merged_kernel(
+    const float* __restrict__ partial_out,
+    hip_bfloat16* __restrict__ output
+) {
+    constexpr int V_DIM = 512;
+    constexpr int HEADS = 16;
+
+    // Grid: (batch_size, HEADS), block: (256)
+    // Each block reduces one (batch, head) pair across KV_SPLITS
+    const int batch_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid = threadIdx.x;  // 0..255
+
+    // Each thread reduces 2 V dimensions
+    const int v_dim0 = tid * 2;
+    const int v_dim1 = tid * 2 + 1;
+
+    // Input layout: (batch, KV_SPLITS, 16, 512)
+    const int64_t in_batch_base = (int64_t)batch_idx * KV_SPLITS * HEADS * V_DIM;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    for (int s = 0; s < KV_SPLITS; s++) {
+        const int64_t split_base = in_batch_base + (int64_t)s * HEADS * V_DIM + (int64_t)head_idx * V_DIM;
+        sum0 += partial_out[split_base + v_dim0];
+        sum1 += partial_out[split_base + v_dim1];
+    }
+
+    // Output layout: (batch * 16, 512)
+    const int64_t out_base = ((int64_t)batch_idx * HEADS + head_idx) * V_DIM;
+    output[out_base + v_dim0] = hip_bfloat16(sum0);
+    output[out_base + v_dim1] = hip_bfloat16(sum1);
 }
 
 '''
@@ -1630,16 +2068,19 @@ torch::Tensor mla_mxfp4_decode_forward(
 //
 // =============================================================================
 
+// Head-merged grid: (batch, split). Target ~304-1024 total blocks.
+// Each block loads KV data ONCE for all 16 heads (16x bandwidth savings).
+// Constraint: trailing blocks (total % 304) must be 0 or >= 152 (half CUs busy).
 template <int BATCH_SIZE, int N>
 constexpr int get_kv_split() {
-    if constexpr (BATCH_SIZE == 4 && N == 1024) return 4;           // 256 blocks, rem=256, 84% trailing
-    else if constexpr (BATCH_SIZE == 4 && N == 8192) return 19;     // 1216, perfect
-    else if constexpr (BATCH_SIZE == 32 && N == 1024) return 8;     // 4096 blocks, rem=256, 84% trailing
-    else if constexpr (BATCH_SIZE == 32 && N == 8192) return 19;    // 9728, perfect
-    else if constexpr (BATCH_SIZE == 64 && N == 1024) return 4;     // 4096 blocks, rem=256, 84% trailing
-    else if constexpr (BATCH_SIZE == 64 && N == 8192) return 19;    // 19456, perfect
-    else if constexpr (BATCH_SIZE == 256 && N == 1024) return 4;    // 16384 blocks, rem=272, 89% trailing
-    else if constexpr (BATCH_SIZE == 256 && N == 8192) return 19;   // 77824, perfect
+    if constexpr (BATCH_SIZE == 4 && N == 1024) return 76;          // 304 blocks, 0 trailing
+    else if constexpr (BATCH_SIZE == 4 && N == 8192) return 76;     // 304 blocks, 0 trailing
+    else if constexpr (BATCH_SIZE == 32 && N == 1024) return 19;    // 608 blocks, 0 trailing
+    else if constexpr (BATCH_SIZE == 32 && N == 8192) return 19;    // 608 blocks, 0 trailing
+    else if constexpr (BATCH_SIZE == 64 && N == 1024) return 19;     // 1216 blocks, 0 trailing
+    else if constexpr (BATCH_SIZE == 64 && N == 8192) return 19;     // 1216 blocks, 0 trailing
+    else if constexpr (BATCH_SIZE == 256 && N == 1024) return 3;    // 768 blocks, 160 trailing (more splits adds reduce overhead)
+    else if constexpr (BATCH_SIZE == 256 && N == 8192) return 4;    // 1024 blocks, attnv already bandwidth-saturated
     else return 0;
 }
 
@@ -1648,7 +2089,8 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     torch::Tensor Q_bf16,
     torch::Tensor KV_data,
     torch::Tensor KV_scale,
-    float sm_scale
+    float sm_scale,
+    bool profile
 ) {
     constexpr int M = 16;
     constexpr int K = 576;
@@ -1689,7 +2131,7 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     constexpr int PROFILE_INTERVAL = 10;
     auto& stats = perf_map[BATCH_SIZE][N];
     stats.count++;
-    bool do_profile = (stats.count % PROFILE_INTERVAL == 0);
+    bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
 
     hipEvent_t e0, e1, e2, e3, e4, e5;
     if (do_profile) {
@@ -1738,12 +2180,14 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     }
     if (do_profile) hipEventRecord(e3);
 
-    // ---- Step 4: Split-K attn x V (LDS-tiled v2) ----
+    // ---- Step 4: Two-phase MFMA FP4xFP4 head-merged attn x V ----
+    // Phase A: cooperative dequant+requant V into LDS
+    // Phase B: MFMA reads contiguously from requantized LDS
     {
         constexpr int BS = 256;
-        dim3 grid1(BATCH_SIZE, NUM_HEADS, KV_SPLITS);
+        dim3 grid1(BATCH_SIZE, KV_SPLITS);
         dim3 block1(BS);
-        mla_attn_v_splitk_lds_v2_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS><<<grid1, block1>>>(
+        mla_attn_v_mfma_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS><<<grid1, block1>>>(
             reinterpret_cast<const float*>(attn_buf.data_ptr()),
             reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
             reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
@@ -1751,17 +2195,16 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     }
     if (do_profile) hipEventRecord(e4);
 
-    // ---- Step 5: Reduce + output ----
+    // ---- Step 5: Head-merged reduce + output ----
     auto output = torch::empty({TOTAL_HEADS, V_DIM},
         torch::TensorOptions().dtype(torch::kBFloat16).device(Q_bf16.device()));
     {
-        constexpr int total_outputs = TOTAL_HEADS * V_DIM;
         constexpr int R_BLOCK = 256;
-        constexpr int r_grid = (total_outputs + R_BLOCK - 1) / R_BLOCK;
-        mla_attn_v_reduce_kernel<R_BLOCK, KV_SPLITS><<<dim3(r_grid), dim3(R_BLOCK)>>>(
+        dim3 r_grid(BATCH_SIZE, NUM_HEADS);
+        dim3 r_block(R_BLOCK);
+        mla_attn_v_reduce_head_merged_kernel<R_BLOCK, KV_SPLITS><<<r_grid, r_block>>>(
             reinterpret_cast<const float*>(partial_buf.data_ptr()),
-            reinterpret_cast<hip_bfloat16*>(output.data_ptr()),
-            total_outputs);
+            reinterpret_cast<hip_bfloat16*>(output.data_ptr()));
     }
 
     if (do_profile) {
@@ -1799,7 +2242,8 @@ torch::Tensor mla_mxfp4_pipeline(
     torch::Tensor KV_scale,
     int batch_size,
     int kv_seq_len,
-    float sm_scale
+    float sm_scale,
+    bool profile
 ) {
     int B_SCALE_STRIDE = KV_scale.stride(0);
     assert(B_SCALE_STRIDE == 18 || B_SCALE_STRIDE == 24);
@@ -1807,7 +2251,7 @@ torch::Tensor mla_mxfp4_pipeline(
 
 #define MLA_MXFP4(BS, N, STR) \
     if (batch_size == BS && kv_seq_len == N && B_SCALE_STRIDE == STR) \
-        return mla_mxfp4_pipeline_impl<BS, N, STR>(Q_bf16, KV_data, KV_scale, sm_scale)
+        return mla_mxfp4_pipeline_impl<BS, N, STR>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
 
     MLA_MXFP4(4, 1024, 18);
     MLA_MXFP4(4, 1024, 24);
@@ -2598,28 +3042,6 @@ def custom_kernel_fp8(data: input_t) -> output_t:
 # =============================================================================
 
 
-def _get_kv_splits(batch_size: int, kv_seq_len: int) -> int:
-    NUM_CUS = 304
-    NUM_HEADS = 16
-    bps = batch_size * NUM_HEADS
-
-    # Pre-computed optimal splits for known configs
-    _SPLITS = {
-        (4, 1024): 4,      # 256 blocks, rem=256, 84% trailing
-        (4, 8192): 19,     # 1216, perfect
-        (32, 1024): 8,     # 4096 blocks, rem=256, 84% trailing
-        (32, 8192): 19,    # 9728, perfect
-        (64, 1024): 4,     # 4096 blocks, rem=256, 84% trailing
-        (64, 8192): 19,    # 19456, perfect
-        (256, 1024): 4,    # 16384 blocks, rem=272, 89% trailing
-        (256, 8192): 19,   # 77824, perfect
-    }
-
-
-    return _SPLITS.get((batch_size, kv_seq_len),
-                       NUM_CUS // gcd(bps, NUM_CUS))  # fallback
-
-
 
 # =============================================================================
 # Python integration for MLA MXFP4 kernels
@@ -2633,6 +3055,7 @@ def custom_kernel_mxfp4_qkt(data):
     kv_seq_len = config["kv_seq_len"]
     v_head_dim = config["v_head_dim"]
     sm_scale = config["sm_scale"]
+    PROFILE = True
 
     kv_buffer_mxfp4, kv_scale_mxfp4 = kv_data["mxfp4"]
     total_q = q.shape[0]
@@ -2643,7 +3066,7 @@ def custom_kernel_mxfp4_qkt(data):
 
     output = _torch_hip_module.mla_mxfp4_pipeline(
         q_flat, kv_data_flat, kv_scale_flat,
-        batch_size, kv_seq_len, sm_scale)
+        batch_size, kv_seq_len, sm_scale, PROFILE)
 
     return output.view(total_q, num_heads, v_head_dim)
 
