@@ -1,5 +1,5 @@
 "**MI355X on GitHub ✅ success**
-> Workflow [23678829163](<https://github.com/gpu-mode/kernelbot/actions/runs/23678829163>) completed
+> Workflow [23726211488](<https://github.com/gpu-mode/kernelbot/actions/runs/23726211488>) completed
 > Downloading artifacts... done
 > ✅ Compilation successful
 > ✅ Benchmarking successful
@@ -11,42 +11,42 @@ Running on:
 * Runtime: `ROCm`
 * Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
 * Torch: `2.10.0+rocm7.1`
-* Hostname: `arc-runner-set-h82gb-runner-cbjbk`
+* Hostname: `arc-runner-set-h82gb-runner-xv8xc`
 
 
 ## Benchmarks:
 ```
 seed: 4217; qseqlen: 1; kvseqlen: 1024; batchsize: 4
- ⏱ 64.2 ± 0.06 µs
- ⚡ 63.6 µs 🐌 65.3 µs
+ ⏱ 32.1 ± 0.28 µs
+ ⚡ 28.4 µs 🐌 73.2 µs
 
 seed: 4220; qseqlen: 1; kvseqlen: 8192; batchsize: 4
- ⏱ 81.1 ± 0.36 µs
- ⚡ 75.8 µs 🐌 137 µs
+ ⏱ 74.1 ± 0.31 µs
+ ⚡ 69.4 µs 🐌 148 µs
 
 seed: 5412; qseqlen: 1; kvseqlen: 1024; batchsize: 32
- ⏱ 80.8 ± 0.32 µs
- ⚡ 76.1 µs 🐌 126 µs
+ ⏱ 51.6 ± 0.36 µs
+ ⚡ 46.3 µs 🐌 108 µs
 
 seed: 5415; qseqlen: 1; kvseqlen: 8192; batchsize: 32
- ⏱ 272 ± 0.4 µs
- ⚡ 262 µs 🐌 482 µs
+ ⏱ 228 ± 0.4 µs
+ ⚡ 217 µs 🐌 289 µs
 
 seed: 1357; qseqlen: 1; kvseqlen: 1024; batchsize: 64
- ⏱ 119 ± 0.3 µs
- ⚡ 114 µs 🐌 170 µs
+ ⏱ 73.1 ± 0.38 µs
+ ⚡ 67.0 µs 🐌 132 µs
 
 seed: 1360; qseqlen: 1; kvseqlen: 8192; batchsize: 64
- ⏱ 426 ± 0.4 µs
- ⚡ 417 µs 🐌 469 µs
+ ⏱ 369 ± 0.4 µs
+ ⚡ 352 µs 🐌 422 µs
 
 seed: 9823; qseqlen: 1; kvseqlen: 1024; batchsize: 256
- ⏱ 231 ± 0.3 µs
- ⚡ 223 µs 🐌 274 µs
+ ⏱ 188 ± 0.4 µs
+ ⚡ 178 µs 🐌 253 µs
 
 seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
- ⏱ 1337 ± 1.3 µs
- ⚡ 1317 µs 🐌 1382 µs
+ ⏱ 1332 ± 1.3 µs
+ ⚡ 1306 µs 🐌 1398 µs
 ```
 
 ## Program stderr:
@@ -55,7 +55,7 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 \u001b[92mSuccessfully preprocessed all matching files.\u001b[0m
 [aiter] start build [module_mla_metadata] under /home/runner/aiter/aiter/jit/build/module_mla_metadata
-[aiter] \u001b[32mfinish build [module_mla_metadata], cost 30.4s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_metadata], cost 31.5s \u001b[0m
 [aiter] import [module_mla_metadata] under /home/runner/aiter/aiter/jit/module_mla_metadata.so
 [aiter] type hints mismatch, override to --> get_mla_metadata_v1(seqlens_qo_indptr: torch.Tensor, seqlens_kv_indptr: torch.Tensor, kv_last_page_lens: torch.Tensor, num_heads_per_head_k: int | typing.SupportsIndex, num_heads_k: int | typing.SupportsIndex, is_causal: bool, work_metadata_ptrs: torch.Tensor, work_info_set: torch.Tensor, work_indptr: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: torch.Tensor, reduce_partial_map: torch.Tensor, page_size: int | typing.SupportsIndex = 1, kv_granularity: int | typing.SupportsIndex = 16, max_seqlen_qo: int | typing.SupportsIndex = -1, uni_seqlen_qo: int | typing.SupportsIndex = -1, fast_mode: bool = True, topk: int | typing.SupportsIndex = -1, max_split_per_batch: int | typing.SupportsIndex = -1, intra_batch_mode: bool = False, dtype_q: Optional[torch.dtype] = None, dtype_kv: Optional[torch.dtype] = None) -> None
 [aiter] start build [module_mla_asm] under /home/runner/aiter/aiter/jit/build/module_mla_asm
@@ -63,11 +63,11 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
   pd.set_option(\"future.no_silent_downcasting\", True)
 /home/runner/aiter/hsa/codegen.py:86: Pandas4Warning: The copy keyword is deprecated and will be removed in a future version. Copy-on-Write is active in pandas since 3.0 which utilizes a lazy copy mechanism that defers copies until necessary. Use .copy() to make an eager copy if necessary.
   pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
-[aiter] \u001b[32mfinish build [module_mla_asm], cost 20.4s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_asm], cost 20.9s \u001b[0m
 [aiter] import [module_mla_asm] under /home/runner/aiter/aiter/jit/module_mla_asm.so
 [aiter] type hints mismatch, override to --> mla_decode_stage1_asm_fwd(Q: torch.Tensor, KV: torch.Tensor, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_page_indices: torch.Tensor, kv_last_page_lens: torch.Tensor, num_kv_splits_indptr: Optional[torch.Tensor], work_meta_data: Optional[torch.Tensor], work_indptr: Optional[torch.Tensor], work_info_set: Optional[torch.Tensor], max_seqlen_q: int | typing.SupportsIndex, page_size: int | typing.SupportsIndex, nhead_kv: int | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, splitData: torch.Tensor, splitLse: torch.Tensor, output: torch.Tensor, q_scale: Optional[torch.Tensor] = None, kv_scale: Optional[torch.Tensor] = None) -> None
 [aiter] start build [module_mla_reduce] under /home/runner/aiter/aiter/jit/build/module_mla_reduce
-[aiter] \u001b[32mfinish build [module_mla_reduce], cost 168.4s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_reduce], cost 170.7s \u001b[0m
 [aiter] import [module_mla_reduce] under /home/runner/aiter/aiter/jit/module_mla_reduce.so
 [aiter] type hints mismatch, override to --> mla_reduce_v1(partial_output: torch.Tensor, partial_lse: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: Optional[torch.Tensor], reduce_partial_map: torch.Tensor, max_seqlen_q: int | typing.SupportsIndex, final_output: torch.Tensor, final_lse: Optional[torch.Tensor] = None) -> None```
 
@@ -76,42 +76,46 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
 [PyTorch] Starting compilation...
 [PyTorch] Setup took 0.00s
 [PyTorch] Starting load_inline...
-/home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/main.cpp -> /home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/main.cpp [skipped, no changes]
-/home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/cuda.cu -> /home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch/hip.hip [skipped, already hipified]
+/home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch_v13/main.cpp -> /home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch_v13/main.cpp [skipped, no changes]
+/home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch_v13/cuda.cu -> /home/runner/.cache/torch_extensions/py312_cpu/mla_mxfp4_hip_torch_v13/hip.hip [skipped, already hipified]
 Total number of unsupported CUDA function calls: 0
 
 
-Total number of replaced kernel launches: 5
-ninja: no work to do.
-[PyTorch] load_inline took 0.40s
-[PyTorch] Total compilation time: 0.40s
+Total number of replaced kernel launches: 9
+[1/1] clang++ main.o hip.cuda.o -shared -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_hip -ltorch_cpu -ltorch_hip -ltorch -ltorch_python -L/opt/rocm/lib -lamdhip64 -o mla_mxfp4_hip_torch_v13.so
+[PyTorch] load_inline took 0.58s
+[PyTorch] Total compilation time: 0.58s
 [aiter] hipModuleLoad: /home/runner/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co GetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE
 [aiter] hipModuleGetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE Success
-[MLA] bs=4 kv=8192 splits=76 | quant=6.8us qkt=9.6us softmax=27.7us attnv=37.2us reduce=7.5us | total=88.6us (avg over 1)
-[MLA] bs=4 kv=8192 splits=76 | quant=6.6us qkt=9.6us softmax=27.8us attnv=36.9us reduce=7.5us | total=88.4us (avg over 2)
-[MLA] bs=4 kv=8192 splits=76 | quant=6.6us qkt=9.7us softmax=27.6us attnv=37.1us reduce=7.5us | total=88.5us (avg over 3)
-[MLA] bs=4 kv=8192 splits=76 | quant=6.6us qkt=9.6us softmax=27.6us attnv=37.1us reduce=7.5us | total=88.4us (avg over 4)
-[MLA] bs=32 kv=1024 splits=19 | quant=6.6us qkt=10.0us softmax=8.6us attnv=56.2us reduce=6.9us | total=88.2us (avg over 1)
-[MLA] bs=32 kv=1024 splits=19 | quant=6.7us qkt=9.8us softmax=8.5us attnv=56.1us reduce=6.9us | total=88.0us (avg over 2)
-[MLA] bs=32 kv=1024 splits=19 | quant=6.6us qkt=9.8us softmax=8.6us attnv=56.1us reduce=6.9us | total=88.0us (avg over 3)
-[MLA] bs=32 kv=1024 splits=19 | quant=6.7us qkt=9.8us softmax=8.6us attnv=56.5us reduce=7.0us | total=88.6us (avg over 4)
-[MLA] bs=32 kv=8192 splits=19 | quant=6.9us qkt=45.9us softmax=32.3us attnv=186.8us reduce=8.4us | total=280.3us (avg over 1)
-[MLA] bs=32 kv=8192 splits=19 | quant=6.8us qkt=46.2us softmax=31.9us attnv=186.6us reduce=7.7us | total=279.1us (avg over 2)
-[MLA] bs=32 kv=8192 splits=19 | quant=6.7us qkt=45.9us softmax=31.7us attnv=187.0us reduce=7.4us | total=278.8us (avg over 3)
-[MLA] bs=32 kv=8192 splits=19 | quant=6.7us qkt=45.8us softmax=31.7us attnv=187.2us reduce=7.3us | total=278.6us (avg over 4)
-[MLA] bs=64 kv=1024 splits=19 | quant=6.6us qkt=15.3us softmax=10.4us attnv=83.6us reduce=9.7us | total=125.7us (avg over 1)
-[MLA] bs=64 kv=1024 splits=19 | quant=8.6us qkt=15.5us softmax=10.3us attnv=83.7us reduce=9.7us | total=127.8us (avg over 2)
-[MLA] bs=64 kv=1024 splits=19 | quant=8.3us qkt=15.8us softmax=11.0us attnv=83.7us reduce=9.8us | total=128.5us (avg over 3)
-[MLA] bs=64 kv=1024 splits=19 | quant=7.9us qkt=15.7us softmax=10.8us attnv=83.7us reduce=9.7us | total=127.8us (avg over 4)
-[MLA] bs=64 kv=8192 splits=19 | quant=7.5us qkt=84.4us softmax=36.6us attnv=293.6us reduce=10.2us | total=432.1us (avg over 1)
-[MLA] bs=64 kv=8192 splits=19 | quant=7.2us qkt=84.3us softmax=36.4us attnv=295.4us reduce=10.3us | total=433.6us (avg over 2)
-[MLA] bs=64 kv=8192 splits=19 | quant=7.1us qkt=84.7us softmax=36.5us attnv=295.0us reduce=10.3us | total=433.5us (avg over 3)
-[MLA] bs=64 kv=8192 splits=19 | quant=7.1us qkt=85.8us softmax=36.4us attnv=296.7us reduce=10.4us | total=436.4us (avg over 4)
-[MLA] bs=256 kv=1024 splits=3 | quant=8.5us qkt=47.2us softmax=22.6us attnv=150.1us reduce=8.2us | total=236.6us (avg over 1)
-[MLA] bs=256 kv=1024 splits=3 | quant=8.5us qkt=48.3us softmax=22.5us attnv=150.9us reduce=9.2us | total=239.4us (avg over 2)
-[MLA] bs=256 kv=1024 splits=3 | quant=8.5us qkt=47.8us softmax=23.1us attnv=151.7us reduce=8.9us | total=240.0us (avg over 3)
-[MLA] bs=256 kv=1024 splits=3 | quant=8.4us qkt=48.9us softmax=23.0us attnv=151.6us reduce=8.7us | total=240.6us (avg over 4)
-[MLA] bs=256 kv=8192 splits=4 | quant=8.4us qkt=286.3us softmax=126.4us attnv=904.5us reduce=9.6us | total=1335.1us (avg over 1)
-[MLA] bs=256 kv=8192 splits=4 | quant=8.4us qkt=287.1us softmax=127.7us attnv=908.2us reduce=9.6us | total=1341.1us (avg over 2)
-[MLA] bs=256 kv=8192 splits=4 | quant=8.5us qkt=286.9us softmax=128.6us attnv=913.3us reduce=9.6us | total=1347.0us (avg over 3)
-[MLA] bs=256 kv=8192 splits=4 | quant=8.5us qkt=287.0us softmax=128.5us attnv=911.5us reduce=9.6us | total=1345.1us (avg over 4)```"
+[MLA] bs=4 kv=1024 splits=76 | quant=6.7us qkt+softmax=11.9us attnv=11.4us reduce=7.5us | total=37.4us (avg over 1)
+[MLA] bs=4 kv=1024 splits=76 | quant=6.5us qkt+softmax=11.9us attnv=11.3us reduce=7.5us | total=37.2us (avg over 2)
+[MLA] bs=4 kv=1024 splits=76 | quant=6.5us qkt+softmax=11.9us attnv=11.4us reduce=7.5us | total=37.3us (avg over 3)
+[MLA] bs=4 kv=1024 splits=76 | quant=6.5us qkt+softmax=11.8us attnv=12.7us reduce=8.0us | total=39.1us (avg over 4)
+[MLA] bs=4 kv=8192 splits=76 | quant=6.5us qkt+softmax=29.2us attnv=39.3us reduce=9.3us | total=84.3us (avg over 1)
+[MLA] bs=4 kv=8192 splits=76 | quant=6.5us qkt+softmax=29.4us attnv=37.3us reduce=8.4us | total=81.6us (avg over 2)
+[MLA] bs=4 kv=8192 splits=76 | quant=6.5us qkt+softmax=29.5us attnv=36.8us reduce=8.0us | total=80.7us (avg over 3)
+[MLA] bs=4 kv=8192 splits=76 | quant=6.5us qkt+softmax=29.4us attnv=36.4us reduce=8.0us | total=80.2us (avg over 4)
+[MLA] bs=32 kv=1024 splits=19 | quant=6.9us qkt+softmax=16.2us attnv=28.4us reduce=7.6us | total=59.0us (avg over 1)
+[MLA] bs=32 kv=1024 splits=19 | quant=6.9us qkt+softmax=16.0us attnv=27.1us reduce=7.1us | total=57.1us (avg over 2)
+[MLA] bs=32 kv=1024 splits=19 | quant=6.8us qkt+softmax=16.1us attnv=26.8us reduce=7.0us | total=56.7us (avg over 3)
+[MLA] bs=32 kv=1024 splits=19 | quant=6.8us qkt+softmax=16.0us attnv=26.5us reduce=6.9us | total=56.2us (avg over 4)
+[MLA] bs=32 kv=8192 splits=19 | quant=6.6us qkt+softmax=67.1us attnv=146.5us reduce=6.7us | total=226.9us (avg over 1)
+[MLA] bs=32 kv=8192 splits=19 | quant=6.8us qkt+softmax=67.0us attnv=149.0us reduce=7.2us | total=230.0us (avg over 2)
+[MLA] bs=32 kv=8192 splits=19 | quant=6.7us qkt+softmax=67.5us attnv=149.6us reduce=7.0us | total=230.8us (avg over 3)
+[MLA] bs=32 kv=8192 splits=19 | quant=6.7us qkt+softmax=67.7us attnv=149.2us reduce=7.0us | total=230.5us (avg over 4)
+[MLA] bs=64 kv=1024 splits=19 | quant=6.9us qkt+softmax=21.5us attnv=38.3us reduce=9.4us | total=76.1us (avg over 1)
+[MLA] bs=64 kv=1024 splits=19 | quant=6.8us qkt+softmax=21.6us attnv=38.4us reduce=9.6us | total=76.3us (avg over 2)
+[MLA] bs=64 kv=1024 splits=19 | quant=6.9us qkt+softmax=21.7us attnv=38.5us reduce=9.5us | total=76.6us (avg over 3)
+[MLA] bs=64 kv=1024 splits=19 | quant=6.9us qkt+softmax=21.8us attnv=38.6us reduce=9.6us | total=76.8us (avg over 4)
+[MLA] bs=64 kv=8192 splits=19 | quant=6.6us qkt+softmax=111.3us attnv=241.4us reduce=9.5us | total=368.9us (avg over 1)
+[MLA] bs=64 kv=8192 splits=19 | quant=7.1us qkt+softmax=113.5us attnv=241.4us reduce=9.5us | total=371.5us (avg over 2)
+[MLA] bs=64 kv=8192 splits=19 | quant=7.0us qkt+softmax=113.3us attnv=243.2us reduce=9.5us | total=373.0us (avg over 3)
+[MLA] bs=64 kv=8192 splits=19 | quant=7.7us qkt+softmax=112.0us attnv=243.4us reduce=9.6us | total=372.7us (avg over 4)
+[MLA] bs=256 kv=1024 splits=4 | quant=8.4us qkt+softmax=64.4us attnv=113.0us reduce=8.8us | total=194.6us (avg over 1)
+[MLA] bs=256 kv=1024 splits=4 | quant=8.4us qkt+softmax=63.6us attnv=113.1us reduce=8.8us | total=194.0us (avg over 2)
+[MLA] bs=256 kv=1024 splits=4 | quant=8.4us qkt+softmax=63.4us attnv=113.6us reduce=8.8us | total=194.2us (avg over 3)
+[MLA] bs=256 kv=1024 splits=4 | quant=8.4us qkt+softmax=62.7us attnv=112.4us reduce=8.8us | total=192.3us (avg over 4)
+[MLA] bs=256 kv=8192 splits=4 | quant=8.8us qkt+softmax=405.0us attnv=914.0us reduce=9.6us | total=1337.6us (avg over 1)
+[MLA] bs=256 kv=8192 splits=4 | quant=8.6us qkt+softmax=405.5us attnv=918.0us reduce=9.6us | total=1341.7us (avg over 2)
+[MLA] bs=256 kv=8192 splits=4 | quant=8.5us qkt+softmax=402.2us attnv=916.9us reduce=9.6us | total=1337.2us (avg over 3)
+[MLA] bs=256 kv=8192 splits=4 | quant=8.6us qkt+softmax=403.2us attnv=916.6us reduce=9.6us | total=1337.9us (avg over 4)```"

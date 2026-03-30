@@ -10,7 +10,7 @@ Implements multiple optimization strategies:
 
 DeepSeek R1 forward_absorb MLA config:
   total_num_heads  = 128    (query heads before TP split)
-  num_heads        = 128 // tp  (query heads per device, tp=4 → 32, tp=8 → 16)
+  num_heads        = 128 // tp  (query heads per device, tp=4 -> 32, tp=8 -> 16)
   num_kv_heads     = 1      (shared latent KV head)
   kv_lora_rank     = 512    (latent dim)
   qk_rope_head_dim = 64     (RoPE dim)
@@ -50,6 +50,7 @@ from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
 # 6. Reduced shared memory bank conflicts
 # 7. Loop unrolling for MXFP4 block processing
 MLA_MXFP4_HIP_SOURCE = b'''
+// v4 fused attn kernel
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -911,7 +912,8 @@ mla_qkt_mxfp4_kernel(
     const uint8_t* __restrict__ B_data,
     const uint8_t* __restrict__ A_scale,
     const uint8_t* __restrict__ B_scale,
-    float* __restrict__ C
+    float* __restrict__ C,
+    float sm_scale
 ) {
     constexpr int IM = 16;
     constexpr int IN = 16;
@@ -992,14 +994,14 @@ mla_qkt_mxfp4_kernel(
         a_sc_cur = a_sc_nxt; b_sc_cur = b_sc_nxt;
     }
 
-    // Store fp32 output: (M, N)
+    // Store fp32 output with fused sm_scale: (M, N)
     int col = lane % 16;
     int quad = lane / 16;
     for (int i = 0; i < 4; i++) {
         int row = i + 4 * quad;
         int gn = tile_n + col;
         if (row < M && gn < N)
-            c_out[row * N + gn] = acc[i];
+            c_out[row * N + gn] = acc[i] * sm_scale;
     }
 }
 
@@ -1038,7 +1040,8 @@ mla_qkt_tiled_kernel(
     const hip_bfloat16* __restrict__ Q_bf16,  // (batch*M, K) bf16 query
     const uint8_t* __restrict__ B_data,       // (batch*N, K_HALF) MXFP4 KV packed
     const uint8_t* __restrict__ B_scale,      // (batch*N, B_SCALE_STRIDE) E8M0 scales
-    float* __restrict__ C                     // (batch, M, N) fp32 scores
+    float* __restrict__ C,                    // (batch, M, N) fp32 scores
+    float sm_scale                            // pre-scale factor fused into output
 ) {
     constexpr int OUTER_M = 16;   // = M, entire M in one tile
     constexpr int OUTER_N = 64;   // 4 N-tiles of 16
@@ -1164,14 +1167,14 @@ mla_qkt_tiled_kernel(
         __syncthreads();
     }
 
-    // ---- Store fp32 output ----
+    // ---- Store fp32 output with fused sm_scale ----
     int col = lane % 16;
     int quad = lane / 16;
     for (int i = 0; i < 4; i++) {
         int row = i + 4 * quad;
         int gn = outer_n + warp_id * IN + col;
         if (row < M && gn < N)
-            c_out[row * N + gn] = acc[i];
+            c_out[row * N + gn] = acc[i] * sm_scale;
     }
 }
 
@@ -1286,23 +1289,23 @@ void mla_attn_v_reduce_kernel(
 }
 
 // =============================================================================
-// Fused sm_scale + softmax HIP kernel
+// 2-pass softmax HIP kernel (pre-scaled input)
 //
-// Replaces: scores = scores * sm_scale; attn_weights = torch.softmax(scores, dim=-1)
-// One block per (batch, head) row. 256 threads, each handles multiple elements.
-// Input: fp32 scores (batch, 16, kv_seq_len)
-// Output: fp32 attn_weights (batch, 16, kv_seq_len) - in-place or out-of-place
+// Input: fp32 pre-scaled scores (batch, 16, N) - sm_scale already applied by QK^T
+// Output: fp32 attn_weights (batch, 16, N) - normalized in-place
 //
-// Add to MLA_MXFP4_HIP_SOURCE in submission.py
+// Pass 1: Find max, compute exp(val - max), accumulate sum (read scores, write exp)
+// Pass 2: Normalize by 1/sum (read+write in-place)
+//
+// Saves one full read pass vs the old 3-pass kernel since sm_scale is pre-applied.
 // =============================================================================
 template <int N, int BLOCK_SIZE>
 __global__ __launch_bounds__(BLOCK_SIZE)
-void mla_scale_softmax_kernel(
-    const float* __restrict__ scores,    // (batch, 16, N)
-    float* __restrict__ attn_out,        // (batch, 16, N)
-    float sm_scale
+void mla_softmax_2pass_kernel(
+    float* __restrict__ data,    // (batch, 16, N) - in-place: pre-scaled scores in, attn weights out
+    int dummy
 ) {
-    constexpr int THREADS = 256;
+    constexpr int THREADS = BLOCK_SIZE;
 
     const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
     const int head_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
@@ -1311,82 +1314,57 @@ void mla_scale_softmax_kernel(
     const int warp_id = tid >> 6;
 
     const int64_t row_offset = __builtin_amdgcn_readfirstlane(((int64_t)batch_idx * 16 + head_idx) * N);
-    const float* row_in = scores + row_offset;
-    float* row_out = attn_out + row_offset;
+    float* row = data + row_offset;
 
-    // Shared memory for cross-warp reductions
     __shared__ float smem[4];  // 4 warps
 
-    // ---- Pass 1: Find max (with fused sm_scale) ----
+    // ---- Pass 1a: Find max ----
     float local_max = -INFINITY;
     for (int i = tid; i < N; i += THREADS) {
-        float val = row_in[i] * sm_scale;
-        local_max = fmaxf(local_max, val);
+        local_max = fmaxf(local_max, row[i]);
     }
 
-    // Warp reduction for max
-    // #pragma unroll
-    for (int offset = 32; offset > 0; offset >>= 1) {
+    for (int offset = 32; offset > 0; offset >>= 1)
         local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
-    }
-
     if (lane == 0) smem[warp_id] = local_max;
     __syncthreads();
 
-    // Cross-warp max reduction
     float global_max;
-    if (tid < 4) {
-        global_max = smem[tid];
-    } else {
-        global_max = -INFINITY;
-    }
+    if (tid < 4) global_max = smem[tid]; else global_max = -INFINITY;
     if (tid < 64) {
-        // #pragma unroll
-        for (int offset = 32; offset > 0; offset >>= 1) {
+        for (int offset = 32; offset > 0; offset >>= 1)
             global_max = fmaxf(global_max, __shfl_xor(global_max, offset));
-        }
     }
     if (tid == 0) smem[0] = global_max;
     __syncthreads();
     global_max = smem[0];
 
-    // ---- Pass 2: Compute exp and sum ----
+    // ---- Pass 1b: Compute exp(val - max), write back, accumulate sum ----
     float local_sum = 0.0f;
     for (int i = tid; i < N; i += THREADS) {
-        float val = row_in[i] * sm_scale;
-        float e = expf(val - global_max);
-        row_out[i] = e;  // Store exp temporarily
+        float e = expf(row[i] - global_max);
+        row[i] = e;
         local_sum += e;
     }
 
-    // Warp reduction for sum
-    // #pragma unroll
-    for (int offset = 32; offset > 0; offset >>= 1) {
+    for (int offset = 32; offset > 0; offset >>= 1)
         local_sum += __shfl_xor(local_sum, offset);
-    }
-
     if (lane == 0) smem[warp_id] = local_sum;
     __syncthreads();
 
     float global_sum;
-    if (tid < 4) {
-        global_sum = smem[tid];
-    } else {
-        global_sum = 0.0f;
-    }
+    if (tid < 4) global_sum = smem[tid]; else global_sum = 0.0f;
     if (tid < 64) {
-        // #pragma unroll
-        for (int offset = 32; offset > 0; offset >>= 1) {
+        for (int offset = 32; offset > 0; offset >>= 1)
             global_sum += __shfl_xor(global_sum, offset);
-        }
     }
     if (tid == 0) smem[0] = global_sum;
     __syncthreads();
     float inv_sum = 1.0f / smem[0];
 
-    // ---- Pass 3: Normalize ----
+    // ---- Pass 2: Normalize ----
     for (int i = tid; i < N; i += THREADS) {
-        row_out[i] *= inv_sum;
+        row[i] *= inv_sum;
     }
 }
 
@@ -1966,10 +1944,302 @@ void mla_attn_v_reduce_head_merged_kernel(
     output[out_base + v_dim1] = hip_bfloat16(sum1);
 }
 
+// =============================================================================
+// FUSED FlashAttention-style MLA decode kernel (v4)
+//
+// Replaces: QK^T GEMM + softmax + attnV with a SINGLE kernel that reads KV
+// data ONCE from HBM. Uses online softmax with V accumulator rescaling.
+//
+// QK^T: Uses SAME single-warp MFMA pattern as working mla_qkt_mxfp4_kernel
+// V accumulation: scalar FP32 with LUT-based MXFP4 dequant
+//
+// Grid: (BATCH_SIZE, KV_SPLITS)
+// Block: 128 threads (2 warps) - warp 0 does MFMA, both do V accum
+//
+// LDS: Q data+scale (4.9KB) + KV tile (18.4KB) + KV scales (1.2KB)
+//      + scores (1KB) = ~25.5 KB
+// =============================================================================
+
+template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS,
+          int K_HALF, int NUM_BLOCKS, int A_K_HALF>
+__global__ __launch_bounds__(BLOCK_SIZE)
+void mla_fused_attn_kernel(
+    const uint8_t* __restrict__ q_data,      // (batch*16, A_K_HALF) pre-quantized Q MXFP4
+    const uint8_t* __restrict__ q_scale,     // (batch*NUM_BLOCKS*16) Q E8M0 scales
+    const uint8_t* __restrict__ kv_mxfp4,    // (batch*N, K_HALF) packed KV MXFP4
+    const uint8_t* __restrict__ kv_scale,    // (batch*N, B_SCALE_STRIDE) KV E8M0 scales
+    float sm_scale,
+    float* __restrict__ partial_out,          // (batch, KV_SPLITS, 16, 512) fp32
+    float* __restrict__ partial_lse           // (batch, KV_SPLITS, 16) log-sum-exp
+) {
+    constexpr int V_DIM = 512;
+    constexpr int THREADS = BLOCK_SIZE;  // 64
+    constexpr int HEADS = 16;
+    constexpr int KV_PER_SPLIT = (N + KV_SPLITS - 1) / KV_SPLITS;
+    constexpr int IM = 16;
+    constexpr int IN = 16;
+    constexpr int BPC = 4;
+    constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
+
+    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
+    const int split_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 64;
+    const int lane = tid % 64;
+
+    const int kv_start_global = split_idx * KV_PER_SPLIT;
+    const int kv_end_global = min(kv_start_global + KV_PER_SPLIT, N);
+
+    // ---- LDS layout ----
+    __shared__ uint8_t q_lds_data[HEADS * A_K_HALF];
+    __shared__ uint8_t q_lds_scale[NUM_BLOCKS * HEADS];
+    __shared__ uint8_t kv_lds_data[IN * K_HALF];         // 16 KV positions at a time
+    __shared__ uint8_t kv_lds_scale_tile[IN * B_SCALE_STRIDE];
+    __shared__ float   scores_lds[HEADS * IN];            // 16 * 16 = 256 floats
+
+    // ---- Per-thread V accumulators + online softmax state ----
+    // 256 threads: V_PER_THREAD=2, all 16 heads, 64 VGPRs total (safe)
+    constexpr int V_PER_THREAD = V_DIM / THREADS;  // 512/256 = 2
+    float acc[HEADS * V_PER_THREAD];      // 32 floats
+    float running_max[HEADS];              // 16 floats
+    float running_sum[HEADS];              // 16 floats
+    for (int h = 0; h < HEADS; h++) {
+        acc[h * 2] = 0.0f;
+        acc[h * 2 + 1] = 0.0f;
+        running_max[h] = -INFINITY;
+        running_sum[h] = 0.0f;
+    }
+
+    // Pre-compute V dimension mappings for this thread
+    int v_dims[V_PER_THREAD];
+    int v_byte_offsets[V_PER_THREAD];
+    int v_blocks[V_PER_THREAD];
+    int v_nibble_shifts[V_PER_THREAD];
+    for (int v = 0; v < V_PER_THREAD; v++) {
+        int vd = tid * V_PER_THREAD + v;
+        v_dims[v] = vd;
+        int vblk = vd / 32;
+        int vwithin = vd % 32;
+        v_byte_offsets[v] = vblk * 16 + vwithin / 2;
+        v_blocks[v] = vblk;
+        v_nibble_shifts[v] = (vwithin % 2) * 4;
+    }
+
+    // ---- Step 1: Load pre-quantized Q into LDS (one-time) ----
+    {
+        const uint8_t* q_d = q_data + batch_idx * HEADS * A_K_HALF;
+        const int total_q_bytes = HEADS * A_K_HALF;
+        for (int i = tid * 16; i < total_q_bytes; i += THREADS * 16) {
+            if (i + 16 <= total_q_bytes)
+                *reinterpret_cast<uint128_vec*>(&q_lds_data[i]) =
+                    *reinterpret_cast<const uint128_vec*>(&q_d[i]);
+        }
+        const uint8_t* q_s = q_scale + batch_idx * NUM_BLOCKS * HEADS;
+        const int total_q_scales = NUM_BLOCKS * HEADS;
+        for (int i = tid; i < total_q_scales; i += THREADS) {
+            q_lds_scale[i] = q_s[i];
+        }
+    }
+    if (kv_start_global >= N) {
+        const int64_t out_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM;
+        const int64_t lse_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS;
+        for (int h = 0; h < HEADS; h++) {
+            partial_out[out_base + (int64_t)h * V_DIM + v_dims[0]] = 0.0f;
+            partial_out[out_base + (int64_t)h * V_DIM + v_dims[1]] = 0.0f;
+        }
+        if (tid < HEADS) partial_lse[lse_base + tid] = -INFINITY;
+        return;
+    }
+
+    __syncthreads();
+
+    // ---- Step 2: Iterate over KV in subtiles of 16 positions ----
+    const int64_t kv_data_base = (int64_t)batch_idx * N * K_HALF;
+    const int64_t kv_scale_base = (int64_t)batch_idx * N * B_SCALE_STRIDE;
+
+    for (int kv_pos = kv_start_global; kv_pos < kv_end_global; kv_pos += IN) {
+        const int subtile_end = min(kv_pos + IN, kv_end_global);
+        const int subtile_size = subtile_end - kv_pos;
+
+        // ---- 2a: Load 16 KV positions into LDS (all 256 threads = 4x faster) ----
+        {
+            const int total_bytes = subtile_size * K_HALF;
+            for (int i = tid * 16; i < total_bytes; i += THREADS * 16) {
+                const int row = i / K_HALF;
+                const int col = i % K_HALF;
+                if (row < subtile_size) {
+                    *reinterpret_cast<uint128_vec*>(&kv_lds_data[row * K_HALF + col]) =
+                        *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[kv_data_base + (int64_t)(kv_pos + row) * K_HALF + col]);
+                }
+            }
+            const int total_sc = subtile_size * B_SCALE_STRIDE;
+            for (int i = tid; i < total_sc; i += THREADS) {
+                const int row = i / B_SCALE_STRIDE;
+                const int blk = i % B_SCALE_STRIDE;
+                kv_lds_scale_tile[row * B_SCALE_STRIDE + blk] =
+                    kv_scale[kv_scale_base + (int64_t)(kv_pos + row) * B_SCALE_STRIDE + blk];
+            }
+        }
+
+        __syncthreads();
+
+        // ---- 2b: QK^T via MFMA (warp 0 only) ----
+        if (warp_id == 0) {
+            float4_t mfma_acc = {};
+            for (int ki = 0; ki < K_ITERS; ki++) {
+                int blk0 = ki * BPC;
+                int a_row = lane % IM;
+                int a_blk = blk0 + lane / IM;
+                uint32_t a_reg[8] = {};
+                if (a_blk < NUM_BLOCKS) {
+                    int a_off = a_row * A_K_HALF + a_blk * 16;
+                    *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
+                        *reinterpret_cast<const uint128_vec*>(&q_lds_data[a_off]);
+                }
+                uint8_t a_e = 127;
+                if (a_row < HEADS && a_blk < NUM_BLOCKS)
+                    a_e = q_lds_scale[a_row + a_blk * HEADS];
+                else
+                    a_reg[0] = a_reg[1] = a_reg[2] = a_reg[3] = 0;
+                int32_t a_sc = mla_broadcast_scale(a_e);
+
+                int b_row = lane % IM;
+                int b_blk = blk0 + lane / IM;
+                uint32_t b_reg[8] = {};
+                if (b_row < subtile_size && b_blk < NUM_BLOCKS) {
+                    int b_off = b_row * K_HALF + b_blk * 16;
+                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                        *reinterpret_cast<const uint128_vec*>(&kv_lds_data[b_off]);
+                }
+                uint8_t b_e = 127;
+                if (b_row < subtile_size && b_blk < NUM_BLOCKS)
+                    b_e = kv_lds_scale_tile[b_row * B_SCALE_STRIDE + b_blk];
+                else
+                    b_reg[0] = b_reg[1] = b_reg[2] = b_reg[3] = 0;
+                int32_t b_sc = mla_broadcast_scale(b_e);
+
+                a_reg[4]=a_reg[5]=a_reg[6]=a_reg[7]=0;
+                b_reg[4]=b_reg[5]=b_reg[6]=b_reg[7]=0;
+
+                int8_vec a_vec = {(int)a_reg[0],(int)a_reg[1],(int)a_reg[2],(int)a_reg[3],
+                                  (int)a_reg[4],(int)a_reg[5],(int)a_reg[6],(int)a_reg[7]};
+                int8_vec b_vec = {(int)b_reg[0],(int)b_reg[1],(int)b_reg[2],(int)b_reg[3],
+                                  (int)b_reg[4],(int)b_reg[5],(int)b_reg[6],(int)b_reg[7]};
+                mfma_acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                    a_vec, b_vec, mfma_acc, FMT_FP4_MFMA, FMT_FP4_MFMA,
+                    0, a_sc, 0, b_sc);
+            }
+            int col = lane % 16;
+            int quad = lane / 16;
+            for (int i = 0; i < 4; i++) {
+                int head = i + 4 * quad;
+                if (head < HEADS && col < subtile_size)
+                    scores_lds[head * IN + col] = mfma_acc[i] * sm_scale;
+            }
+        }
+
+        __syncthreads();
+
+        // ---- 2c: Online softmax + V accumulation (all 256 threads, 2 V dims each) ----
+        for (int ki = 0; ki < subtile_size; ki++) {
+            float v_val0, v_val1;
+            {
+                float bs0 = e8m0_to_float_fast(kv_lds_scale_tile[ki * B_SCALE_STRIDE + v_blocks[0]]);
+                uint8_t p0 = kv_lds_data[ki * K_HALF + v_byte_offsets[0]];
+                v_val0 = FP4_E2M1_LUT[(p0 >> v_nibble_shifts[0]) & 0x0F] * bs0;
+
+                float bs1 = e8m0_to_float_fast(kv_lds_scale_tile[ki * B_SCALE_STRIDE + v_blocks[1]]);
+                uint8_t p1 = kv_lds_data[ki * K_HALF + v_byte_offsets[1]];
+                v_val1 = FP4_E2M1_LUT[(p1 >> v_nibble_shifts[1]) & 0x0F] * bs1;
+            }
+
+            #pragma unroll
+            for (int h = 0; h < HEADS; h++) {
+                const float s = scores_lds[h * IN + ki];
+                const float old_max = running_max[h];
+                const float new_max = fmaxf(old_max, s);
+                const float rescale = __expf(old_max - new_max);
+                const float exp_s = __expf(s - new_max);
+                running_max[h] = new_max;
+                running_sum[h] = running_sum[h] * rescale + exp_s;
+                acc[h * 2]     = acc[h * 2] * rescale + exp_s * v_val0;
+                acc[h * 2 + 1] = acc[h * 2 + 1] * rescale + exp_s * v_val1;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ---- Step 3: Write partial output + LSE ----
+    const int64_t out_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM;
+    for (int h = 0; h < HEADS; h++) {
+        float inv_sum = (running_sum[h] > 0.0f) ? (1.0f / running_sum[h]) : 0.0f;
+        partial_out[out_base + (int64_t)h * V_DIM + v_dims[0]] = acc[h * 2] * inv_sum;
+        partial_out[out_base + (int64_t)h * V_DIM + v_dims[1]] = acc[h * 2 + 1] * inv_sum;
+    }
+
+    const int64_t lse_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS;
+    if (tid < HEADS) {
+        float lse = running_max[tid] + logf(fmaxf(running_sum[tid], 1e-20f));
+        partial_lse[lse_base + tid] = lse;
+    }
+}
+
+// =============================================================================
+// Fused reduce kernel: combines independently-normalized splits using LSE
+// 2-pass: first find max_lse, then accumulate weighted partials
+// No large stack arrays - avoids register spill for large KV_SPLITS
+// =============================================================================
+
+template <int BLOCK_SIZE, int KV_SPLITS>
+__global__ __launch_bounds__(BLOCK_SIZE)
+void mla_fused_reduce_kernel(
+    const float* __restrict__ partial_out,    // (batch, KV_SPLITS, 16, 512)
+    const float* __restrict__ partial_lse,    // (batch, KV_SPLITS, 16)
+    hip_bfloat16* __restrict__ output         // (batch * 16, 512)
+) {
+    constexpr int V_DIM = 512;
+    constexpr int HEADS = 16;
+
+    const int batch_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int v_dim0 = tid * 2;
+    const int v_dim1 = tid * 2 + 1;
+
+    const int64_t lse_batch_base = (int64_t)batch_idx * KV_SPLITS * HEADS;
+    const int64_t v_batch_base = (int64_t)batch_idx * KV_SPLITS * HEADS * V_DIM;
+
+    // Pass 1: Find max LSE across all splits (no array needed)
+    float max_lse = -INFINITY;
+    for (int s = 0; s < KV_SPLITS; s++) {
+        float lse = partial_lse[lse_batch_base + (int64_t)s * HEADS + head_idx];
+        max_lse = fmaxf(max_lse, lse);
+    }
+
+    // Pass 2: Accumulate weighted partials using max_lse
+    float sum0 = 0.0f, sum1 = 0.0f, denom = 0.0f;
+    for (int s = 0; s < KV_SPLITS; s++) {
+        float lse = partial_lse[lse_batch_base + (int64_t)s * HEADS + head_idx];
+        float w = expf(lse - max_lse);
+        denom += w;
+        const int64_t split_base = v_batch_base + (int64_t)s * HEADS * V_DIM + (int64_t)head_idx * V_DIM;
+        sum0 += w * partial_out[split_base + v_dim0];
+        sum1 += w * partial_out[split_base + v_dim1];
+    }
+
+    float inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+    const int64_t out_base = ((int64_t)batch_idx * HEADS + head_idx) * V_DIM;
+    output[out_base + v_dim0] = hip_bfloat16(sum0 * inv_denom);
+    output[out_base + v_dim1] = hip_bfloat16(sum1 * inv_denom);
+}
+
 '''
 
 # C++ wrapper for PyTorch load_inline compilation - optimized for MI355X
 MLA_MXFP4_CPP_SOURCE = r'''
+// v4 fused attn kernel rewrite
 #include <torch/extension.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
@@ -2079,8 +2349,8 @@ constexpr int get_kv_split() {
     else if constexpr (BATCH_SIZE == 32 && N == 8192) return 19;    // 608 blocks, 0 trailing
     else if constexpr (BATCH_SIZE == 64 && N == 1024) return 19;     // 1216 blocks, 0 trailing
     else if constexpr (BATCH_SIZE == 64 && N == 8192) return 19;     // 1216 blocks, 0 trailing
-    else if constexpr (BATCH_SIZE == 256 && N == 1024) return 3;    // 768 blocks, 160 trailing (more splits adds reduce overhead)
-    else if constexpr (BATCH_SIZE == 256 && N == 8192) return 4;    // 1024 blocks, attnv already bandwidth-saturated
+    else if constexpr (BATCH_SIZE == 256 && N == 1024) return 4;    // 1024 blocks, best balance attnV vs reduce
+    else if constexpr (BATCH_SIZE == 256 && N == 8192) return 4;    // 1024 blocks, MFMA kernel bandwidth-saturated
     else return 0;
 }
 
@@ -2095,8 +2365,7 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     constexpr int M = 16;
     constexpr int K = 576;
     constexpr int K_HALF = 288;
-    constexpr int NUM_BLOCKS = K / 32; // 18, each thread quantizes 32 elements of Q
-    constexpr int IN = 16;
+    constexpr int NUM_BLOCKS = K / 32; // 18
     constexpr int NUM_HEADS = 16;
     constexpr int V_DIM = 512;
     constexpr int A_K_HALF = NUM_BLOCKS * 16;
@@ -2104,7 +2373,8 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     constexpr int KV_SPLITS = get_kv_split<BATCH_SIZE, N>();
 
     // ---- Static scratch buffers per BATCH_SIZE ----
-    static torch::Tensor q_data_buf, q_scale_buf, scores_buf, attn_buf, partial_buf;
+    // attn_buf serves double duty: QK^T writes pre-scaled scores, softmax normalizes in-place
+    static torch::Tensor q_data_buf, q_scale_buf, attn_buf, partial_buf;
     static int last_n = 0, last_splits = 0;
 
     bool need_realloc = (N != last_n || KV_SPLITS != last_splits);
@@ -2114,7 +2384,6 @@ torch::Tensor mla_mxfp4_pipeline_impl(
 
         q_data_buf = torch::empty({BATCH_SIZE * M, A_K_HALF}, u8opts);
         q_scale_buf = torch::empty({BATCH_SIZE * NUM_BLOCKS * M}, u8opts);
-        scores_buf = torch::empty({BATCH_SIZE, M, N}, f32opts);
         attn_buf = torch::empty({BATCH_SIZE, M, N}, f32opts);
         partial_buf = torch::empty({TOTAL_HEADS * KV_SPLITS * V_DIM}, f32opts);
 
@@ -2124,7 +2393,7 @@ torch::Tensor mla_mxfp4_pipeline_impl(
 
     // ---- Profiling ----
     struct PerfStats {
-        float t_quant = 0, t_qkt = 0, t_softmax = 0, t_attnv = 0, t_reduce = 0;
+        float t_quant = 0, t_qkt_softmax = 0, t_attnv = 0, t_reduce = 0;
         int count = 0;
     };
     static std::unordered_map<int, std::unordered_map<int, PerfStats>> perf_map;
@@ -2133,10 +2402,10 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     stats.count++;
     bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
 
-    hipEvent_t e0, e1, e2, e3, e4, e5;
+    hipEvent_t e0, e1, e2, e3, e4;
     if (do_profile) {
         hipEventCreate(&e0); hipEventCreate(&e1); hipEventCreate(&e2);
-        hipEventCreate(&e3); hipEventCreate(&e4); hipEventCreate(&e5);
+        hipEventCreate(&e3); hipEventCreate(&e4);
         hipEventRecord(e0);
     }
 
@@ -2153,8 +2422,10 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     }
     if (do_profile) hipEventRecord(e1);
 
-    // ---- Step 2: QK^T GEMM ----
+    // ---- Step 2: QK^T GEMM (with fused sm_scale) + 2-pass softmax ----
+    // Step 2a: Single-warp QK^T writes pre-scaled scores directly to attn_buf
     {
+        constexpr int IN = 16;
         dim3 grid(1, (N + IN - 1) / IN, BATCH_SIZE);
         constexpr int BS = 64;
         dim3 block(BS);
@@ -2164,38 +2435,44 @@ torch::Tensor mla_mxfp4_pipeline_impl(
             reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
             reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
             reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
-            reinterpret_cast<float*>(scores_buf.data_ptr()));
+            reinterpret_cast<float*>(attn_buf.data_ptr()),
+            sm_scale);
     }
-    if (do_profile) hipEventRecord(e2);
-
-    // ---- Step 3: Fused scale + softmax ----
+    // Step 2b: 2-pass softmax in-place on attn_buf (scores already scaled)
     {
         constexpr int BS = 256;
         dim3 grid(BATCH_SIZE, NUM_HEADS);
         dim3 block(BS);
-        mla_scale_softmax_kernel<N, BS><<<grid, block>>>(
-            reinterpret_cast<const float*>(scores_buf.data_ptr()),
+        mla_softmax_2pass_kernel<N, BS><<<grid, block>>>(
             reinterpret_cast<float*>(attn_buf.data_ptr()),
-            sm_scale);
+            0);
     }
-    if (do_profile) hipEventRecord(e3);
+    if (do_profile) hipEventRecord(e2);
 
-    // ---- Step 4: Two-phase MFMA FP4xFP4 head-merged attn x V ----
-    // Phase A: cooperative dequant+requant V into LDS
-    // Phase B: MFMA reads contiguously from requantized LDS
+    // ---- Step 3: Head-merged attn x V (split-K) ----
+    // Compile-time dispatch: scalar kernel for most shapes (fewer LDS ops),
+    // MFMA kernel for bs>=256/kv>=8192 where compute density matters.
     {
         constexpr int BS = 256;
         dim3 grid1(BATCH_SIZE, KV_SPLITS);
         dim3 block1(BS);
-        mla_attn_v_mfma_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS><<<grid1, block1>>>(
-            reinterpret_cast<const float*>(attn_buf.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
-            reinterpret_cast<float*>(partial_buf.data_ptr()));
+        if constexpr (BATCH_SIZE >= 256 && N >= 8192) {
+            mla_attn_v_mfma_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS><<<grid1, block1>>>(
+                reinterpret_cast<const float*>(attn_buf.data_ptr()),
+                reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+                reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+                reinterpret_cast<float*>(partial_buf.data_ptr()));
+        } else {
+            mla_attn_v_splitk_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS><<<grid1, block1>>>(
+                reinterpret_cast<const float*>(attn_buf.data_ptr()),
+                reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+                reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+                reinterpret_cast<float*>(partial_buf.data_ptr()));
+        }
     }
-    if (do_profile) hipEventRecord(e4);
+    if (do_profile) hipEventRecord(e3);
 
-    // ---- Step 5: Head-merged reduce + output ----
+    // ---- Step 4: Head-merged reduce + output ----
     auto output = torch::empty({TOTAL_HEADS, V_DIM},
         torch::TensorOptions().dtype(torch::kBFloat16).device(Q_bf16.device()));
     {
@@ -2208,28 +2485,170 @@ torch::Tensor mla_mxfp4_pipeline_impl(
     }
 
     if (do_profile) {
-        hipEventRecord(e5);
-        hipEventSynchronize(e5);
-        float d01, d12, d23, d34, d45;
+        hipEventRecord(e4);
+        hipEventSynchronize(e4);
+        float d01, d12, d23, d34;
         hipEventElapsedTime(&d01, e0, e1);
         hipEventElapsedTime(&d12, e1, e2);
         hipEventElapsedTime(&d23, e2, e3);
         hipEventElapsedTime(&d34, e3, e4);
-        hipEventElapsedTime(&d45, e4, e5);
-        stats.t_quant += d01; stats.t_qkt += d12; stats.t_softmax += d23;
-        stats.t_attnv += d34; stats.t_reduce += d45;
+        stats.t_quant += d01; stats.t_qkt_softmax += d12;
+        stats.t_attnv += d23; stats.t_reduce += d34;
         int n = stats.count / PROFILE_INTERVAL;
         if (n < 5) {
             printf("[MLA] bs=%d kv=%d splits=%d | "
-                "quant=%.1fus qkt=%.1fus softmax=%.1fus attnv=%.1fus reduce=%.1fus | "
+                "quant=%.1fus qkt+softmax=%.1fus attnv=%.1fus reduce=%.1fus | "
                 "total=%.1fus (avg over %d)\n",
                 BATCH_SIZE, N, KV_SPLITS,
-                stats.t_quant/n*1000, stats.t_qkt/n*1000, stats.t_softmax/n*1000,
+                stats.t_quant/n*1000, stats.t_qkt_softmax/n*1000,
                 stats.t_attnv/n*1000, stats.t_reduce/n*1000,
-                (stats.t_quant+stats.t_qkt+stats.t_softmax+stats.t_attnv+stats.t_reduce)/n*1000, n);
+                (stats.t_quant+stats.t_qkt_softmax+stats.t_attnv+stats.t_reduce)/n*1000, n);
         }
         hipEventDestroy(e0); hipEventDestroy(e1); hipEventDestroy(e2);
-        hipEventDestroy(e3); hipEventDestroy(e4); hipEventDestroy(e5);
+        hipEventDestroy(e3); hipEventDestroy(e4);
+    }
+
+    return output;
+}
+
+// =============================================================================
+// Fused MLA pipeline: Q quant + fused attn (QK^T + online softmax + V accum) + reduce
+// For kv=8192 shapes where reading KV once instead of twice saves ~640MB of HBM traffic.
+// =============================================================================
+
+// Split-K for fused pipeline: fewer splits since each block does more work
+// and the reduce kernel has per-split overhead
+template <int BATCH_SIZE, int N>
+constexpr int get_fused_kv_split() {
+    // Target: ~256 blocks minimum for good CU utilization (256 CUs on MI355X)
+    // Each block = (batch, split), so blocks = BATCH_SIZE * splits
+    if constexpr (BATCH_SIZE == 4 && N == 1024) return 16;     // 64 blocks, 64 positions/split
+    else if constexpr (BATCH_SIZE == 4 && N == 8192) return 64; // 256 blocks, 128 positions/split
+    else if constexpr (BATCH_SIZE == 32 && N == 1024) return 8; // 256 blocks, 128 positions/split
+    else if constexpr (BATCH_SIZE == 32 && N == 8192) return 16;// 512 blocks, 512 positions/split
+    else if constexpr (BATCH_SIZE == 64 && N == 1024) return 4; // 256 blocks, 256 positions/split
+    else if constexpr (BATCH_SIZE == 64 && N == 8192) return 8; // 512 blocks, 1024 positions/split
+    else if constexpr (BATCH_SIZE == 256 && N == 1024) return 2;// 512 blocks, 512 positions/split
+    else if constexpr (BATCH_SIZE == 256 && N == 8192) return 4;// 1024 blocks, 2048 positions/split
+    else return 4;
+}
+
+template <int BATCH_SIZE, int N, int STRIDE>
+torch::Tensor mla_fused_pipeline_impl(
+    torch::Tensor Q_bf16,
+    torch::Tensor KV_data,
+    torch::Tensor KV_scale,
+    float sm_scale,
+    bool profile
+) {
+    constexpr int M = 16;
+    constexpr int K = 576;
+    constexpr int K_HALF = 288;
+    constexpr int NUM_BLOCKS = K / 32; // 18
+    constexpr int NUM_HEADS = 16;
+    constexpr int V_DIM = 512;
+    constexpr int A_K_HALF = NUM_BLOCKS * 16;
+    constexpr int TOTAL_HEADS = BATCH_SIZE * NUM_HEADS;
+    constexpr int KV_SPLITS = get_kv_split<BATCH_SIZE, N>();
+
+    // ---- Static scratch buffers ----
+    static torch::Tensor q_data_buf, q_scale_buf, partial_v_buf, partial_lse_buf;
+    static int last_n = 0, last_splits = 0;
+
+    bool need_realloc = (N != last_n || KV_SPLITS != last_splits);
+    if (need_realloc) {
+        auto u8opts = torch::TensorOptions().dtype(torch::kUInt8).device(Q_bf16.device());
+        auto f32opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q_bf16.device());
+
+        q_data_buf = torch::empty({BATCH_SIZE * M, A_K_HALF}, u8opts);
+        q_scale_buf = torch::empty({BATCH_SIZE * NUM_BLOCKS * M}, u8opts);
+        partial_v_buf = torch::empty({BATCH_SIZE * KV_SPLITS * NUM_HEADS * V_DIM}, f32opts);
+        partial_lse_buf = torch::empty({BATCH_SIZE * KV_SPLITS * NUM_HEADS}, f32opts);
+
+        last_n = N;
+        last_splits = KV_SPLITS;
+    }
+
+    // ---- Profiling ----
+    struct PerfStats {
+        float t_quant = 0, t_fused = 0, t_reduce = 0;
+        int count = 0;
+    };
+    static std::unordered_map<int, std::unordered_map<int, PerfStats>> perf_map;
+    constexpr int PROFILE_INTERVAL = 10;
+    auto& stats = perf_map[BATCH_SIZE][N];
+    stats.count++;
+    bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
+
+    hipEvent_t e0, e1, e2, e3;
+    if (do_profile) {
+        hipEventCreate(&e0); hipEventCreate(&e1);
+        hipEventCreate(&e2); hipEventCreate(&e3);
+        hipEventRecord(e0);
+    }
+
+    // ---- Step 1: Quantize Q to MXFP4 ----
+    {
+        constexpr int q_block = 64;
+        constexpr int total_q_blocks = BATCH_SIZE * M * NUM_BLOCKS;
+        constexpr int q_grid = (total_q_blocks + q_block - 1) / q_block;
+        mla_quant_q_batched_kernel<M, K, K_HALF, NUM_BLOCKS, BATCH_SIZE, q_block>
+            <<<dim3(q_grid), dim3(q_block)>>>(
+            reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
+            reinterpret_cast<uint8_t*>(q_data_buf.data_ptr()),
+            reinterpret_cast<uint8_t*>(q_scale_buf.data_ptr()));
+    }
+    if (do_profile) hipEventRecord(e1);
+
+    // ---- Step 2: Fused attention (QK^T MFMA + online softmax + V accumulation) ----
+    {
+        constexpr int BS = 256;
+        dim3 grid(BATCH_SIZE, KV_SPLITS);
+        dim3 block(BS);
+        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF>
+            <<<grid, block>>>(
+            reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
+            reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
+            reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+            reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+            sm_scale,
+            reinterpret_cast<float*>(partial_v_buf.data_ptr()),
+            reinterpret_cast<float*>(partial_lse_buf.data_ptr()));
+    }
+    if (do_profile) hipEventRecord(e2);
+
+    // ---- Step 3: LSE-corrected reduce across splits ----
+    auto output = torch::empty({TOTAL_HEADS, V_DIM},
+        torch::TensorOptions().dtype(torch::kBFloat16).device(Q_bf16.device()));
+    {
+        constexpr int R_BLOCK = 256;
+        dim3 r_grid(BATCH_SIZE, NUM_HEADS);
+        dim3 r_block(R_BLOCK);
+        mla_fused_reduce_kernel<R_BLOCK, KV_SPLITS><<<r_grid, r_block>>>(
+            reinterpret_cast<const float*>(partial_v_buf.data_ptr()),
+            reinterpret_cast<const float*>(partial_lse_buf.data_ptr()),
+            reinterpret_cast<hip_bfloat16*>(output.data_ptr()));
+    }
+
+    if (do_profile) {
+        hipEventRecord(e3);
+        hipEventSynchronize(e3);
+        float d01, d12, d23;
+        hipEventElapsedTime(&d01, e0, e1);
+        hipEventElapsedTime(&d12, e1, e2);
+        hipEventElapsedTime(&d23, e2, e3);
+        stats.t_quant += d01; stats.t_fused += d12; stats.t_reduce += d23;
+        int n = stats.count / PROFILE_INTERVAL;
+        if (n < 5) {
+            printf("[MLA FUSED] bs=%d kv=%d splits=%d | "
+                "quant=%.1fus fused_attn=%.1fus reduce=%.1fus | "
+                "total=%.1fus (avg over %d)\n",
+                BATCH_SIZE, N, KV_SPLITS,
+                stats.t_quant/n*1000, stats.t_fused/n*1000, stats.t_reduce/n*1000,
+                (stats.t_quant+stats.t_fused+stats.t_reduce)/n*1000, n);
+        }
+        hipEventDestroy(e0); hipEventDestroy(e1);
+        hipEventDestroy(e2); hipEventDestroy(e3);
     }
 
     return output;
@@ -2253,7 +2672,28 @@ torch::Tensor mla_mxfp4_pipeline(
     if (batch_size == BS && kv_seq_len == N && B_SCALE_STRIDE == STR) \
         return mla_mxfp4_pipeline_impl<BS, N, STR>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
 
-    MLA_MXFP4(4, 1024, 18);
+#define MLA_FUSED(BS, N, STR) \
+    if (batch_size == BS && kv_seq_len == N && B_SCALE_STRIDE == STR) \
+        return mla_fused_pipeline_impl<BS, N, STR>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
+
+    // Use fused pipeline for all shapes
+    MLA_FUSED(4, 1024, 18);
+    MLA_FUSED(4, 1024, 24);
+    MLA_FUSED(4, 8192, 18);
+    MLA_FUSED(4, 8192, 24);
+    MLA_FUSED(32, 1024, 18);
+    MLA_FUSED(32, 1024, 24);
+    MLA_FUSED(32, 8192, 18);
+    MLA_FUSED(32, 8192, 24);
+    MLA_FUSED(64, 1024, 18);
+    MLA_FUSED(64, 1024, 24);
+    MLA_FUSED(64, 8192, 18);
+    MLA_FUSED(64, 8192, 24);
+    MLA_FUSED(256, 1024, 18);
+    MLA_FUSED(256, 1024, 24);
+    MLA_FUSED(256, 8192, 18);
+    MLA_FUSED(256, 8192, 24);
+    /*MLA_MXFP4(4, 1024, 18);
     MLA_MXFP4(4, 1024, 24);
     MLA_MXFP4(4, 8192, 18);
     MLA_MXFP4(4, 8192, 24);
@@ -2268,7 +2708,7 @@ torch::Tensor mla_mxfp4_pipeline(
     MLA_MXFP4(256, 1024, 18);
     MLA_MXFP4(256, 1024, 24);
     MLA_MXFP4(256, 8192, 18);
-    MLA_MXFP4(256, 8192, 24);
+    MLA_MXFP4(256, 8192, 24);*/
     TORCH_CHECK(false, "Unsupported batch_size: ", batch_size);
 }
 
@@ -2409,7 +2849,7 @@ def _try_compile_hip_kernel_torch():
         os.environ['PYTORCH_ROCM_ARCH'] = 'gfx950'
         os.environ['MAX_JOBS'] = '4'
         _torch_hip_module = load_inline(
-            name='mla_mxfp4_hip_torch',
+            name='mla_mxfp4_hip_torch_v13',
             cpp_sources='',
             cuda_sources=[kernel_source],
             extra_cflags=['-O3'],
@@ -2557,7 +2997,7 @@ def get_optimal_num_kv_splits(batch_size: int, kv_seq_len: int) -> int:
     """
     if batch_size <= 4:
         # Very small batches: minimize reduction overhead aggressively
-        # Target: get bf16 from 86.9µs to 81µs
+        # Target: get bf16 from 86.9us to 81us
         if kv_seq_len <= 1024:
             return 2  # Minimal splits - reduction overhead dominates
         elif kv_seq_len <= 2048:
@@ -2956,14 +3396,7 @@ def _pytorch_mla_attention(
 # Dispatcher: select kernel based on QKV_DTYPE
 # ---------------------------------------------------------------------------
 def custom_kernel(data: input_t) -> output_t:
-    q, kv_data, qo_indptr, kv_indptr, config = data
-    batch_size = config["batch_size"]
-    kv_seq_len = config["kv_seq_len"]
-
-    if batch_size <= 4 and kv_seq_len <= 1024:
-        return custom_kernel_bf16(data)
-    else:
-        return custom_kernel_mxfp4_qkt(data)
+    return custom_kernel_mxfp4_qkt(data)
 
 # def custom_kernel(data: input_t) -> output_t:
 #     """Dispatch to the appropriate kernel based on QKV_DTYPE."""
@@ -3031,12 +3464,12 @@ def custom_kernel_fp8(data: input_t) -> output_t:
 # =============================================================================
 # Updated Python dispatch for custom_kernel_mxfp4_qkt
 #
-# Uses split-K fused attn×V for ALL cases (replaces both the non-split fused
+# Uses split-K fused attnxV for ALL cases (replaces both the non-split fused
 # kernel and the dequant+bmm fallback).
 #
 # The split-K kernel handles any (batch_size, kv_seq_len) combination well:
-# - Short KV (1024): kv_splits=1 → same as non-split kernel
-# - Long KV (8192): kv_splits=8 → each block handles 1024 positions
+# - Short KV (1024): kv_splits=1 -> same as non-split kernel
+# - Long KV (8192): kv_splits=8 -> each block handles 1024 positions
 #
 # Replace custom_kernel_mxfp4_qkt in submission.py with this version.
 # =============================================================================
@@ -3571,7 +4004,7 @@ def custom_kernel_mxfp4_native(data: input_t) -> output_t:
 
     This implementation:
     1. Uses custom HIP kernel if available (fastest path)
-    2. Falls back to gemm_a4w4 for fp4×fp4 QK^T computation
+    2. Falls back to gemm_a4w4 for fp4xfp4 QK^T computation
     3. Applies softmax in fp32 for numerical stability
     4. Uses bf16 for attn @ V computation
 
