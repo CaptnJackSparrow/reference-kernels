@@ -178,82 +178,114 @@ struct QuantBlock {
     uint8_t e8m0;
 };
 
-__device__ __forceinline__ void load_bf16x32(const hip_bfloat16* ptr, float vals[32]) {
-    for (int chunk_off = 0; chunk_off < 32; chunk_off += 8) {
-        // Load 8 BF16 values at once (16 bytes)
-        uint32_t raw[4];
-        *reinterpret_cast<uint128_vec*>(&raw[0]) =
-            *reinterpret_cast<const uint128_vec*>(&ptr[chunk_off]);
-        // Unpack BF16 to float: bf16 bits << 16 = float bits
-        for (int j = 0; j < 4; j++) {
-            uint32_t pair = raw[j];
-            float2 lo_hi = {__uint_as_float((pair & 0xFFFF) << 16),
-                            __uint_as_float(pair & 0xFFFF0000u)};
-            *(&reinterpret_cast<float2*>(&vals[chunk_off])[j]) = lo_hi;
-        }
-    }
-}
-
-__device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
-    float amax = 0.0f;
-    for (int i = 0; i < 32; i++)
-        amax = fmaxf(amax, fabsf(vals[i]));
-
+struct E8M0Scale {
     uint8_t e8m0;
     float quant_scale;
-    if (amax == 0.0f) {
-        e8m0 = 0;
-        quant_scale = 0.0f;
+};
+
+__device__ constexpr uint8_t E8M0_LUT[256] = {
+    0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,
+    30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,
+    62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,
+    94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,
+    126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,
+    158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,
+    190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,
+    222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,
+};
+
+__device__ constexpr uint32_t QUANT_SCALE_RECIP_LUT[256] = {
+    0x00000000u,0x00800000u,0x01000000u,0x01800000u,0x02000000u,0x02800000u,0x03000000u,0x03800000u,
+    0x04000000u,0x04800000u,0x05000000u,0x05800000u,0x06000000u,0x06800000u,0x07000000u,0x07800000u,
+    0x08000000u,0x08800000u,0x09000000u,0x09800000u,0x0A000000u,0x0A800000u,0x0B000000u,0x0B800000u,
+    0x0C000000u,0x0C800000u,0x0D000000u,0x0D800000u,0x0E000000u,0x0E800000u,0x0F000000u,0x0F800000u,
+    0x10000000u,0x10800000u,0x11000000u,0x11800000u,0x12000000u,0x12800000u,0x13000000u,0x13800000u,
+    0x14000000u,0x14800000u,0x15000000u,0x15800000u,0x16000000u,0x16800000u,0x17000000u,0x17800000u,
+    0x18000000u,0x18800000u,0x19000000u,0x19800000u,0x1A000000u,0x1A800000u,0x1B000000u,0x1B800000u,
+    0x1C000000u,0x1C800000u,0x1D000000u,0x1D800000u,0x1E000000u,0x1E800000u,0x1F000000u,0x1F800000u,
+    0x20000000u,0x20800000u,0x21000000u,0x21800000u,0x22000000u,0x22800000u,0x23000000u,0x23800000u,
+    0x24000000u,0x24800000u,0x25000000u,0x25800000u,0x26000000u,0x26800000u,0x27000000u,0x27800000u,
+    0x28000000u,0x28800000u,0x29000000u,0x29800000u,0x2A000000u,0x2A800000u,0x2B000000u,0x2B800000u,
+    0x2C000000u,0x2C800000u,0x2D000000u,0x2D800000u,0x2E000000u,0x2E800000u,0x2F000000u,0x2F800000u,
+    0x30000000u,0x30800000u,0x31000000u,0x31800000u,0x32000000u,0x32800000u,0x33000000u,0x33800000u,
+    0x34000000u,0x34800000u,0x35000000u,0x35800000u,0x36000000u,0x36800000u,0x37000000u,0x37800000u,
+    0x38000000u,0x38800000u,0x39000000u,0x39800000u,0x3A000000u,0x3A800000u,0x3B000000u,0x3B800000u,
+    0x3C000000u,0x3C800000u,0x3D000000u,0x3D800000u,0x3E000000u,0x3E800000u,0x3F000000u,0x3F800000u,
+    0x40000000u,0x40800000u,0x41000000u,0x41800000u,0x42000000u,0x42800000u,0x43000000u,0x43800000u,
+    0x44000000u,0x44800000u,0x45000000u,0x45800000u,0x46000000u,0x46800000u,0x47000000u,0x47800000u,
+    0x48000000u,0x48800000u,0x49000000u,0x49800000u,0x4A000000u,0x4A800000u,0x4B000000u,0x4B800000u,
+    0x4C000000u,0x4C800000u,0x4D000000u,0x4D800000u,0x4E000000u,0x4E800000u,0x4F000000u,0x4F800000u,
+    0x50000000u,0x50800000u,0x51000000u,0x51800000u,0x52000000u,0x52800000u,0x53000000u,0x53800000u,
+    0x54000000u,0x54800000u,0x55000000u,0x55800000u,0x56000000u,0x56800000u,0x57000000u,0x57800000u,
+    0x58000000u,0x58800000u,0x59000000u,0x59800000u,0x5A000000u,0x5A800000u,0x5B000000u,0x5B800000u,
+    0x5C000000u,0x5C800000u,0x5D000000u,0x5D800000u,0x5E000000u,0x5E800000u,0x5F000000u,0x5F800000u,
+    0x60000000u,0x60800000u,0x61000000u,0x61800000u,0x62000000u,0x62800000u,0x63000000u,0x63800000u,
+    0x64000000u,0x64800000u,0x65000000u,0x65800000u,0x66000000u,0x66800000u,0x67000000u,0x67800000u,
+    0x68000000u,0x68800000u,0x69000000u,0x69800000u,0x6A000000u,0x6A800000u,0x6B000000u,0x6B800000u,
+    0x6C000000u,0x6C800000u,0x6D000000u,0x6D800000u,0x6E000000u,0x6E800000u,0x6F000000u,0x6F800000u,
+    0x70000000u,0x70800000u,0x71000000u,0x71800000u,0x72000000u,0x72800000u,0x73000000u,0x73800000u,
+    0x74000000u,0x74800000u,0x75000000u,0x75800000u,0x76000000u,0x76800000u,0x77000000u,0x77800000u,
+    0x78000000u,0x78800000u,0x79000000u,0x79800000u,0x7A000000u,0x7A800000u,0x7B000000u,0x7B800000u,
+    0x7C000000u,0x7C800000u,0x7D000000u,0x7D800000u,0x7E000000u,0x7E800000u,0x7F000000u,0x00000000u,
+};
+
+__device__ __forceinline__ E8M0Scale compute_e8m0_scale(hip_bfloat16 amax_bf16) {
+    E8M0Scale result;
+    uint16_t amax_bits = amax_bf16.data;
+    if (amax_bits == 0) {
+        result.e8m0 = 0;
+        result.quant_scale = 0.0f;
     } else {
-        uint32_t amax_bits = __float_as_uint(amax);
-        amax_bits = (amax_bits + 0x200000u) & 0xFF800000u;
-        int raw_exp = (int)((amax_bits >> 23) & 0xFF);
-        int e8m0_unbiased = raw_exp - 127 - 2;
-        e8m0_unbiased = max(-127, min(127, e8m0_unbiased));
-        e8m0 = (uint8_t)(e8m0_unbiased + 127);
-        quant_scale = __uint_as_float((uint32_t)(127 - e8m0_unbiased) << 23);
+        uint16_t rounded = (amax_bits + 0x0020u) & 0xFF80u;
+        int raw_exp = (int)((rounded >> 7) & 0xFF);
+        result.e8m0 = E8M0_LUT[raw_exp];
+        result.quant_scale = __uint_as_float(QUANT_SCALE_RECIP_LUT[result.e8m0]);
     }
+    return result;
+}
+
+// Hardware FP4 conversion from BF16: converts 2 BF16 values to packed FP4 byte.
+__device__ __forceinline__ uint8_t quantize_fp4_pair_hw_bf16(
+    hip_bfloat16 v0, hip_bfloat16 v1, float quant_scale
+) {
+    using bf16x2 = uint16_t __attribute__((ext_vector_type(2)));
+    bf16x2 pair = {v0.data, v1.data};
+    union { uint32_t u32; uint8_t u8[4]; } cvt = {0};
+    cvt.u32 = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(cvt.u32, pair, quant_scale, 0);
+    return cvt.u8[0];
+}
+
+// Quantize 32 BF16 values to packed FP4 + E8M0 scale using BF16 hw intrinsic.
+__device__ __forceinline__ QuantBlock quantize_fp4_block_bf16(const hip_bfloat16* src) {
+    uint16_t amax_bits = 0;
+    for (int i = 0; i < 32; i++) {
+        uint16_t bits = *reinterpret_cast<const uint16_t*>(&src[i]) & 0x7FFF;
+        amax_bits = (bits > amax_bits) ? bits : amax_bits;
+    }
+    hip_bfloat16 amax_bf16 = *reinterpret_cast<const hip_bfloat16*>(&amax_bits);
+
+    E8M0Scale sc = compute_e8m0_scale(amax_bf16);
 
     uint32_t pack[4] = {0, 0, 0, 0};
     for (int i = 0; i < 16; i++) {
-        uint8_t packed = 0;
-        for (int j = 0; j < 2; j++) {
-            float v = vals[2 * i + j];
-            float qx = v * quant_scale;
-
-            uint32_t qx_bits = __float_as_uint(qx);
-            uint32_t sign = qx_bits & 0x80000000u;
-            qx_bits ^= sign;
-            float qx_abs = __uint_as_float(qx_bits);
-
-            uint8_t fp4;
-            if (qx_abs >= 6.0f) {
-                fp4 = 0x7;
-            } else if (qx_abs < 1.0f) {
-                constexpr uint32_t denorm_magic = 149u << 23;
-                float denorm = qx_abs + __uint_as_float(denorm_magic);
-                uint32_t denorm_bits = __float_as_uint(denorm) - denorm_magic;
-                fp4 = (uint8_t)denorm_bits;
-            } else {
-                uint32_t mant_odd = (qx_bits >> (23 - 1)) & 1;
-                constexpr int32_t val_to_add = 0xC11FFFFF;
-                qx_bits = (uint32_t)((int32_t)qx_bits + val_to_add);
-                qx_bits += mant_odd;
-                fp4 = (uint8_t)(qx_bits >> (23 - 1));
-            }
-
-            uint8_t sign_fp4 = (uint8_t)(sign >> (23 + 8 - 1 - 2));
-            fp4 |= sign_fp4;
-
-            packed |= fp4 << (4 * j);
-        }
+        uint8_t packed = quantize_fp4_pair_hw_bf16(src[2*i], src[2*i+1], sc.quant_scale);
         pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
     }
 
     QuantBlock result;
     *reinterpret_cast<uint128_vec*>(&result.data) = *reinterpret_cast<uint128_vec*>(&pack);
-    result.e8m0 = e8m0;
+    result.e8m0 = sc.e8m0;
     return result;
+}
+
+// Quantize 32 float values to packed FP4 + E8M0 scale.
+// Converts to BF16 first and uses the BF16 hw intrinsic path (matching mxfp4-mm).
+__device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
+    hip_bfloat16 bvals[32];
+    for (int i = 0; i < 32; i++) {
+        bvals[i] = hip_bfloat16(vals[i]);
+    }
+    return quantize_fp4_block_bf16(bvals);
 }
 
 template <int M, int K, int K_HALF, int NUM_BLOCKS, int BATCH_SIZE, int BLOCK_SIZE>
@@ -273,9 +305,7 @@ void mla_quant_q_batched_kernel(
     int blk = local_id % NUM_BLOCKS;
     if (row >= M) return;
 
-    float vals[32];
-    load_bf16x32(&Q[(batch_idx * M + row) * K + blk * 32], vals);
-    QuantBlock qb = quantize_fp4_block(vals);
+    QuantBlock qb = quantize_fp4_block_bf16(&Q[(batch_idx * M + row) * K + blk * 32]);
 
     constexpr int A_K_HALF = NUM_BLOCKS * 16;
     int data_off = (batch_idx * M + row) * A_K_HALF + blk * 16;
@@ -864,38 +894,6 @@ void mla_mxfp4_decode_kernel_bs4_kv1024(
     }
 }
 
-
-// Quantize Q: one thread per 32-element block
-template <int M, int K, int K_HALF, int NUM_BLOCKS_Q>
-__global__ void mla_quant_q_kernel(
-    const hip_bfloat16* __restrict__ Q,
-    uint8_t* __restrict__ out_data,
-    uint8_t* __restrict__ out_scale
-) {
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = gid / NUM_BLOCKS_Q;
-    if (row >= M) return;
-
-    int blk = gid % NUM_BLOCKS_Q;
-
-    float vals[32];
-    int k_start = blk * 32;
-    if (k_start + 31 < K) {
-        load_bf16x32(&Q[row * K + k_start], vals);
-    } else {
-        // Partial block at end (K=576: last block has 576%32=0, but for padded K)
-        for (int i = 0; i < 32; i++) {
-            vals[i] = (k_start + i < K) ? float(Q[row * K + k_start + i]) : 0.0f;
-        }
-    }
-
-    QuantBlock qb = quantize_fp4_block(vals);
-    int data_off = row * (NUM_BLOCKS_Q * 16) + blk * 16;
-    *reinterpret_cast<uint128_vec*>(&out_data[data_off]) =
-        *reinterpret_cast<uint128_vec*>(&qb.data);
-    out_scale[row + blk * M] = qb.e8m0;  // column-major
-}
-
 // =====================================================================
 // MLA QK^T kernel: MFMA FP4, fp32 output, batched, linear B scales
 // =====================================================================
@@ -1014,170 +1012,6 @@ mla_qkt_mxfp4_kernel(
 //
 // Add this code to MLA_MXFP4_HIP_SOURCE in submission.py
 // =============================================================================
-
-// =====================================================================
-// Helper: broadcast E8M0 scale to 4 lanes (for MFMA scale operand)
-// =====================================================================
-// Already defined as mla_broadcast_scale in your code
-
-// =====================================================================
-// KERNEL 1: Tiled QK^T GEMM with fused Q quantization
-//
-// Replaces: mla_quant_q_batched_kernel + mla_qkt_mxfp4_kernel
-// Benefits: eliminates separate Q quant launch, LDS data reuse for A
-//
-// Config: OUTER_M=16, OUTER_N=64, OUTER_K=128
-//         IM=16, IN=16, IK=128 (16x16x128 MFMA)
-//         4 warps = 256 threads
-//         Batched via blockIdx.z
-//         Linear B scale (not shuffled)
-//         fp32 output (for softmax)
-// =====================================================================
-
-template <int M, int N, int K, int K_HALF, int NUM_BLOCKS, int B_SCALE_STRIDE>
-__global__ void //__launch_bounds__(256, 4)
-mla_qkt_tiled_kernel(
-    const hip_bfloat16* __restrict__ Q_bf16,  // (batch*M, K) bf16 query
-    const uint8_t* __restrict__ B_data,       // (batch*N, K_HALF) MXFP4 KV packed
-    const uint8_t* __restrict__ B_scale,      // (batch*N, B_SCALE_STRIDE) E8M0 scales
-    float* __restrict__ C,                    // (batch, M, N) fp32 scores
-    float sm_scale                            // pre-scale factor fused into output
-) {
-    constexpr int OUTER_M = 16;   // = M, entire M in one tile
-    constexpr int OUTER_N = 64;   // 4 N-tiles of 16
-    constexpr int OUTER_K = 128;  // 4 blocks of 32
-    constexpr int IM = 16;
-    constexpr int IN = 16;
-    constexpr int IK = 128;
-    constexpr int OK_BLOCKS = OUTER_K / 32;       // 4
-    constexpr int OK_HALF = OUTER_K / 2;           // 64
-    constexpr int WARPS = 4;                        // OUTER_N / IN
-    constexpr int BLOCK_SIZE = WARPS * 64;          // 256
-    constexpr int OUTER_K_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;  // ceil(18/4) = 5
-
-    const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.z);
-    const int outer_n = __builtin_amdgcn_readfirstlane(blockIdx.y * OUTER_N);
-    const int tid = threadIdx.x;
-    const int warp_id = tid / 64;
-    const int lane = tid % 64;
-
-    // Per-batch pointers
-    const hip_bfloat16* q_ptr = Q_bf16 + batch_idx * M * K;
-    const uint8_t* b_data = B_data + batch_idx * N * K_HALF;
-    const uint8_t* b_sc = B_scale + (int64_t)batch_idx * N * B_SCALE_STRIDE;
-    float* c_out = C + batch_idx * M * N;
-
-    // LDS layout
-    __shared__ uint8_t smem_a_data[OUTER_M * OK_HALF];     // 16 * 64 = 1024
-    __shared__ uint8_t smem_a_scale[OUTER_M * OK_BLOCKS];  // 16 * 4 = 64
-    __shared__ uint8_t smem_b_data[OK_BLOCKS * OUTER_N * 16]; // block-transposed: 4 * 64 * 16 = 4096
-    __shared__ uint8_t smem_b_scale[OK_BLOCKS * OUTER_N];  // 4 * 64 = 256
-    // Total LDS: 5440 bytes: excellent occupancy
-
-    // Accumulator for this warp's 16x16 tile
-    float4_t acc = {};
-
-    for (int ok = 0; ok < OUTER_K_ITERS; ok++) {
-        const int blk_base = ok * OK_BLOCKS;
-        const int k_base = ok * OUTER_K;  // in elements (for bf16 Q load)
-
-        // ---- Load A (Q): fused quantize bf16 -> MXFP4 in LDS ----
-        // Each thread handles one or more 32-element blocks
-        constexpr int A_TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;  // 16 * 4 = 64
-        for (int b = tid; b < A_TOTAL_BLOCKS; b += BLOCK_SIZE) {
-            int row = b / OK_BLOCKS;
-            int blk = b % OK_BLOCKS;
-            int g_blk = blk_base + blk;
-            int g_k = g_blk * 32;
-
-            float vals[32];
-            if (g_k < K && row < M) {
-                // Load 32 bf16 values from Q
-                load_bf16x32(&q_ptr[row * K + g_k], vals);
-            } else {
-                // Zero-pad OOB blocks (blocks 18-19 when K=576)
-                for (int i = 0; i < 32; i++) vals[i] = 0.0f;
-            }
-
-            QuantBlock qb = quantize_fp4_block(vals);
-
-            // Store to LDS: row-major data
-            int lds_off = row * OK_HALF + blk * 16;
-            *reinterpret_cast<uint128_vec*>(&smem_a_data[lds_off]) =
-                *reinterpret_cast<uint128_vec*>(&qb.data);
-            smem_a_scale[row * OK_BLOCKS + blk] = qb.e8m0;
-        }
-
-        // ---- Load B (KV): from MXFP4 global to block-transposed LDS ----
-        constexpr int B_TOTAL_BLOCKS = OUTER_N * OK_BLOCKS;  // 64 * 4 = 256
-        for (int b = tid; b < B_TOTAL_BLOCKS; b += BLOCK_SIZE) {
-            int row = b / OK_BLOCKS;  // N dimension (0..63)
-            int blk = b % OK_BLOCKS;  // K block (0..3)
-            int g_n = outer_n + row;
-            int g_blk = blk_base + blk;
-
-            // Block-transposed: [blk][row][16 bytes]
-            int lds_off = (blk * OUTER_N + row) * 16;
-
-            if (g_blk < NUM_BLOCKS && g_n < N) {
-                *reinterpret_cast<uint128_vec*>(&smem_b_data[lds_off]) =
-                    *reinterpret_cast<const uint128_vec*>(&b_data[g_n * K_HALF + g_blk * 16]);
-                // Linear B scale (MLA KV scale layout)
-                smem_b_scale[blk * OUTER_N + row] = b_sc[g_n * B_SCALE_STRIDE + g_blk];
-            } else {
-                *reinterpret_cast<uint128_vec*>(&smem_b_data[lds_off]) = uint128_vec{0, 0, 0, 0};
-                smem_b_scale[blk * OUTER_N + row] = 127;  // scale=1.0, data=0 -> zero contribution
-            }
-        }
-
-        __syncthreads();
-
-        // ---- Inner MFMA: each warp processes one 16x16 N-tile ----
-        // A data is SHARED across all 4 warps (key benefit of tiling)
-        int warp_n_offset = warp_id * IN;
-
-        // Load A tile from LDS (same for all warps!)
-        int a_row = lane % 16;
-        int a_k_group = lane / 16;  // 0..3
-        uint32_t a_reg[8];
-        int a_lds = a_row * OK_HALF + a_k_group * 16;
-        *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
-            *reinterpret_cast<const uint128_vec*>(&smem_a_data[a_lds]);
-        a_reg[4] = a_reg[5] = a_reg[6] = a_reg[7] = 0;
-        int32_t a_sc = mla_broadcast_scale(smem_a_scale[a_row * OK_BLOCKS + a_k_group]);
-
-        // Load B tile from LDS (block-transposed, unique per warp)
-        int b_row = lane % 16;
-        int b_k_group = lane / 16;
-        uint32_t b_reg[8];
-        int b_lds = (b_k_group * OUTER_N + warp_n_offset + b_row) * 16;
-        *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
-            *reinterpret_cast<const uint128_vec*>(&smem_b_data[b_lds]);
-        b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
-        int32_t b_sc = mla_broadcast_scale(smem_b_scale[b_k_group * OUTER_N + warp_n_offset + b_row]);
-
-        // 16x16x128 MFMA FP4
-        int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
-                              (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
-        int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                              (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
-        acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-            a_vec, b_vec, acc, FMT_FP4_MFMA, FMT_FP4_MFMA, 0, a_sc, 0, b_sc);
-
-        __syncthreads();
-    }
-
-    // ---- Store fp32 output with fused sm_scale ----
-    int col = lane % 16;
-    int quad = lane / 16;
-    for (int i = 0; i < 4; i++) {
-        int row = i + 4 * quad;
-        int gn = outer_n + warp_id * IN + col;
-        if (row < M && gn < N)
-            c_out[row * N + gn] = acc[i] * sm_scale;
-    }
-}
-
 
 // =====================================================================
 // KERNEL 2: Fused attn_weights x V with on-the-fly MXFP4 dequant
@@ -1964,6 +1798,7 @@ template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS,
           int K_HALF, int NUM_BLOCKS, int A_K_HALF>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_fused_attn_kernel(
+    const hip_bfloat16* __restrict__ Q_bf16,  // (batch*16, K) BF16 queries (for future inline quant)
     const uint8_t* __restrict__ q_data,      // (batch*16, A_K_HALF) pre-quantized Q MXFP4
     const uint8_t* __restrict__ q_scale,     // (batch*NUM_BLOCKS*16) Q E8M0 scales
     const uint8_t* __restrict__ kv_mxfp4,    // (batch*N, K_HALF) packed KV MXFP4
@@ -1980,11 +1815,12 @@ void mla_fused_attn_kernel(
     constexpr int IN = 16;
     constexpr int BPC = 4;
     constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
+    constexpr int K = NUM_BLOCKS * 32;
 
     const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
     const int split_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
     const int tid = threadIdx.x;
-    const int warp_id = tid / 64;
+    const int warp_id = __builtin_amdgcn_readfirstlane(tid / 64);
     const int lane = tid % 64;
 
     const int kv_start_global = split_idx * KV_PER_SPLIT;
@@ -2607,6 +2443,7 @@ torch::Tensor mla_fused_pipeline_impl(
         dim3 block(BS);
         mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF>
             <<<grid, block>>>(
+            reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
             reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
             reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
             reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
@@ -2677,7 +2514,7 @@ torch::Tensor mla_mxfp4_pipeline(
         return mla_fused_pipeline_impl<BS, N, STR>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
 
     // Use fused pipeline for all shapes
-    MLA_FUSED(4, 1024, 18);
+    /*MLA_FUSED(4, 1024, 18);
     MLA_FUSED(4, 1024, 24);
     MLA_FUSED(4, 8192, 18);
     MLA_FUSED(4, 8192, 24);
@@ -2692,8 +2529,8 @@ torch::Tensor mla_mxfp4_pipeline(
     MLA_FUSED(256, 1024, 18);
     MLA_FUSED(256, 1024, 24);
     MLA_FUSED(256, 8192, 18);
-    MLA_FUSED(256, 8192, 24);
-    /*MLA_MXFP4(4, 1024, 18);
+    MLA_FUSED(256, 8192, 24);*/
+    MLA_MXFP4(4, 1024, 18);
     MLA_MXFP4(4, 1024, 24);
     MLA_MXFP4(4, 8192, 18);
     MLA_MXFP4(4, 8192, 24);
@@ -2708,7 +2545,7 @@ torch::Tensor mla_mxfp4_pipeline(
     MLA_MXFP4(256, 1024, 18);
     MLA_MXFP4(256, 1024, 24);
     MLA_MXFP4(256, 8192, 18);
-    MLA_MXFP4(256, 8192, 24);*/
+    MLA_MXFP4(256, 8192, 24);
     TORCH_CHECK(false, "Unsupported batch_size: ", batch_size);
 }
 
