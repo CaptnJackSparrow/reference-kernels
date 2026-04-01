@@ -379,7 +379,6 @@ void mla_fused_attn_kernel(
     float partial_lse[][16]
 ) {
     constexpr int V_DIM = 512;
-    constexpr int THREADS = BLOCK_SIZE;
     constexpr int HEADS = 16;
     constexpr int KV_PER_SPLIT = (N + KV_SPLITS - 1) / KV_SPLITS;
     constexpr int KV_SUBTILE = 128;
@@ -395,7 +394,7 @@ void mla_fused_attn_kernel(
     constexpr int V_CHUNK_DIM = IM;
     constexpr int V_CHUNKS = V_DIM / V_CHUNK_DIM;
 
-    constexpr int WARPS = THREADS / 64;
+    constexpr int WARPS = BLOCK_SIZE / 64;
     constexpr int CHUNKS_PER_WARP = V_CHUNKS / WARPS;
 
     const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
@@ -447,7 +446,7 @@ void mla_fused_attn_kernel(
     // ---- Step 1: Load pre-quantized Q into LDS (one-time) ----
     {
         const int total_q_bytes = HEADS * A_K_HALF;
-        for (int i = tid * 16; i < total_q_bytes; i += THREADS * 16) {
+        for (int i = tid * 16; i < total_q_bytes; i += BLOCK_SIZE * 16) {
             if (i + 16 <= total_q_bytes) {
                 const int h = i / A_K_HALF;
                 const int col = i % A_K_HALF;
@@ -457,12 +456,12 @@ void mla_fused_attn_kernel(
         }
         const uint8_t* q_s = q_scale + batch_idx * NUM_BLOCKS * HEADS;
         const int total_q_scales = NUM_BLOCKS * HEADS;
-        for (int i = tid; i < total_q_scales; i += THREADS) {
+        for (int i = tid; i < total_q_scales; i += BLOCK_SIZE) {
             q_lds_scale[i] = q_s[i];
         }
     }
     if (kv_start_global >= N) {
-        for (int i = tid; i < HEADS * V_DIM; i += THREADS) {
+        for (int i = tid; i < HEADS * V_DIM; i += BLOCK_SIZE) {
             partial_out[out_row][i] = 0.0f;
         }
         if (tid < HEADS) partial_lse[out_row][tid] = -INFINITY;
@@ -486,7 +485,7 @@ void mla_fused_attn_kernel(
         // ---- 2a: Load 128 KV positions into LDS ----
         {
             const int total_bytes = subtile_size * K_HALF;
-            for (int i = tid * 16; i < total_bytes; i += THREADS * 16) {
+            for (int i = tid * 16; i < total_bytes; i += BLOCK_SIZE * 16) {
                 const int row = i / K_HALF;
                 const int col = i % K_HALF;
                 if (row < subtile_size) {
@@ -495,7 +494,7 @@ void mla_fused_attn_kernel(
                 }
             }
             const int total_sc = subtile_size * B_SCALE_STRIDE;
-            for (int i = tid; i < total_sc; i += THREADS) {
+            for (int i = tid; i < total_sc; i += BLOCK_SIZE) {
                 const int row = i / B_SCALE_STRIDE;
                 const int blk = i % B_SCALE_STRIDE;
                 kv_lds_scale_tile[row][blk] =
@@ -909,7 +908,7 @@ constexpr int get_fused_kv_split() {
     else return 4;
 }
 
-template <int BATCH_SIZE, int N, int STRIDE>
+template <int BATCH_SIZE, int N, int STRIDE, int BS = 256, bool USE_32x32 = false>
 torch::Tensor mla_fused_pipeline_impl(
     torch::Tensor Q_bf16,
     torch::Tensor KV_data,
@@ -976,10 +975,9 @@ torch::Tensor mla_fused_pipeline_impl(
 
     // ---- Step 2: Fused attention (QK^T MFMA + online softmax + V accumulation) ----
     {
-        constexpr int BS = 256;
         dim3 grid(BATCH_SIZE, KV_SPLITS);
         dim3 block(BS);
-        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, true>
+        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, USE_32x32>
             <<<grid, block>>>(
             reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
             reinterpret_cast<const uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
@@ -1043,27 +1041,36 @@ torch::Tensor mla_mxfp4_pipeline(
     assert(B_SCALE_STRIDE == 18 || B_SCALE_STRIDE == 24);
     assert(kv_seq_len == 1024 || kv_seq_len == 8192);
 
-#define MLA_FUSED(BS, N, STR) \
-    if (batch_size == BS && kv_seq_len == N && B_SCALE_STRIDE == STR) \
-        return mla_fused_pipeline_impl<BS, N, STR>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
+#define MLA_FUSED(BS_VAL, N, STR, BLOCK, USE32) \
+    if (batch_size == BS_VAL && kv_seq_len == N && B_SCALE_STRIDE == STR) \
+        return mla_fused_pipeline_impl<BS_VAL, N, STR, BLOCK, USE32>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
 
-    // Use fused pipeline for all shapes
-    MLA_FUSED(4, 1024, 18);
-    MLA_FUSED(4, 1024, 24);
-    MLA_FUSED(4, 8192, 18);
-    MLA_FUSED(4, 8192, 24);
-    MLA_FUSED(32, 1024, 18);
-    MLA_FUSED(32, 1024, 24);
-    MLA_FUSED(32, 8192, 18);
-    MLA_FUSED(32, 8192, 24);
-    MLA_FUSED(64, 1024, 18);
-    MLA_FUSED(64, 1024, 24);
-    MLA_FUSED(64, 8192, 18);
-    MLA_FUSED(64, 8192, 24);
-    MLA_FUSED(256, 1024, 18);
-    MLA_FUSED(256, 1024, 24);
-    MLA_FUSED(256, 8192, 18);
-    MLA_FUSED(256, 8192, 24);
+    // Tuned dispatch: (batch_size, kv_seq_len, stride, block_size, use_32x32)
+    // Tuned per-config dispatch (winners from BSxMFMA sweep, all 16x16x128)
+    // bs=4, kv=1024: BS=256 wins (41.8µs)
+    MLA_FUSED(4, 1024, 18, 256, false);
+    MLA_FUSED(4, 1024, 24, 256, false);
+    // bs=4, kv=8192: BS=512 wins (45.3µs, -14% vs BS=256)
+    MLA_FUSED(4, 8192, 18, 512, false);
+    MLA_FUSED(4, 8192, 24, 512, false);
+    // bs=32, kv=1024: BS=512 wins (40.0µs, -16% vs BS=256)
+    MLA_FUSED(32, 1024, 18, 512, false);
+    MLA_FUSED(32, 1024, 24, 512, false);
+    // bs=32, kv=8192: BS=256 wins (154µs)
+    MLA_FUSED(32, 8192, 18, 256, false);
+    MLA_FUSED(32, 8192, 24, 256, false);
+    // bs=64, kv=1024: BS=256 wins (74.0µs)
+    MLA_FUSED(64, 1024, 18, 256, false);
+    MLA_FUSED(64, 1024, 24, 256, false);
+    // bs=64, kv=8192: BS=128 wins (217µs, -21% vs BS=256)
+    MLA_FUSED(64, 8192, 18, 128, false);
+    MLA_FUSED(64, 8192, 24, 128, false);
+    // bs=256, kv=1024: BS=256 wins (154µs)
+    MLA_FUSED(256, 1024, 18, 256, false);
+    MLA_FUSED(256, 1024, 24, 256, false);
+    // bs=256, kv=8192: BS=128 wins (362µs, -63% vs BS=256)
+    MLA_FUSED(256, 8192, 18, 128, false);
+    MLA_FUSED(256, 8192, 24, 128, false);
     TORCH_CHECK(false, "Unsupported batch_size: ", batch_size);
 }
 
@@ -1470,7 +1477,7 @@ def custom_kernel_mxfp4_qkt(data):
     kv_seq_len = config["kv_seq_len"]
     v_head_dim = config["v_head_dim"]
     sm_scale = config["sm_scale"]
-    PROFILE = True
+    PROFILE = False
 
     kv_buffer_mxfp4, kv_scale_mxfp4 = kv_data["mxfp4"]
     total_q = q.shape[0]

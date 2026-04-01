@@ -1,5 +1,5 @@
 "**MI355X on GitHub ✅ success**
-> Workflow [23835633477](<https://github.com/gpu-mode/kernelbot/actions/runs/23835633477>) completed
+> Workflow [23874471787](<https://github.com/gpu-mode/kernelbot/actions/runs/23874471787>) completed
 > Downloading artifacts... done
 > ✅ Compilation successful
 > ✅ Benchmarking successful
@@ -11,42 +11,42 @@ Running on:
 * Runtime: `ROCm`
 * Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
 * Torch: `2.10.0+rocm7.1`
-* Hostname: `arc-runner-set-hbp2z-runner-hxk2j`
+* Hostname: `arc-runner-set-hbp2z-runner-4rrtp`
 
 
 ## Benchmarks:
 ```
 seed: 4217; qseqlen: 1; kvseqlen: 1024; batchsize: 4
- ⏱ 41.8 ± 0.26 µs
- ⚡ 37.9 µs 🐌 80.2 µs
+ ⏱ 38.8 ± 0.04 µs
+ ⚡ 37.6 µs 🐌 43.9 µs
 
 seed: 4220; qseqlen: 1; kvseqlen: 8192; batchsize: 4
- ⏱ 52.5 ± 0.27 µs
- ⚡ 48.7 µs 🐌 97.2 µs
+ ⏱ 42.3 ± 0.04 µs
+ ⚡ 41.5 µs 🐌 45.7 µs
 
 seed: 5412; qseqlen: 1; kvseqlen: 1024; batchsize: 32
- ⏱ 47.6 ± 0.27 µs
- ⚡ 43.9 µs 🐌 85.2 µs
+ ⏱ 37.1 ± 0.04 µs
+ ⚡ 36.2 µs 🐌 41.9 µs
 
 seed: 5415; qseqlen: 1; kvseqlen: 8192; batchsize: 32
- ⏱ 154 ± 0.3 µs
- ⚡ 148 µs 🐌 197 µs
+ ⏱ 173 ± 0.6 µs
+ ⚡ 162 µs 🐌 354 µs
 
 seed: 1357; qseqlen: 1; kvseqlen: 1024; batchsize: 64
- ⏱ 74.0 ± 0.27 µs
- ⚡ 69.7 µs 🐌 115 µs
+ ⏱ 70.8 ± 0.07 µs
+ ⚡ 69.5 µs 🐌 75.2 µs
 
 seed: 1360; qseqlen: 1; kvseqlen: 8192; batchsize: 64
- ⏱ 276 ± 0.3 µs
- ⚡ 269 µs 🐌 312 µs
+ ⏱ 221 ± 0.6 µs
+ ⚡ 210 µs 🐌 417 µs
 
 seed: 9823; qseqlen: 1; kvseqlen: 1024; batchsize: 256
- ⏱ 154 ± 0.3 µs
- ⚡ 149 µs 🐌 190 µs
+ ⏱ 148 ± 0.1 µs
+ ⚡ 145 µs 🐌 152 µs
 
 seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
- ⏱ 978 ± 1.0 µs
- ⚡ 965 µs 🐌 1016 µs
+ ⏱ 368 ± 0.6 µs
+ ⚡ 354 µs 🐌 574 µs
 ```
 
 ## Program stderr:
@@ -55,7 +55,7 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 \u001b[92mSuccessfully preprocessed all matching files.\u001b[0m
 [aiter] start build [module_mla_metadata] under /home/runner/aiter/aiter/jit/build/module_mla_metadata
-[aiter] \u001b[32mfinish build [module_mla_metadata], cost 31.6s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_metadata], cost 32.0s \u001b[0m
 [aiter] import [module_mla_metadata] under /home/runner/aiter/aiter/jit/module_mla_metadata.so
 [aiter] type hints mismatch, override to --> get_mla_metadata_v1(seqlens_qo_indptr: torch.Tensor, seqlens_kv_indptr: torch.Tensor, kv_last_page_lens: torch.Tensor, num_heads_per_head_k: int | typing.SupportsIndex, num_heads_k: int | typing.SupportsIndex, is_causal: bool, work_metadata_ptrs: torch.Tensor, work_info_set: torch.Tensor, work_indptr: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: torch.Tensor, reduce_partial_map: torch.Tensor, page_size: int | typing.SupportsIndex = 1, kv_granularity: int | typing.SupportsIndex = 16, max_seqlen_qo: int | typing.SupportsIndex = -1, uni_seqlen_qo: int | typing.SupportsIndex = -1, fast_mode: bool = True, topk: int | typing.SupportsIndex = -1, max_split_per_batch: int | typing.SupportsIndex = -1, intra_batch_mode: bool = False, dtype_q: Optional[torch.dtype] = None, dtype_kv: Optional[torch.dtype] = None) -> None
 [aiter] start build [module_mla_asm] under /home/runner/aiter/aiter/jit/build/module_mla_asm
@@ -63,11 +63,11 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
   pd.set_option(\"future.no_silent_downcasting\", True)
 /home/runner/aiter/hsa/codegen.py:86: Pandas4Warning: The copy keyword is deprecated and will be removed in a future version. Copy-on-Write is active in pandas since 3.0 which utilizes a lazy copy mechanism that defers copies until necessary. Use .copy() to make an eager copy if necessary.
   pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
-[aiter] \u001b[32mfinish build [module_mla_asm], cost 20.9s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_asm], cost 21.2s \u001b[0m
 [aiter] import [module_mla_asm] under /home/runner/aiter/aiter/jit/module_mla_asm.so
 [aiter] type hints mismatch, override to --> mla_decode_stage1_asm_fwd(Q: torch.Tensor, KV: torch.Tensor, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_page_indices: torch.Tensor, kv_last_page_lens: torch.Tensor, num_kv_splits_indptr: Optional[torch.Tensor], work_meta_data: Optional[torch.Tensor], work_indptr: Optional[torch.Tensor], work_info_set: Optional[torch.Tensor], max_seqlen_q: int | typing.SupportsIndex, page_size: int | typing.SupportsIndex, nhead_kv: int | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, splitData: torch.Tensor, splitLse: torch.Tensor, output: torch.Tensor, q_scale: Optional[torch.Tensor] = None, kv_scale: Optional[torch.Tensor] = None) -> None
 [aiter] start build [module_mla_reduce] under /home/runner/aiter/aiter/jit/build/module_mla_reduce
-[aiter] \u001b[32mfinish build [module_mla_reduce], cost 170.5s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_reduce], cost 171.7s \u001b[0m
 [aiter] import [module_mla_reduce] under /home/runner/aiter/aiter/jit/module_mla_reduce.so
 [aiter] type hints mismatch, override to --> mla_reduce_v1(partial_output: torch.Tensor, partial_lse: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: Optional[torch.Tensor], reduce_partial_map: torch.Tensor, max_seqlen_q: int | typing.SupportsIndex, final_output: torch.Tensor, final_lse: Optional[torch.Tensor] = None) -> None```
 
@@ -81,41 +81,9 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
 Total number of unsupported CUDA function calls: 0
 
 
-Total number of replaced kernel launches: 8
-[1/1] clang++ main.o hip.cuda.o -shared -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_hip -ltorch_cpu -ltorch_hip -ltorch -ltorch_python -L/opt/rocm/lib -lamdhip64 -o mla_mxfp4_hip_torch_v13.so
-[PyTorch] load_inline took 0.55s
-[PyTorch] Total compilation time: 0.55s
+Total number of replaced kernel launches: 3
+ninja: no work to do.
+[PyTorch] load_inline took 0.30s
+[PyTorch] Total compilation time: 0.30s
 [aiter] hipModuleLoad: /home/runner/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co GetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE
-[aiter] hipModuleGetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE Success
-[MLA FUSED] bs=4 kv=1024 splits=16 | quant=6.7us fused_attn=31.0us reduce=5.9us | total=43.7us (avg over 1)
-[MLA FUSED] bs=4 kv=1024 splits=16 | quant=6.9us fused_attn=31.0us reduce=6.0us | total=43.9us (avg over 2)
-[MLA FUSED] bs=4 kv=1024 splits=16 | quant=6.8us fused_attn=31.1us reduce=6.0us | total=43.9us (avg over 3)
-[MLA FUSED] bs=4 kv=1024 splits=16 | quant=6.8us fused_attn=31.0us reduce=6.0us | total=43.8us (avg over 4)
-[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.7us fused_attn=38.1us reduce=10.0us | total=54.9us (avg over 1)
-[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.7us fused_attn=37.9us reduce=10.0us | total=54.6us (avg over 2)
-[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.7us fused_attn=37.8us reduce=10.1us | total=54.5us (avg over 3)
-[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.7us fused_attn=37.8us reduce=10.1us | total=54.6us (avg over 4)
-[MLA FUSED] bs=32 kv=1024 splits=8 | quant=6.7us fused_attn=37.3us reduce=6.1us | total=50.2us (avg over 1)
-[MLA FUSED] bs=32 kv=1024 splits=8 | quant=6.8us fused_attn=37.7us reduce=6.1us | total=50.6us (avg over 2)
-[MLA FUSED] bs=32 kv=1024 splits=8 | quant=6.8us fused_attn=37.6us reduce=6.1us | total=50.5us (avg over 3)
-[MLA FUSED] bs=32 kv=1024 splits=8 | quant=6.8us fused_attn=37.5us reduce=6.1us | total=50.4us (avg over 4)
-[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.7us fused_attn=141.6us reduce=6.6us | total=154.9us (avg over 1)
-[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.6us fused_attn=142.2us reduce=6.7us | total=155.5us (avg over 2)
-[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.6us fused_attn=142.0us reduce=6.7us | total=155.3us (avg over 3)
-[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.6us fused_attn=141.8us reduce=6.7us | total=155.1us (avg over 4)
-[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.8us fused_attn=64.7us reduce=6.2us | total=77.6us (avg over 1)
-[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.8us fused_attn=64.2us reduce=6.1us | total=77.1us (avg over 2)
-[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.7us fused_attn=63.9us reduce=6.1us | total=76.8us (avg over 3)
-[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.8us fused_attn=64.0us reduce=6.1us | total=76.9us (avg over 4)
-[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.8us fused_attn=267.5us reduce=6.7us | total=281.0us (avg over 1)
-[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.7us fused_attn=267.1us reduce=6.6us | total=280.5us (avg over 2)
-[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.7us fused_attn=266.6us reduce=6.7us | total=280.0us (avg over 3)
-[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.7us fused_attn=266.3us reduce=6.6us | total=279.6us (avg over 4)
-[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.5us fused_attn=142.1us reduce=7.1us | total=156.7us (avg over 1)
-[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.5us fused_attn=141.8us reduce=7.1us | total=156.4us (avg over 2)
-[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.7us fused_attn=143.1us reduce=7.1us | total=157.9us (avg over 3)
-[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.7us fused_attn=143.2us reduce=7.1us | total=158.0us (avg over 4)
-[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.4us fused_attn=968.2us reduce=9.4us | total=985.0us (avg over 1)
-[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.5us fused_attn=965.1us reduce=9.4us | total=981.9us (avg over 2)
-[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.5us fused_attn=965.9us reduce=9.4us | total=982.7us (avg over 3)
-[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.5us fused_attn=964.0us reduce=9.4us | total=980.9us (avg over 4)```"
+[aiter] hipModuleGetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE Success```"
