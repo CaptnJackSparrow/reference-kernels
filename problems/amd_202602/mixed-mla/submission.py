@@ -72,6 +72,7 @@ constexpr int KV_TILE_SIZE = 64;  // Process 64 KV tokens at a time
 constexpr int FMT_FP4_MFMA = 4;
 
 typedef float __attribute__((ext_vector_type(4))) float4_t;
+typedef float __attribute__((ext_vector_type(16))) float16_t;
 typedef int __attribute__((ext_vector_type(8))) int8_vec;
 typedef uint32_t __attribute__((ext_vector_type(4))) uint128_vec;
 
@@ -940,6 +941,97 @@ void mla_mxfp4_decode_kernel_bs4_kv1024(
 __device__ __forceinline__ int32_t mla_broadcast_scale(uint8_t e8m0) {
     return (int32_t)e8m0 * 0x01010101;
 }
+
+// =====================================================================
+// MLA MFMA traits: abstracts 16x16x128 vs 32x32x64 differences
+// =====================================================================
+template <bool USE_32x32>
+struct MlaMfmaTraits {
+    using acc_t = typename std::conditional<USE_32x32, float16_t, float4_t>::type;
+    static constexpr int IM = USE_32x32 ? 32 : 16;
+    static constexpr int IK = USE_32x32 ? 64 : 128;
+    static constexpr int BPC = IK / 32;
+    static constexpr int ACC_SIZE = USE_32x32 ? 16 : 4;
+
+    static __device__ __forceinline__ acc_t mfma(
+        int8_vec a, int32_t a_sc, int8_vec b, int32_t b_sc, acc_t acc
+    ) {
+        if constexpr (USE_32x32) {
+            return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+                a, b, acc, FMT_FP4_MFMA, FMT_FP4_MFMA, 0, a_sc, 0, b_sc);
+        } else {
+            return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                a, b, acc, FMT_FP4_MFMA, FMT_FP4_MFMA, 0, a_sc, 0, b_sc);
+        }
+    }
+
+    // Map accumulator element index + lane to head index
+    static __device__ __forceinline__ int acc_to_head(int i, int lane) {
+        if constexpr (USE_32x32) {
+            int half = lane / 32;
+            return (i % 4) + 4 * half + 8 * (i / 4);
+        } else {
+            int quad = lane / 16;
+            return i + 4 * quad;
+        }
+    }
+
+    // Map lane to output column (N-dimension)
+    static __device__ __forceinline__ int lane_to_col(int lane) {
+        return lane % IM;
+    }
+
+    // Store accumulator values to scores_lds with sm_scale
+    template <int HEADS, int KV_SUBTILE>
+    static __device__ __forceinline__ void store_scores(
+        const acc_t& acc, int lane, int batch_col_offset, int subtile_size,
+        float sm_scale, float scores[][KV_SUBTILE]
+    ) {
+        int col = lane_to_col(lane);
+        int eff_col = batch_col_offset + col;
+        for (int i = 0; i < ACC_SIZE; i++) {
+            int head = acc_to_head(i, lane);
+            if (head < HEADS && eff_col < subtile_size)
+                scores[head][eff_col] = acc[i] * sm_scale;
+        }
+    }
+
+    // Rescale V accumulators by per-head factors
+    template <int HEADS, int CHUNKS_PER_WARP>
+    static __device__ __forceinline__ void rescale_v_acc(
+        acc_t v_acc[], int lane, const float rescale[]
+    ) {
+        for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
+            for (int i = 0; i < ACC_SIZE; i++) {
+                int head = acc_to_head(i, lane);
+                if (head < HEADS)
+                    v_acc[ci][i] *= rescale[head];
+            }
+        }
+    }
+
+    // Store V accumulator to partial output
+    template <int HEADS, int V_DIM, int CHUNKS_PER_WARP>
+    static __device__ __forceinline__ void store_v_output(
+        const acc_t v_acc[], int lane, int warp_id,
+        int out_row, float partial_out[][16 * 512],
+        const float running_sum_lds[][128]
+    ) {
+        int col = lane_to_col(lane);
+        for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
+            int chunk = warp_id * CHUNKS_PER_WARP + ci;
+            for (int i = 0; i < ACC_SIZE; i++) {
+                int head = acc_to_head(i, lane);
+                int v_dim = chunk * IM + col;
+                if (head < HEADS && v_dim < V_DIM) {
+                    float rs = running_sum_lds[head][0];
+                    float inv_sum = (rs > 0.0f) ? (1.0f / rs) : 0.0f;
+                    partial_out[out_row][head * V_DIM + v_dim] = v_acc[ci][i] * inv_sum;
+                }
+            }
+        }
+    }
+};
 
 template <int M, int N, int K_HALF, int NUM_BLOCKS, int B_SCALE_STRIDE,
           int A_K_HALF, int BLOCK_SIZE>
@@ -1947,7 +2039,8 @@ void mla_attn_v_reduce_head_merged_kernel(
 // =============================================================================
 
 template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS,
-          int K_HALF, int NUM_BLOCKS, int A_K_HALF, bool PROFILE_PHASES = false>
+          int K_HALF, int NUM_BLOCKS, int A_K_HALF,
+          bool USE_32x32 = false, bool PROFILE_PHASES = false>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_fused_attn_kernel(
     const hip_bfloat16* __restrict__ Q_bf16,
@@ -1964,15 +2057,20 @@ void mla_fused_attn_kernel(
     constexpr int HEADS = 16;
     constexpr int KV_PER_SPLIT = (N + KV_SPLITS - 1) / KV_SPLITS;
     constexpr int KV_SUBTILE = 128;
-    constexpr int QKT_BATCH = 16;
-    constexpr int IM = 16;
-    constexpr int BPC = 4;
-    constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
 
-    constexpr int V_CHUNKS = V_DIM / 16;
+    // MFMA variant traits
+    using Traits = MlaMfmaTraits<USE_32x32>;
+    using acc_t = typename Traits::acc_t;
+    constexpr int IM = Traits::IM;
+    constexpr int BPC = Traits::BPC;
+    constexpr int ACC_SIZE = Traits::ACC_SIZE;
+    constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
+    constexpr int QKT_BATCH = IM;
+    constexpr int V_CHUNK_DIM = IM;
+    constexpr int V_CHUNKS = V_DIM / V_CHUNK_DIM;
+
     constexpr int WARPS = THREADS / 64;
     constexpr int CHUNKS_PER_WARP = V_CHUNKS / WARPS;
-    constexpr int V_LDS_STRIDE = 256;
 
     const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
     const int split_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
@@ -2000,7 +2098,7 @@ void mla_fused_attn_kernel(
     __shared__ float   scores_lds[HEADS][KV_SUBTILE];
 
     // ---- Per-warp MFMA V accumulators + online softmax state ----
-    float4_t v_acc[CHUNKS_PER_WARP];
+    acc_t v_acc[CHUNKS_PER_WARP];
     float running_max[HEADS];
     float running_sum[HEADS];
     for (int c = 0; c < CHUNKS_PER_WARP; c++) {
@@ -2014,10 +2112,10 @@ void mla_fused_attn_kernel(
     const int out_row = __builtin_amdgcn_readfirstlane(batch_idx * KV_SPLITS + split_idx);
 
     // MFMA lane indices (used for both QK^T and V accumulation)
-    const int mfma_a_row = lane % 16;
-    const int mfma_a_kgrp = lane / 16;
-    const int mfma_b_col = lane % 16;
-    const int mfma_b_kgrp = lane / 16;
+    const int mfma_a_row = lane % IM;
+    const int mfma_a_kgrp = lane / IM;
+    const int mfma_b_col = lane % IM;
+    const int mfma_b_kgrp = lane / IM;
     const int32_t b_sc_one = mla_broadcast_scale(127);
 
     // ---- Step 1: Load pre-quantized Q into LDS (one-time) ----
@@ -2089,16 +2187,16 @@ void mla_fused_attn_kernel(
             }
         }
 
-        // ---- 2b: QK^T via 8 iterations of MFMA 16x16x128 (warp 0 only) ----
+        // ---- 2b: QK^T via MFMA (warp 0 only) ----
         if (warp_id == 0) {
             for (int qkt_iter = 0; qkt_iter < KV_SUBTILE / QKT_BATCH; qkt_iter++) {
-                float4_t mfma_acc = {};
+                acc_t mfma_acc = {};
                 for (int ki = 0; ki < K_ITERS; ki++) {
                     int blk0 = ki * BPC;
                     int qa_row = lane % IM;
                     int qa_blk = blk0 + lane / IM;
                     uint32_t qa_reg[8] = {};
-                    if (qa_blk < NUM_BLOCKS) {
+                    if (qa_row < HEADS && qa_blk < NUM_BLOCKS) {
                         *reinterpret_cast<uint128_vec*>(&qa_reg[0]) =
                             *reinterpret_cast<const uint128_vec*>(&q_lds_data[qa_row][qa_blk * 16]);
                     }
@@ -2124,25 +2222,16 @@ void mla_fused_attn_kernel(
                         kb_reg[0] = kb_reg[1] = kb_reg[2] = kb_reg[3] = 0;
                     int32_t kb_sc = mla_broadcast_scale(kb_e);
 
-                    qa_reg[4]=qa_reg[5]=qa_reg[6]=qa_reg[7]=0;
-                    kb_reg[4]=kb_reg[5]=kb_reg[6]=kb_reg[7]=0;
-
                     int8_vec qa_vec = {(int)qa_reg[0],(int)qa_reg[1],(int)qa_reg[2],(int)qa_reg[3],
                                        (int)qa_reg[4],(int)qa_reg[5],(int)qa_reg[6],(int)qa_reg[7]};
                     int8_vec kb_vec = {(int)kb_reg[0],(int)kb_reg[1],(int)kb_reg[2],(int)kb_reg[3],
                                        (int)kb_reg[4],(int)kb_reg[5],(int)kb_reg[6],(int)kb_reg[7]};
-                    mfma_acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                        qa_vec, kb_vec, mfma_acc, FMT_FP4_MFMA, FMT_FP4_MFMA,
-                        0, qa_sc, 0, kb_sc);
+
+                    mfma_acc = Traits::mfma(qa_vec, qa_sc, kb_vec, kb_sc, mfma_acc);
                 }
-                int col = lane % 16;
-                int quad = lane / 16;
-                int eff_col = qkt_iter * QKT_BATCH + col;
-                for (int i = 0; i < 4; i++) {
-                    int head = i + 4 * quad;
-                    if (head < HEADS && eff_col < subtile_size)
-                        scores_lds[head][eff_col] = mfma_acc[i] * sm_scale;
-                }
+                Traits::template store_scores<HEADS, KV_SUBTILE>(
+                    mfma_acc, lane, qkt_iter * QKT_BATCH, subtile_size,
+                    sm_scale, scores_lds);
             }
         }
 
@@ -2210,14 +2299,8 @@ void mla_fused_attn_kernel(
             }
 
             // ALL threads rescale their MFMA V accumulators
-            const int out_quad = lane / 16;
-            for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
-                for (int i = 0; i < 4; i++) {
-                    const int head = i + 4 * out_quad;
-                    if (head < HEADS)
-                        v_acc[ci][i] *= rescale_lds[head];
-                }
-            }
+            Traits::template rescale_v_acc<HEADS, CHUNKS_PER_WARP>(
+                v_acc, lane, rescale_lds);
         }
 
         if constexpr (PROFILE_PHASES) {
@@ -2229,93 +2312,146 @@ void mla_fused_attn_kernel(
         }
 
         // ---- 2d: MFMA Attn*V with scale-absorption pattern ----
-        for (int ci = 0; ci < CHUNKS_PER_WARP; ci += 2) {
-            const int chunk0 = warp_id * CHUNKS_PER_WARP + ci;
-            const int vscale_blk = chunk0 / 2;
+        if constexpr (USE_32x32) {
+            // 32x32x64: each chunk covers 32 V dims, 1 MFMA per chunk
+            for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
+                const int chunk = warp_id * CHUNKS_PER_WARP + ci;
+                const int vscale_blk = chunk;  // 1 scale block per 32 V dims
 
-            // A operand: attn * v_scale, quantized to FP4
-            const int k_base_a = mfma_a_kgrp * 32;
-            float scaled_attn[32];
-            for (int j = 0; j < 32; j++) {
-                const float aw = scores_lds[mfma_a_row][k_base_a + j];
-                const float vs = e8m0_to_float_fast(kv_lds_scale_tile[k_base_a + j][vscale_blk]);
-                scaled_attn[j] = aw * vs;
+                // A operand: attn * v_scale, quantized to FP4
+                const int k_base_a = mfma_a_kgrp * 32;
+                float scaled_attn[32];
+                for (int j = 0; j < 32; j++) {
+                    const float aw = (mfma_a_row < HEADS) ? scores_lds[mfma_a_row][k_base_a + j] : 0.0f;
+                    const float vs = e8m0_to_float_fast(kv_lds_scale_tile[k_base_a + j][vscale_blk]);
+                    scaled_attn[j] = aw * vs;
+                }
+                QuantBlock aqb = quantize_fp4_block(scaled_attn);
+
+                uint32_t a_reg[8] = {};
+                *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
+                    *reinterpret_cast<uint128_vec*>(&aqb.data);
+                int32_t a_sc = mla_broadcast_scale(aqb.e8m0);
+
+                int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
+                                  (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
+
+                // B operand: gather V nibbles for 32 V dims
+                {
+                    const int k_base_b = mfma_b_kgrp * 32;
+                    const int v_d = chunk * 32 + mfma_b_col;
+                    const int nib_shift = (v_d & 1) * 4;
+                    const int local_off = mfma_b_col / 2;
+                    const int lds_byte_base = chunk * 16;
+
+                    uint8_t packed[16];
+                    for (int j = 0; j < 16; j++) {
+                        const int k0 = k_base_b + j * 2;
+                        const int k1 = k_base_b + j * 2 + 1;
+
+                        uint8_t raw0 = 0, raw1 = 0;
+                        if (k0 < subtile_size)
+                            raw0 = kv_lds_data[k0][lds_byte_base + local_off];
+                        if (k1 < subtile_size)
+                            raw1 = kv_lds_data[k1][lds_byte_base + local_off];
+
+                        uint8_t n0 = (raw0 >> nib_shift) & 0x0F;
+                        uint8_t n1 = (raw1 >> nib_shift) & 0x0F;
+                        packed[j] = n0 | (n1 << 4);
+                    }
+
+                    uint32_t b_reg[8] = {};
+                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                        *reinterpret_cast<uint128_vec*>(&packed[0]);
+                    int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                      (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                    v_acc[ci] = Traits::mfma(a_vec, a_sc, b_vec, b_sc_one, v_acc[ci]);
+                }
             }
-            QuantBlock aqb = quantize_fp4_block(scaled_attn);
+        } else {
+            // 16x16x128: each chunk covers 16 V dims, 2 sub-chunks per iteration
+            for (int ci = 0; ci < CHUNKS_PER_WARP; ci += 2) {
+                const int chunk0 = warp_id * CHUNKS_PER_WARP + ci;
+                const int vscale_blk = chunk0 / 2;
 
-            uint32_t a_reg[8];
-            *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
-                *reinterpret_cast<uint128_vec*>(&aqb.data);
-            a_reg[4] = a_reg[5] = a_reg[6] = a_reg[7] = 0;
-            int32_t a_sc = mla_broadcast_scale(aqb.e8m0);
+                // A operand: attn * v_scale, quantized to FP4
+                const int k_base_a = mfma_a_kgrp * 32;
+                float scaled_attn[32];
+                for (int j = 0; j < 32; j++) {
+                    const float aw = scores_lds[mfma_a_row][k_base_a + j];
+                    const float vs = e8m0_to_float_fast(kv_lds_scale_tile[k_base_a + j][vscale_blk]);
+                    scaled_attn[j] = aw * vs;
+                }
+                QuantBlock aqb = quantize_fp4_block(scaled_attn);
 
-            int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
-                              (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
+                uint32_t a_reg[8];
+                *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
+                    *reinterpret_cast<uint128_vec*>(&aqb.data);
+                a_reg[4] = a_reg[5] = a_reg[6] = a_reg[7] = 0;
+                int32_t a_sc = mla_broadcast_scale(aqb.e8m0);
 
-            // B operand: gather V nibbles for both sub-chunks
-            {
-                const int k_base_b = mfma_b_kgrp * 32;
-                const int v_d0 = chunk0 * 16 + mfma_b_col;
-                const int v_d1 = (chunk0 + 1) * 16 + mfma_b_col;
-                const int nib_shift0 = (v_d0 & 1) * 4;
-                const int nib_shift1 = (v_d1 & 1) * 4;
-                const int local_off0 = mfma_b_col / 2;
-                const int local_off1 = 8 + mfma_b_col / 2;
-                const int lds_byte_base = chunk0 * 8;
+                int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
+                                  (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
 
-                uint8_t packed0[16], packed1[16];
+                // B operand: gather V nibbles for both sub-chunks
+                {
+                    const int k_base_b = mfma_b_kgrp * 32;
+                    const int v_d0 = chunk0 * 16 + mfma_b_col;
+                    const int v_d1 = (chunk0 + 1) * 16 + mfma_b_col;
+                    const int nib_shift0 = (v_d0 & 1) * 4;
+                    const int nib_shift1 = (v_d1 & 1) * 4;
+                    const int local_off0 = mfma_b_col / 2;
+                    const int local_off1 = 8 + mfma_b_col / 2;
+                    const int lds_byte_base = chunk0 * 8;
 
-                for (int j = 0; j < 16; j++) {
-                    const int k0 = k_base_b + j * 2;
-                    const int k1 = k_base_b + j * 2 + 1;
+                    uint8_t packed0[16], packed1[16];
 
-                    uint8_t raw0_s0 = 0, raw0_s1 = 0;
-                    if (k0 < subtile_size) {
-                        raw0_s0 = kv_lds_data[k0][lds_byte_base + local_off0];
-                        raw0_s1 = kv_lds_data[k0][lds_byte_base + local_off1];
+                    for (int j = 0; j < 16; j++) {
+                        const int k0 = k_base_b + j * 2;
+                        const int k1 = k_base_b + j * 2 + 1;
+
+                        uint8_t raw0_s0 = 0, raw0_s1 = 0;
+                        if (k0 < subtile_size) {
+                            raw0_s0 = kv_lds_data[k0][lds_byte_base + local_off0];
+                            raw0_s1 = kv_lds_data[k0][lds_byte_base + local_off1];
+                        }
+
+                        uint8_t raw1_s0 = 0, raw1_s1 = 0;
+                        if (k1 < subtile_size) {
+                            raw1_s0 = kv_lds_data[k1][lds_byte_base + local_off0];
+                            raw1_s1 = kv_lds_data[k1][lds_byte_base + local_off1];
+                        }
+
+                        uint8_t n0_s0 = (raw0_s0 >> nib_shift0) & 0x0F;
+                        uint8_t n1_s0 = (raw1_s0 >> nib_shift0) & 0x0F;
+                        packed0[j] = n0_s0 | (n1_s0 << 4);
+
+                        uint8_t n0_s1 = (raw0_s1 >> nib_shift1) & 0x0F;
+                        uint8_t n1_s1 = (raw1_s1 >> nib_shift1) & 0x0F;
+                        packed1[j] = n0_s1 | (n1_s1 << 4);
                     }
 
-                    uint8_t raw1_s0 = 0, raw1_s1 = 0;
-                    if (k1 < subtile_size) {
-                        raw1_s0 = kv_lds_data[k1][lds_byte_base + local_off0];
-                        raw1_s1 = kv_lds_data[k1][lds_byte_base + local_off1];
+                    // MFMA for sub-chunk 0
+                    {
+                        uint32_t b_reg[8];
+                        *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                            *reinterpret_cast<uint128_vec*>(&packed0[0]);
+                        b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+                        int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                          (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                        v_acc[ci] = Traits::mfma(a_vec, a_sc, b_vec, b_sc_one, v_acc[ci]);
                     }
 
-                    uint8_t n0_s0 = (raw0_s0 >> nib_shift0) & 0x0F;
-                    uint8_t n1_s0 = (raw1_s0 >> nib_shift0) & 0x0F;
-                    packed0[j] = n0_s0 | (n1_s0 << 4);
-
-                    uint8_t n0_s1 = (raw0_s1 >> nib_shift1) & 0x0F;
-                    uint8_t n1_s1 = (raw1_s1 >> nib_shift1) & 0x0F;
-                    packed1[j] = n0_s1 | (n1_s1 << 4);
-                }
-
-                // MFMA for sub-chunk 0
-                {
-                    uint32_t b_reg[8];
-                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
-                        *reinterpret_cast<uint128_vec*>(&packed0[0]);
-                    b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
-                    int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                                      (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
-                    v_acc[ci] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                        a_vec, b_vec, v_acc[ci],
-                        FMT_FP4_MFMA, FMT_FP4_MFMA,
-                        0, a_sc, 0, b_sc_one);
-                }
-
-                // MFMA for sub-chunk 1
-                {
-                    uint32_t b_reg[8];
-                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
-                        *reinterpret_cast<uint128_vec*>(&packed1[0]);
-                    b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
-                    int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                                      (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
-                    v_acc[ci + 1] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                        a_vec, b_vec, v_acc[ci + 1],
-                        FMT_FP4_MFMA, FMT_FP4_MFMA,
-                        0, a_sc, 0, b_sc_one);
+                    // MFMA for sub-chunk 1
+                    {
+                        uint32_t b_reg[8];
+                        *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                            *reinterpret_cast<uint128_vec*>(&packed1[0]);
+                        b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+                        int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                          (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                        v_acc[ci + 1] = Traits::mfma(a_vec, a_sc, b_vec, b_sc_one, v_acc[ci + 1]);
+                    }
                 }
             }
         }
@@ -2344,20 +2480,8 @@ void mla_fused_attn_kernel(
     __syncthreads();
 
     {
-        const int out_col = lane % 16;
-        const int out_quad = lane / 16;
-        for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
-            const int chunk = warp_id * CHUNKS_PER_WARP + ci;
-            for (int i = 0; i < 4; i++) {
-                const int head = i + 4 * out_quad;
-                const int v_dim = chunk * 16 + out_col;
-                if (head < HEADS && v_dim < V_DIM) {
-                    float rs = scores_lds[head][0];
-                    float inv_sum = (rs > 0.0f) ? (1.0f / rs) : 0.0f;
-                    partial_out[out_row][head * V_DIM + v_dim] = v_acc[ci][i] * inv_sum;
-                }
-            }
-        }
+        Traits::template store_v_output<HEADS, V_DIM, CHUNKS_PER_WARP>(
+            v_acc, lane, warp_id, out_row, partial_out, scores_lds);
     }
 
     if (tid < HEADS) {
@@ -2794,7 +2918,7 @@ torch::Tensor mla_fused_pipeline_impl(
         constexpr int BS = 256;
         dim3 grid(BATCH_SIZE, KV_SPLITS);
         dim3 block(BS);
-        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF>
+        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, true>
             <<<grid, block>>>(
             reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
             reinterpret_cast<const uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
