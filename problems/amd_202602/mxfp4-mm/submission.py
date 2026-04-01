@@ -363,9 +363,31 @@ struct MfmaTraits {
             }
         }
     }
+
+    template <int N>
+    static __device__ __forceinline__ void store_f32(
+        float* ws, const acc_t& acc,
+        int tile_m, int tile_n, int lane
+    ) {
+        if constexpr (IM == 32) {
+            int col = lane % 32;
+            int half = lane / 32;
+            for (int i = 0; i < 16; i++) {
+                int row = (i % 4) + 4 * half + 8 * (i / 4);
+                ws[(tile_m + row) * N + tile_n + col] = acc[i];
+            }
+        } else {
+            int col = lane % 16;
+            int quad = lane / 16;
+            for (int i = 0; i < 4; i++) {
+                int row = i + 4 * quad;
+                ws[(tile_m + row) * N + tile_n + col] = acc[i];
+            }
+        }
+    }
 };
 
-template <int M, int K_HALF, int IM, int IN, int IK>
+template <int K_HALF, int IM, int IN, int IK>
 __device__ __forceinline__ int32_t load_a_with_scale(
     const uint8_t A_data[][K_HALF],
     const uint8_t A_scale[][K_HALF / 16],
@@ -404,7 +426,7 @@ __device__ __forceinline__ void load_ab_global(
     uint32_t a_r[MfmaTraits<IM,IN,IK>::REGS], int32_t& a_s,
     uint32_t b_r[MfmaTraits<IM,IN,IK>::REGS], int32_t& b_s
 ) {
-    a_s = load_a_with_scale<M, K_HALF, IM, IN, IK>(A_data, A_scale, tile_m, blk0, lane, a_r);
+    a_s = load_a_with_scale<K_HALF, IM, IN, IK>(A_data, A_scale, tile_m, blk0, lane, a_r);
     b_s = load_b_with_scale<K_HALF, NUM_BLOCKS, IM, IN, IK>(B_data, B_scale, tile_n, blk0, lane, b_r);
 }
 
@@ -756,7 +778,7 @@ __global__ void mfma_fp4_gemm_coop_simple(
 // Tiled kernel helpers: load global -> registers, store registers -> LDS
 // =====================================================================
 
-template <int OUTER_M, int OUTER_N, int OUTER_K>
+template <int OUTER_M, int OUTER_N, int OUTER_K, int WARP_TILES_M = 1, int WARP_TILES_N = 1>
 struct LdsLayout {
     static constexpr int LIMIT    = 160 * 1024;
     static constexpr int OK_HALF   = OUTER_K / 2;
@@ -767,7 +789,8 @@ struct LdsLayout {
     static constexpr int B_SCALE  = OUTER_N * K_BLOCKS;
     static constexpr int C_DATA_FLOATS = OUTER_M * OUTER_N;
     static constexpr int C_DATA_BYTES  = C_DATA_FLOATS * 4;
-    static constexpr int TOTAL    = A_DATA + A_SCALE + B_DATA + B_SCALE + C_DATA_BYTES;
+    static constexpr int TOTAL    = A_DATA + A_SCALE + B_DATA + B_SCALE +
+                                    ((WARP_TILES_M * WARP_TILES_N > 1) ? C_DATA_BYTES : 0);
     static constexpr int OCCUPANCY= LIMIT / TOTAL;
 };
 
@@ -1003,28 +1026,68 @@ __device__ __forceinline__ void inner_mfma_loop(
     const uint8_t smem_a_data[][OK_HALF], const uint8_t smem_a_scale[][OUTER_K / 32],
     const uint8_t smem_b_data[][OUTER_N * 16], const uint8_t smem_b_scale[][OUTER_N],
     int warp_m, int warp_n, int lane,
-    float smem_c[][OUTER_N]
+    float smem_c[][OUTER_N],
+    typename MfmaTraits<IM, IN, IK>::acc_t& reg_acc
 ) {
     using Traits = MfmaTraits<IM, IN, IK>;
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
     constexpr int ITERS = OUTER_K / IK;
 
-    for (int ik = 0; ik < ITERS; ik++) {
-        int blk0 = ik * BPC;
+    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+        // Single tile per warp: accumulate in registers, no LDS
+        int tile_m_local = warp_m * IM;
+        int tile_n_local = warp_n * IN;
 
-        if constexpr (IM >= IN) {
-            // Reuse A: outer loop M, inner loop N
-            for (int wt_m = 0; wt_m < WARP_TILES_M; wt_m++) {
-                uint32_t a_reg[Traits::REGS];
-                int a_row, a_blk;
-                int tile_m_local = (warp_m * WARP_TILES_M + wt_m) * IM;
-                load_tile<IM, OK_HALF>(smem_a_data,
-                    tile_m_local,
-                    blk0, lane, a_reg, a_blk, a_row);
-                int32_t a_sc = broadcast_scale(
-                    smem_a_scale[a_row][a_blk]);
+        for (int ik = 0; ik < ITERS; ik++) {
+            int blk0 = ik * BPC;
+            uint32_t a_reg[Traits::REGS];
+            auto a_sc = load_a_with_scale<OK_HALF, IM, IN, IK>(
+                smem_a_data, smem_a_scale, tile_m_local, blk0, lane, a_reg);
 
+            uint32_t b_reg[Traits::REGS];
+            int b_row, b_blk;
+            load_transposed<IM, OUTER_N>(smem_b_data,
+                tile_n_local, blk0, lane, b_reg, b_blk, b_row);
+            int32_t b_sc = broadcast_scale(
+                smem_b_scale[b_blk][b_row]);
+
+            reg_acc = Traits::mfma(a_reg, a_sc, b_reg, b_sc, reg_acc);
+        }
+    } else {
+        // Multi-tile per warp: use LDS for accumulation
+        for (int ik = 0; ik < ITERS; ik++) {
+            int blk0 = ik * BPC;
+
+            if constexpr (IM >= IN) {
+                // Reuse A: outer loop M, inner loop N
+                for (int wt_m = 0; wt_m < WARP_TILES_M; wt_m++) {
+                    uint32_t a_reg[Traits::REGS];
+                    int tile_m_local = (warp_m * WARP_TILES_M + wt_m) * IM;
+                    auto a_sc = load_a_with_scale<OK_HALF, IM, IN, IK>(
+                        smem_a_data, smem_a_scale, tile_m_local, blk0, lane, a_reg);
+
+                    for (int wt_n = 0; wt_n < WARP_TILES_N; wt_n++) {
+                        uint32_t b_reg[Traits::REGS];
+                        int b_row, b_blk;
+                        load_transposed<IM, OUTER_N>(smem_b_data,
+                            (warp_n * WARP_TILES_N + wt_n) * IN,
+                            blk0, lane, b_reg, b_blk, b_row);
+                        int32_t b_sc = broadcast_scale(
+                            smem_b_scale[b_blk][b_row]);
+
+                        int tile_n_local = (warp_n * WARP_TILES_N + wt_n) * IN;
+                        typename Traits::acc_t acc;
+                        Traits::template load_acc_from_smem<OUTER_N>(
+                            smem_c, acc, tile_m_local, tile_n_local, lane);
+
+                        acc = Traits::mfma(a_reg, a_sc, b_reg, b_sc, acc);
+
+                        Traits::template store_acc_to_smem<OUTER_N>(
+                            smem_c, acc, tile_m_local, tile_n_local, lane);
+                    }
+                }
+            } else {
                 for (int wt_n = 0; wt_n < WARP_TILES_N; wt_n++) {
                     uint32_t b_reg[Traits::REGS];
                     int b_row, b_blk;
@@ -1033,51 +1096,26 @@ __device__ __forceinline__ void inner_mfma_loop(
                         blk0, lane, b_reg, b_blk, b_row);
                     int32_t b_sc = broadcast_scale(
                         smem_b_scale[b_blk][b_row]);
-
                     int tile_n_local = (warp_n * WARP_TILES_N + wt_n) * IN;
-                    typename Traits::acc_t acc;
-                    Traits::template load_acc_from_smem<OUTER_N>(
-                        smem_c, acc, tile_m_local, tile_n_local, lane);
 
-                    acc = Traits::mfma(a_reg, a_sc, b_reg, b_sc, acc);
+                    for (int wt_m = 0; wt_m < WARP_TILES_M; wt_m++) {
+                        uint32_t a_reg[Traits::REGS];
+                        int tile_m_local = (warp_m * WARP_TILES_M + wt_m) * IM;
+                        auto a_sc = load_a_with_scale<OK_HALF, IM, IN, IK>(
+                            smem_a_data, smem_a_scale, tile_m_local, blk0, lane, a_reg);
+                        typename Traits::acc_t acc;
+                        Traits::template load_acc_from_smem<OUTER_N>(
+                            smem_c, acc, tile_m_local, tile_n_local, lane);
 
-                    Traits::template store_acc_to_smem<OUTER_N>(
-                        smem_c, acc, tile_m_local, tile_n_local, lane);
-                }
-            }
-        } else {
-            for (int wt_n = 0; wt_n < WARP_TILES_N; wt_n++) {
-                uint32_t b_reg[Traits::REGS];
-                int b_row, b_blk;
-                load_transposed<IM, OUTER_N>(smem_b_data,
-                    (warp_n * WARP_TILES_N + wt_n) * IN,
-                    blk0, lane, b_reg, b_blk, b_row);
-                int32_t b_sc = broadcast_scale(
-                    smem_b_scale[b_blk][b_row]);
-                int tile_n_local = (warp_n * WARP_TILES_N + wt_n) * IN;
+                        acc = Traits::mfma(a_reg, a_sc, b_reg, b_sc, acc);
 
-                for (int wt_m = 0; wt_m < WARP_TILES_M; wt_m++) {
-                    uint32_t a_reg[Traits::REGS];
-                    int a_row, a_blk;
-                    load_tile<IM, OK_HALF>(smem_a_data,
-                        (warp_m * WARP_TILES_M + wt_m) * IM,
-                        blk0, lane, a_reg, a_blk, a_row);
-                    int32_t a_sc = broadcast_scale(
-                        smem_a_scale[a_row][a_blk]);
-
-                    int tile_m_local = (warp_m * WARP_TILES_M + wt_m) * IM;
-                    typename Traits::acc_t acc;
-                    Traits::template load_acc_from_smem<OUTER_N>(
-                        smem_c, acc, tile_m_local, tile_n_local, lane);
-
-                    acc = Traits::mfma(a_reg, a_sc, b_reg, b_sc, acc);
-
-                    Traits::template store_acc_to_smem<OUTER_N>(
-                        smem_c, acc, tile_m_local, tile_n_local, lane);
+                        Traits::template store_acc_to_smem<OUTER_N>(
+                            smem_c, acc, tile_m_local, tile_n_local, lane);
+                    }
                 }
             }
         }
-    }
+    } // end multi-tile
 }
 
 
@@ -1092,21 +1130,21 @@ template <int WARPS, int M, int N, int K, int NUM_BLOCKS,
           bool FUSE_A_QUANT = false, int BUFFERS = 1,
           int OCCUPANCY = -1, int K_HALF = K / 2>
 __global__ void
-__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? (LdsLayout<OUTER_M, OUTER_N, OUTER_K>::OCCUPANCY) / BUFFERS : OCCUPANCY)
+__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? (LdsLayout<OUTER_M, OUTER_N, OUTER_K, WARP_TILES_M, WARP_TILES_N>::OCCUPANCY) / BUFFERS : OCCUPANCY)
 mfma_fp4_gemm_tiled(
+    const hip_bfloat16 A_bf16[][K],
     const uint8_t A_data[][K_HALF],
     const uint8_t B_data[][K_HALF],
     const uint8_t A_scale[][NUM_BLOCKS],
     const uint8_t* __restrict__ B_scale,
-    hip_bfloat16 C[][N],
-    const hip_bfloat16 A_bf16[][K]
+    hip_bfloat16 C[][N]
 ) {
     constexpr int WARPS_M = OUTER_M / (IM * WARP_TILES_M);
     constexpr int WARPS_N = OUTER_N / (IN * WARP_TILES_N);
     static_assert(WARPS == WARPS_M * WARPS_N);
 
     using Traits = MfmaTraits<IM, IN, IK>;
-    using Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K>;
+    using Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, WARP_TILES_M, WARP_TILES_N>;
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OUTER_K_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
@@ -1132,11 +1170,18 @@ mfma_fp4_gemm_tiled(
     __shared__ uint8_t smem_a_scale[BUFFERS][OUTER_M][OK_BLOCKS];
     __shared__ uint8_t smem_b_data[BUFFERS][OK_BLOCKS][OUTER_N * 16];
     __shared__ uint8_t smem_b_scale[BUFFERS][OK_BLOCKS][OUTER_N];
-    __shared__ float smem_c_data[OUTER_M][OUTER_N];
+    extern __shared__ float smem_c_raw[];
+    auto (&smem_c_data)[OUTER_M][OUTER_N] = *reinterpret_cast<float (*)[OUTER_M][OUTER_N]>(smem_c_raw);
 
-    // Zero-initialize shared memory accumulator
-    for (int i = tid; i < Lds::C_DATA_FLOATS; i += BLOCK_SIZE)
-        reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
+    typename Traits::acc_t reg_acc;
+    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+        reg_acc = Traits::zero_acc();
+    }
+
+    if constexpr (WARP_TILES_M * WARP_TILES_N > 1) {
+        for (int i = tid; i < Lds::C_DATA_FLOATS; i += BLOCK_SIZE)
+            reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
+    }
 
     // Load the first tile
     if constexpr (FUSE_A_QUANT) {
@@ -1192,7 +1237,7 @@ mfma_fp4_gemm_tiled(
         inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
             smem_a_data[buf], smem_a_scale[buf],
             smem_b_data[buf], smem_b_scale[buf],
-            warp_m, warp_n, lane, smem_c_data);
+            warp_m, warp_n, lane, smem_c_data, reg_acc);
 
         if constexpr (BUFFERS == 1 && WARPS > 1) {
             __syncthreads();
@@ -1221,14 +1266,18 @@ mfma_fp4_gemm_tiled(
     inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
         smem_a_data[buf], smem_a_scale[buf],
         smem_b_data[buf], smem_b_scale[buf],
-        warp_m, warp_n, lane, smem_c_data);
+        warp_m, warp_n, lane, smem_c_data, reg_acc);
 
-    if constexpr (WARPS > 1) {
-        __syncthreads();
+    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+        Traits::template store<M, N>(C, reg_acc,
+            outer_m + warp_m * IM, outer_n + warp_n * IN, lane);
+    } else {
+        if constexpr (WARPS > 1) {
+            __syncthreads();
+        }
+        store_c_from_smem<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
+            smem_c_data, C, outer_m, outer_n, tid);
     }
-
-    store_c_from_smem<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
-        smem_c_data, C, outer_m, outer_n, tid);
 }
 
 // =====================================================================
@@ -1472,9 +1521,15 @@ mfma_fp4_gemm_tiled_splitk_fused(
     __shared__ uint8_t smem_b_scale[BUFFERS][OK_BLOCKS][OUTER_N];
     __shared__ float smem_c_data[OUTER_M][OUTER_N];
 
-    // Zero-initialize shared memory accumulator
-    for (int i = tid; i < Lds::C_DATA_FLOATS; i += BLOCK_SIZE)
-        reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
+    typename Traits::acc_t reg_acc;
+    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+        reg_acc = Traits::zero_acc();
+    }
+
+    if constexpr (WARP_TILES_M * WARP_TILES_N > 1) {
+        for (int i = tid; i < Lds::C_DATA_FLOATS; i += BLOCK_SIZE)
+            reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
+    }
 
     // Load first tile: quantize A from BF16, load pre-quantized B
     {
@@ -1517,7 +1572,7 @@ mfma_fp4_gemm_tiled_splitk_fused(
         inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
             smem_a_data[buf], smem_a_scale[buf],
             smem_b_data[buf], smem_b_scale[buf],
-            warp_m, warp_n, lane, smem_c_data);
+            warp_m, warp_n, lane, smem_c_data, reg_acc);
 
         if constexpr (BUFFERS == 1 && WARPS > 1) __syncthreads();
 
@@ -1539,17 +1594,21 @@ mfma_fp4_gemm_tiled_splitk_fused(
         inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
             smem_a_data[last_buf], smem_a_scale[last_buf],
             smem_b_data[last_buf], smem_b_scale[last_buf],
-            warp_m, warp_n, lane, smem_c_data);
+            warp_m, warp_n, lane, smem_c_data, reg_acc);
     }
 
-    if constexpr (WARPS > 1) {
-        __syncthreads();
+    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+        float* ws = workspace + split_id * M * N;
+        Traits::template store_f32<N>(ws, reg_acc,
+            outer_m + warp_m * IM, outer_n + warp_n * IN, lane);
+    } else {
+        if constexpr (WARPS > 1) {
+            __syncthreads();
+        }
+        float* ws = workspace + split_id * M * N;
+        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
+            smem_c_data, ws, outer_m, outer_n, tid);
     }
-
-    // Write fp32 partials to workspace from shared memory
-    float* ws = workspace + split_id * M * N;
-    store_c_from_smem_f32< M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
-        smem_c_data, ws, outer_m, outer_n, tid);
 }
 
 template <int WARPS, int M, int N, int K,
@@ -2046,16 +2105,17 @@ void launch_tiled(torch::Tensor A_bf16,
     if (do_profile) (void)hipEventRecord(e1);
 
     constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+    constexpr size_t smem_c_bytes = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
     dim3 block(WARPS * 64);
     mfma_fp4_gemm_tiled<WARPS,M,N,K,NUM_BLOCKS,OM,ON,OK,IM,IN,IK,WTM,WTN,false,BUFFERS,OCCUPANCY>
-        <<<grid, block>>>(
+        <<<grid, block, smem_c_bytes>>>(
+        reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()), // unused
         reinterpret_cast<const uint8_t(*)[K_HALF]>(A_data_buf.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t(*)[NUM_BLOCKS]>(A_scale_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
-        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()),
-        nullptr);
+        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()));
 
     if (do_profile) {
         (void)hipEventRecord(e2);
@@ -2088,12 +2148,12 @@ void launch_tiled_fused(torch::Tensor A_bf16, torch::Tensor B,
     dim3 block(WARPS * 64);
     mfma_fp4_gemm_tiled<WARPS,M,N,K,NUM_BLOCKS,OM,ON,OK,IM,IN,IK,WTM,WTN,true,BUFFERS,OCCUPANCY>
         <<<grid, block>>>(
-        nullptr,
+        reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
+        reinterpret_cast<const uint8_t(*)[K / 2]>((const void*)0),
         reinterpret_cast<const uint8_t(*)[K / 2]>(B.data_ptr()),
-        nullptr,
+        reinterpret_cast<const uint8_t(*)[NUM_BLOCKS]>((const void*)0),
         reinterpret_cast<const uint8_t*>(Bs.data_ptr()),
-        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()),
-        reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()));
+        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()));
 }
 
 template <int M, int N, int K,
@@ -2477,7 +2537,21 @@ void mfma_gemm(
     //S32(256, 3072, 1536, 1, 2) --> 21.6
     //T(256, 3072, 1536, 32, 64, 1536, 32, 32, 64, 1, 1, 1) --> 34.3
     //T(256, 3072, 1536, 64, 64, 768, 32, 32, 64, 1, 1, 2) --> 39.2
-    S32(256, 3072, 1536, 1, 1)
+    //T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 2, 2, 1) --> 70.8
+    //T(256, 3072, 1536, 64, 64, 256, 32, 32, 64, 2, 2, 1) --> 84.2
+    //F(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 2, 2, 1) --> 95.8
+    //T(256, 3072, 1536, 128, 64, 128, 32, 32, 64, 4, 2, 1) --> 125
+    //T(256, 3072, 1536, 64, 64, 512, 32, 32, 64, 2, 2, 1) --> 92.3
+    //S32(256, 3072, 1536, 1, 1)
+    //T(256, 3072, 1536, 32, 32, 1536, 32, 32, 64, 1, 1, 1) -> 26.8
+    //T(256, 3072, 1536, 32, 32, 128, 32, 32, 64, 1, 1, 1)
+    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //--> 17.1
+    //T(256, 3072, 1536, 64, 64, 256, 32, 32, 64, 1, 1, 1) --> 35.4
+    //T(256, 3072, 1536, 64, 64, 512, 32, 32, 64, 1, 1, 1) --> 41.1
+    //T(256, 3072, 1536, 64, 64, 768, 32, 32, 64, 1, 1, 1) --> 36.6
+    //T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 2) --> 18.6
+    //T(256, 3072, 1536, 64, 32, 128, 32, 32, 64, 1, 1, 1) --> 33.7
+    //T(256, 3072, 1536, 64, 96, 128, 32, 32, 64, 1, 1, 1) --> 18.3
 
     // Simple 16x16x128
     SF16(4,  2880, 512, 1, 1)
@@ -2490,7 +2564,12 @@ void mfma_gemm(
     //S16(64, 7168, 2048, 1, 2) --> 20.4
     //SK(64, 7168, 2048, 16, 16, 128, 1, 1, 2) --> 22.8
     //SKF(64, 7168, 2048, 16, 16, 128, 1, 1, 2) --> 30.2
-    S16(64, 7168, 2048, 1, 1)
+    //T(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 1) --> 23.0
+    //TSK(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 2, 1, -1) --> 23.9
+    TSK(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 4, 1, -1) //--> 21.6
+    //T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 2, 1, 1) --> 70.0
+    //T(64, 7168, 2048, 64, 128, 128, 16, 16, 128, 2, 2, 2) --> 25.7
+    //S16(64, 7168, 2048, 1, 1)
 
     // Tiled fused
     //F2(32, 4096, 512, 32, 32, 512, 16, 16, 128, 1, 1, 1, 1)

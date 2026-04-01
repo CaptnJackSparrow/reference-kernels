@@ -244,6 +244,24 @@ __device__ __forceinline__ E8M0Scale compute_e8m0_scale(hip_bfloat16 amax_bf16) 
     return result;
 }
 
+// E8M0 scale computation from FP32 amax (avoids BF16 intermediate)
+__device__ __forceinline__ E8M0Scale compute_e8m0_scale_f32(float amax) {
+    E8M0Scale result;
+    uint32_t amax_bits = __float_as_uint(amax);
+    if ((amax_bits & 0x7FFFFFFFu) == 0) {
+        result.e8m0 = 0;
+        result.quant_scale = 0.0f;
+    } else {
+        // Round mantissa up to nearest power of 2 (same logic as BF16 but for FP32)
+        // FP32: [sign(1)][exp(8)][mant(23)], round bit at position 22
+        uint32_t rounded = (amax_bits + 0x00400000u) & 0xFF800000u;
+        int raw_exp = (int)((rounded >> 23) & 0xFF);
+        result.e8m0 = E8M0_LUT[raw_exp];
+        result.quant_scale = __uint_as_float(QUANT_SCALE_RECIP_LUT[result.e8m0]);
+    }
+    return result;
+}
+
 // Hardware FP4 conversion from BF16: converts 2 BF16 values to packed FP4 byte.
 __device__ __forceinline__ uint8_t quantize_fp4_pair_hw_bf16(
     hip_bfloat16 v0, hip_bfloat16 v1, float quant_scale
@@ -252,6 +270,14 @@ __device__ __forceinline__ uint8_t quantize_fp4_pair_hw_bf16(
     bf16x2 pair = {v0.data, v1.data};
     union { uint32_t u32; uint8_t u8[4]; } cvt = {0};
     cvt.u32 = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(cvt.u32, pair, quant_scale, 0);
+    return cvt.u8[0];
+}
+
+// Hardware FP4 conversion from FP32: converts 2 FP32 values to packed FP4 byte.
+__device__ __forceinline__ uint8_t quantize_fp4_pair_hw(float v0, float v1, float quant_scale) {
+    union { uint32_t u32; uint8_t u8[4]; } cvt = {0};
+    cvt.u32 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(
+        cvt.u32, v0, v1, quant_scale, 0);
     return cvt.u8[0];
 }
 
@@ -279,22 +305,37 @@ __device__ __forceinline__ QuantBlock quantize_fp4_block_bf16(const hip_bfloat16
 }
 
 // Quantize 32 float values to packed FP4 + E8M0 scale.
-// Converts to BF16 first and uses the BF16 hw intrinsic path (matching mxfp4-mm).
+// Uses FP32 hw intrinsic directly (no BF16 intermediate).
 __device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
-    hip_bfloat16 bvals[32];
+    // Find amax in FP32
+    float amax = 0.0f;
     for (int i = 0; i < 32; i++) {
-        bvals[i] = hip_bfloat16(vals[i]);
+        float a = fabsf(vals[i]);
+        amax = (a > amax) ? a : amax;
     }
-    return quantize_fp4_block_bf16(bvals);
+
+    E8M0Scale sc = compute_e8m0_scale_f32(amax);
+
+    uint32_t pack[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 16; i++) {
+        uint8_t packed = quantize_fp4_pair_hw(vals[2*i], vals[2*i+1], sc.quant_scale);
+        pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
+    }
+
+    QuantBlock result;
+    *reinterpret_cast<uint128_vec*>(&result.data) = *reinterpret_cast<uint128_vec*>(&pack);
+    result.e8m0 = sc.e8m0;
+    return result;
 }
 
 template <int M, int K, int K_HALF, int NUM_BLOCKS, int BATCH_SIZE, int BLOCK_SIZE>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_quant_q_batched_kernel(
-    const hip_bfloat16* __restrict__ Q,
-    uint8_t* __restrict__ out_data,
+    const hip_bfloat16 Q[][K],
+    uint8_t out_data[][NUM_BLOCKS * 16],
     uint8_t* __restrict__ out_scale
 ) {
+    constexpr int A_K_HALF = NUM_BLOCKS * 16;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int per_batch = M * NUM_BLOCKS;
     int batch_idx = gid / per_batch;
@@ -305,11 +346,9 @@ void mla_quant_q_batched_kernel(
     int blk = local_id % NUM_BLOCKS;
     if (row >= M) return;
 
-    QuantBlock qb = quantize_fp4_block_bf16(&Q[(batch_idx * M + row) * K + blk * 32]);
+    QuantBlock qb = quantize_fp4_block_bf16(&Q[batch_idx * M + row][blk * 32]);
 
-    constexpr int A_K_HALF = NUM_BLOCKS * 16;
-    int data_off = (batch_idx * M + row) * A_K_HALF + blk * 16;
-    *reinterpret_cast<uint128_vec*>(&out_data[data_off]) =
+    *reinterpret_cast<uint128_vec*>(&out_data[batch_idx * M + row][blk * 16]) =
         *reinterpret_cast<uint128_vec*>(&qb.data);
     out_scale[batch_idx * NUM_BLOCKS * M + row + blk * M] = qb.e8m0;
 }
@@ -906,11 +945,11 @@ template <int M, int N, int K_HALF, int NUM_BLOCKS, int B_SCALE_STRIDE,
           int A_K_HALF, int BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_SIZE)
 mla_qkt_mxfp4_kernel(
-    const uint8_t* __restrict__ A_data,
-    const uint8_t* __restrict__ B_data,
+    const uint8_t A_data[][A_K_HALF],
+    const uint8_t B_data[][K_HALF],
     const uint8_t* __restrict__ A_scale,
-    const uint8_t* __restrict__ B_scale,
-    float* __restrict__ C,
+    const uint8_t B_scale[][B_SCALE_STRIDE],
+    float C[][N],
     float sm_scale
 ) {
     constexpr int IM = 16;
@@ -923,61 +962,59 @@ mla_qkt_mxfp4_kernel(
     const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.z);
     const int tile_n = __builtin_amdgcn_readfirstlane(blockIdx.y * IN);
 
-    const uint8_t* a_data = A_data + batch_idx * M * A_K_HALF;
-    const uint8_t* a_scale = A_scale + batch_idx * (NUM_BLOCKS * M);
-    const uint8_t* b_data = B_data + batch_idx * N * K_HALF;
-    const uint8_t* b_scale = B_scale + batch_idx * N * B_SCALE_STRIDE;
-    float* c_out = C + batch_idx * M * N;
-
     float4_t acc = {};
 
     uint32_t a_cur[8], b_cur[8];
     uint32_t a_nxt[8], b_nxt[8];
     int32_t a_sc_cur, b_sc_cur, a_sc_nxt, b_sc_nxt;
 
-    // Helper: safe load tile - clamps OOB block reads
-    auto load_safe = [&](const uint8_t* src, int row_base, int blk0,
-                         int stride, int max_rows, int max_blks,
-                         uint32_t reg[8], int& blk_out, int& row_out,
-                         const uint8_t* scale_src, int scale_stride, bool is_col_major_scale,
-                         int scale_M, int32_t& sc_out) {
+    // Helper: safe load tile data - clamps OOB block reads (2D array version)
+    auto load_tile = [&](auto src, int row_base, int blk0,
+                         int max_rows, int max_blks,
+                         uint32_t reg[8], int& blk_out, int& row_out) {
         row_out = row_base + (lane % IM);
         int k_group = lane / IM;
         blk_out = blk0 + k_group;
 
-        // Clamp to safe range
         int safe_row = min(row_out, max(max_rows - 1, 0));
         int safe_blk = min(blk_out, max(max_blks - 1, 0));
-        int off = safe_row * stride + safe_blk * 16;
-        *reinterpret_cast<uint128_vec*>(&reg[0]) = *reinterpret_cast<const uint128_vec*>(&src[off]);
+        *reinterpret_cast<uint128_vec*>(&reg[0]) =
+            *reinterpret_cast<const uint128_vec*>(&src[safe_row][safe_blk * 16]);
         reg[4] = reg[5] = reg[6] = reg[7] = 0;
 
-        uint8_t e = 127;
-        if (row_out < max_rows && blk_out < max_blks) {
-            if (is_col_major_scale)
-                e = scale_src[row_out + blk_out * scale_M];
-            else
-                e = scale_src[row_out * scale_stride + blk_out];
-        } else {
+        if (!(row_out < max_rows && blk_out < max_blks)) {
             reg[0] = reg[1] = reg[2] = reg[3] = 0;
         }
-        sc_out = mla_broadcast_scale(e);
+    };
+
+    // Scale helpers: A_scale is col-major (flat), B_scale is row-major (2D)
+    auto get_a_scale = [&](int row, int blk) -> int32_t {
+        uint8_t e = 127;
+        if (row < M && blk < NUM_BLOCKS)
+            e = A_scale[batch_idx * NUM_BLOCKS * M + row + blk * M];
+        return mla_broadcast_scale(e);
+    };
+    auto get_b_scale = [&](int row, int blk) -> int32_t {
+        uint8_t e = 127;
+        if (row < N && blk < NUM_BLOCKS)
+            e = B_scale[batch_idx * N + row][blk];
+        return mla_broadcast_scale(e);
     };
 
     // Load first K tile
     int a_row, a_blk, b_row, b_blk;
-    load_safe(a_data, 0, 0, A_K_HALF, M, NUM_BLOCKS, a_cur, a_blk, a_row,
-              a_scale, 0, true, M, a_sc_cur);
-    load_safe(b_data, tile_n, 0, K_HALF, N, NUM_BLOCKS, b_cur, b_blk, b_row,
-              b_scale, B_SCALE_STRIDE, false, 0, b_sc_cur);
+    load_tile(&A_data[batch_idx * M], 0, 0, M, NUM_BLOCKS, a_cur, a_blk, a_row);
+    a_sc_cur = get_a_scale(a_row, a_blk);
+    load_tile(&B_data[batch_idx * N], tile_n, 0, N, NUM_BLOCKS, b_cur, b_blk, b_row);
+    b_sc_cur = get_b_scale(b_row, b_blk);
 
     for (int ki = 0; ki < K_ITERS; ki++) {
         if (ki + 1 < K_ITERS) {
             int next_blk0 = (ki + 1) * BPC;
-            load_safe(a_data, 0, next_blk0, A_K_HALF, M, NUM_BLOCKS, a_nxt, a_blk, a_row,
-                      a_scale, 0, true, M, a_sc_nxt);
-            load_safe(b_data, tile_n, next_blk0, K_HALF, N, NUM_BLOCKS, b_nxt, b_blk, b_row,
-                      b_scale, B_SCALE_STRIDE, false, 0, b_sc_nxt);
+            load_tile(&A_data[batch_idx * M], 0, next_blk0, M, NUM_BLOCKS, a_nxt, a_blk, a_row);
+            a_sc_nxt = get_a_scale(a_row, a_blk);
+            load_tile(&B_data[batch_idx * N], tile_n, next_blk0, N, NUM_BLOCKS, b_nxt, b_blk, b_row);
+            b_sc_nxt = get_b_scale(b_row, b_blk);
         }
 
         // 16x16x128 MFMA FP4
@@ -999,7 +1036,7 @@ mla_qkt_mxfp4_kernel(
         int row = i + 4 * quad;
         int gn = tile_n + col;
         if (row < M && gn < N)
-            c_out[row * N + gn] = acc[i] * sm_scale;
+            C[batch_idx * M + row][gn] = acc[i] * sm_scale;
     }
 }
 
@@ -1136,7 +1173,7 @@ void mla_attn_v_reduce_kernel(
 template <int N, int BLOCK_SIZE>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_softmax_2pass_kernel(
-    float* __restrict__ data,    // (batch, 16, N) - in-place: pre-scaled scores in, attn weights out
+    float data[][N],    // (batch, 16, N) - in-place: pre-scaled scores in, attn weights out
     int dummy
 ) {
     constexpr int THREADS = BLOCK_SIZE;
@@ -1147,15 +1184,14 @@ void mla_softmax_2pass_kernel(
     const int lane = tid & 63;
     const int warp_id = tid >> 6;
 
-    const int64_t row_offset = __builtin_amdgcn_readfirstlane(((int64_t)batch_idx * 16 + head_idx) * N);
-    float* row = data + row_offset;
+    const int row_idx = batch_idx * 16 + head_idx;
 
     __shared__ float smem[4];  // 4 warps
 
     // ---- Pass 1a: Find max ----
     float local_max = -INFINITY;
     for (int i = tid; i < N; i += THREADS) {
-        local_max = fmaxf(local_max, row[i]);
+        local_max = fmaxf(local_max, data[row_idx][i]);
     }
 
     for (int offset = 32; offset > 0; offset >>= 1)
@@ -1176,8 +1212,8 @@ void mla_softmax_2pass_kernel(
     // ---- Pass 1b: Compute exp(val - max), write back, accumulate sum ----
     float local_sum = 0.0f;
     for (int i = tid; i < N; i += THREADS) {
-        float e = expf(row[i] - global_max);
-        row[i] = e;
+        float e = expf(data[row_idx][i] - global_max);
+        data[row_idx][i] = e;
         local_sum += e;
     }
 
@@ -1198,7 +1234,7 @@ void mla_softmax_2pass_kernel(
 
     // ---- Pass 2: Normalize ----
     for (int i = tid; i < N; i += THREADS) {
-        row[i] *= inv_sum;
+        data[row_idx][i] *= inv_sum;
     }
 }
 
@@ -1356,13 +1392,13 @@ void mla_attn_v_splitk_lds_v2_kernel(
 // Thread mapping: 256 threads, each handles 2 V dims x 16 heads = 32 accumulators
 // =============================================================================
 
-template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS>
+template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS, bool PROFILE_PHASES = false>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_attn_v_splitk_head_merged_kernel(
-    const float* __restrict__ attn_weights,  // (batch, 16, N)
-    const uint8_t* __restrict__ kv_mxfp4,    // (batch * N, 288)
-    const uint8_t* __restrict__ kv_scale,    // (batch * N, B_SCALE_STRIDE)
-    float* __restrict__ partial_out           // (batch, KV_SPLITS, 16, 512)
+    const float attn_weights[][N],               // (batch * 16, N)
+    const uint8_t kv_mxfp4[][288],               // (batch * N, 288)
+    const uint8_t kv_scale[][B_SCALE_STRIDE],    // (batch * N, B_SCALE_STRIDE)
+    float partial_out[][16 * 512]                  // (batch * KV_SPLITS, 16 * 512)
 ) {
     constexpr int V_DIM = 512;
     constexpr int KV_BYTES_PER_ROW = 288;
@@ -1380,9 +1416,19 @@ void mla_attn_v_splitk_head_merged_kernel(
     const int kv_start_global = split_idx * KV_PER_SPLIT;
     const int kv_end_global = min(kv_start_global + KV_PER_SPLIT, N);
 
+    // Per-phase profiling (block 0 only, enabled via PROFILE_PHASES template flag)
+    [[maybe_unused]] const bool is_timer_block = PROFILE_PHASES && (blockIdx.x == 0 && blockIdx.y == 0);
+    [[maybe_unused]] uint64_t t_start = 0, t_load_total = 0, t_compute_total = 0, t_store = 0;
+    [[maybe_unused]] uint64_t t_dequant_total = 0, t_fma_total = 0;
+    [[maybe_unused]] uint64_t t_phase = 0;
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0)
+            t_start = __builtin_amdgcn_s_memrealtime();
+    }
+
     // Output layout: (batch, KV_SPLITS, 16, 512)
-    // Base offset for this (batch, split)
-    const int64_t out_base = __builtin_amdgcn_readfirstlane(((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM);
+    // Row index for this (batch, split)
+    const int out_row = __builtin_amdgcn_readfirstlane(batch_idx * KV_SPLITS + split_idx);
 
     // Each thread handles 2 adjacent V dimensions across all 16 heads
     const int v_dim0 = tid * 2;
@@ -1400,23 +1446,27 @@ void mla_attn_v_splitk_head_merged_kernel(
     if (kv_start_global >= N) {
         // Zero output for OOB splits
         for (int h = 0; h < HEADS; h++) {
-            partial_out[out_base + (int64_t)h * V_DIM + v_dim0] = 0.0f;
-            partial_out[out_base + (int64_t)h * V_DIM + v_dim1] = 0.0f;
+            partial_out[out_row][(int64_t)h * V_DIM + v_dim0] = 0.0f;
+            partial_out[out_row][(int64_t)h * V_DIM + v_dim1] = 0.0f;
         }
         return;
     }
 
     // LDS layout
-    __shared__ uint8_t kv_tile[KV_TILE * V_BYTES];          // 16 KB
-    __shared__ uint8_t scale_tile[KV_TILE * V_SCALES];       // 1 KB
-    __shared__ float attn_cache[HEADS * KV_TILE];             // 4 KB
+    __shared__ uint8_t kv_tile[KV_TILE][V_BYTES];          // 16 KB
+    __shared__ uint8_t scale_tile[KV_TILE][V_SCALES];       // 1 KB
+    __shared__ float attn_cache[HEADS][KV_TILE];             // 4 KB
 
-    const int64_t kv_base = (int64_t)batch_idx * N * KV_BYTES_PER_ROW;
-    const int64_t sc_base = (int64_t)batch_idx * N * B_SCALE_STRIDE;
+    const int kv_row_base = batch_idx * N;
 
     for (int kv_start = kv_start_global; kv_start < kv_end_global; kv_start += KV_TILE) {
         const int tile_end = min(kv_start + KV_TILE, kv_end_global);
         const int tile_size = tile_end - kv_start;
+
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0)
+                t_phase = __builtin_amdgcn_s_memrealtime();
+        }
 
         // ---- Cooperative load: KV data (V portion only: first 256 bytes) ----
         {
@@ -1425,10 +1475,8 @@ void mla_attn_v_splitk_head_merged_kernel(
                 const int row = i / (V_BYTES / 16);  // V_BYTES/16 = 16
                 const int vec_in_row = i % (V_BYTES / 16);
                 const int kv_idx = kv_start + row;
-                const int64_t src_off = kv_base + (int64_t)kv_idx * KV_BYTES_PER_ROW + vec_in_row * 16;
-                const int dst_off = row * V_BYTES + vec_in_row * 16;
-                *reinterpret_cast<uint128_vec*>(&kv_tile[dst_off]) =
-                    *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[src_off]);
+                *reinterpret_cast<uint128_vec*>(&kv_tile[row][vec_in_row * 16]) =
+                    *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[kv_row_base + kv_idx][vec_in_row * 16]);
             }
         }
 
@@ -1439,8 +1487,8 @@ void mla_attn_v_splitk_head_merged_kernel(
                 const int row = i / V_SCALES;
                 const int blk = i % V_SCALES;
                 const int kv_idx = kv_start + row;
-                scale_tile[row * V_SCALES + blk] =
-                    kv_scale[sc_base + (int64_t)kv_idx * B_SCALE_STRIDE + blk];
+                scale_tile[row][blk] =
+                    kv_scale[kv_row_base + kv_idx][blk];
             }
         }
 
@@ -1451,37 +1499,82 @@ void mla_attn_v_splitk_head_merged_kernel(
             for (int i = tid; i < total_attn; i += THREADS) {
                 const int h = i / tile_size;
                 const int ki = i % tile_size;
-                attn_cache[h * KV_TILE + ki] =
-                    attn_weights[((int64_t)batch_idx * HEADS + h) * N + kv_start + ki];
+                attn_cache[h][ki] =
+                    attn_weights[batch_idx * HEADS + h][kv_start + ki];
             }
         }
 
         __syncthreads();
 
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                t_load_total += t_now - t_phase;
+                t_phase = t_now;
+            }
+        }
+
         // ---- Compute: for each KV position, load V data once, apply to all heads ----
         for (int ki = 0; ki < tile_size; ki++) {
             // Load and dequantize V value ONCE (shared across all heads)
             const float block_scale = e8m0_to_float_fast(
-                scale_tile[ki * V_SCALES + v_block]);
-            const uint8_t packed = kv_tile[ki * V_BYTES + v_byte_offset];
+                scale_tile[ki][v_block]);
+            const uint8_t packed = kv_tile[ki][v_byte_offset];
             const float v_val0 = FP4_E2M1_LUT[packed & 0x0F] * block_scale;
             const float v_val1 = FP4_E2M1_LUT[(packed >> 4) & 0x0F] * block_scale;
 
             // Apply to all 16 heads (each head has different attn weight)
             for (int h = 0; h < HEADS; h++) {
-                const float w = attn_cache[h * KV_TILE + ki];
+                const float w = attn_cache[h][ki];
                 acc[h * 2]     += w * v_val0;
                 acc[h * 2 + 1] += w * v_val1;
+            }
+
+            // Sample first iteration to estimate dequant vs fma split
+            if constexpr (PROFILE_PHASES) {
+                if (is_timer_block && tid == 0 && ki == 0) {
+                    uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                    t_dequant_total += t_now - t_phase;  // first iter total (dequant+fma)
+                }
+            }
+        }
+
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                t_fma_total += t_now - t_phase;  // full loop time
+                t_compute_total += t_now - t_phase;
+                // t_dequant_total = sample of 1st iter (dequant+fma)
+                // t_fma_total = full loop. Per-iter cost ~ t_fma_total / tile_size
             }
         }
 
         __syncthreads();
     }
 
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0)
+            t_phase = __builtin_amdgcn_s_memrealtime();
+    }
+
     // Write partial output: (batch, KV_SPLITS, 16, 512)
     for (int h = 0; h < HEADS; h++) {
-        partial_out[out_base + (int64_t)h * V_DIM + v_dim0] = acc[h * 2];
-        partial_out[out_base + (int64_t)h * V_DIM + v_dim1] = acc[h * 2 + 1];
+        partial_out[out_row][(int64_t)h * V_DIM + v_dim0] = acc[h * 2];
+        partial_out[out_row][(int64_t)h * V_DIM + v_dim1] = acc[h * 2 + 1];
+    }
+
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0) {
+            t_store = __builtin_amdgcn_s_memrealtime() - t_phase;
+            uint64_t t_total = __builtin_amdgcn_s_memrealtime() - t_start;
+            printf("[AttnV HM] N=%d splits=%d | load=%llu dequant=%llu fma=%llu store=%llu total=%llu cycles",
+                   N, KV_SPLITS,
+                   (unsigned long long)t_load_total,
+                   (unsigned long long)t_dequant_total,
+                   (unsigned long long)t_fma_total,
+                   (unsigned long long)t_store,
+                   (unsigned long long)t_total);
+        }
     }
 }
 
@@ -1500,13 +1593,13 @@ void mla_attn_v_splitk_head_merged_kernel(
 // Attention weights quantized once per tile, reused across all V-dim chunks.
 // =============================================================================
 
-template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS>
+template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS, bool PROFILE_PHASES = false>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_attn_v_mfma_head_merged_kernel(
-    const float* __restrict__ attn_weights,  // (batch, 16, N) post-softmax
-    const uint8_t* __restrict__ kv_mxfp4,    // (batch * N, 288) packed KV
-    const uint8_t* __restrict__ kv_scale,    // (batch * N, B_SCALE_STRIDE) E8M0
-    float* __restrict__ partial_out           // (batch, KV_SPLITS, 16, 512)
+    const float attn_weights[][N],               // (batch * 16, N) post-softmax
+    const uint8_t kv_mxfp4[][288],               // (batch * N, 288) packed KV
+    const uint8_t kv_scale[][B_SCALE_STRIDE],    // (batch * N, B_SCALE_STRIDE) E8M0
+    float partial_out[][16 * 512]                  // (batch * KV_SPLITS, 16 * 512)
 ) {
     constexpr int V_DIM = 512;
     constexpr int KV_BYTES_PER_ROW = 288;
@@ -1531,29 +1624,22 @@ void mla_attn_v_mfma_head_merged_kernel(
     const int kv_start_global = __builtin_amdgcn_readfirstlane(split_idx * KV_PER_SPLIT);
     const int kv_end_global = __builtin_amdgcn_readfirstlane(min(kv_start_global + KV_PER_SPLIT, N));
 
-    const int64_t out_base = __builtin_amdgcn_readfirstlane(((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM);
+    // Per-phase profiling (block 0 only, enabled via PROFILE_PHASES template flag)
+    [[maybe_unused]] const bool is_timer_block = PROFILE_PHASES && (blockIdx.x == 0 && blockIdx.y == 0);
+    [[maybe_unused]] uint64_t t_start = 0, t_load_total = 0, t_compute_total = 0, t_store = 0;
+    [[maybe_unused]] uint64_t t_scale_quant_total = 0, t_gather_total = 0, t_mfma_total = 0;
+    [[maybe_unused]] uint64_t t_phase = 0;
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0)
+            t_start = __builtin_amdgcn_s_memrealtime();
+    }
 
-    // ======================================================================
-    // Scale-absorption MFMA: absorb per-position V scales into A operand
-    //
-    // output[h,v] = sum_k attn[h,k] * (FP4_nib[k,v] * v_scale[k,v_block])
-    //             = sum_k (attn[h,k] * v_scale[k,v_block]) * FP4_nib[k,v]
-    //
-    // A operand = quantize_fp4(attn[h,k] * v_scale[k,v_block]) per-lane
-    // B operand = raw V FP4 nibbles, scale = 1.0 (E8M0=127)
-    // No V dequant/requant. A computed in registers per-lane.
-    // Adjacent chunks share V-scale-block -> quantize A once per pair.
-    // Only 1 syncthreads per tile.
-    //
-    // LDS (~43.5 KB, fits 3 blocks/CU at 160KB):
-    //   v_lds:       128 * 260 = 33,280 B (V data, padded stride)
-    //   v_scale_lds: 128 * 16  =  2,048 B (V scales)
-    //   attn_f32:    16 * 128  =  8,192 B (fp32 attn, all heads, 4B each)
-    // ======================================================================
+    const int out_row = __builtin_amdgcn_readfirstlane(batch_idx * KV_SPLITS + split_idx);
 
-    __shared__ uint8_t v_lds[KV_TILE * V_LDS_STRIDE];
-    __shared__ uint8_t v_scale_lds[KV_TILE * 16];
-    __shared__ float attn_f32[HEADS * KV_TILE];
+    // LDS arrays as 2D
+    __shared__ uint8_t v_lds[KV_TILE][V_LDS_STRIDE];
+    __shared__ uint8_t v_scale_lds[KV_TILE][16];
+    __shared__ float attn_f32[HEADS][KV_TILE];
 
     float4_t warp_acc[CHUNKS_PER_WARP];
     for (int c = 0; c < CHUNKS_PER_WARP; c++) {
@@ -1562,13 +1648,12 @@ void mla_attn_v_mfma_head_merged_kernel(
 
     if (kv_start_global >= N) {
         for (int i = tid; i < HEADS * V_DIM; i += THREADS) {
-            partial_out[out_base + i] = 0.0f;
+            partial_out[out_row][i] = 0.0f;
         }
         return;
     }
 
-    const int64_t kv_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * N * KV_BYTES_PER_ROW);
-    const int64_t sc_base = __builtin_amdgcn_readfirstlane((int64_t)batch_idx * N * B_SCALE_STRIDE);
+    const int kv_row_base = __builtin_amdgcn_readfirstlane(batch_idx * N);
 
     // MFMA lane indices (constant)
     const int a_row = lane % 16;   // head index for A
@@ -1583,15 +1668,20 @@ void mla_attn_v_mfma_head_merged_kernel(
         const int tile_end = min(kv_start + KV_TILE, kv_end_global);
         const int tile_size = tile_end - kv_start;
 
-        // ---- Cooperative load: V data (padded stride) ----
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0)
+                t_phase = __builtin_amdgcn_s_memrealtime();
+        }
+
+        // ---- Cooperative load: V data ----
         {
             const int total_vec = tile_size * 16;
             for (int i = tid; i < total_vec; i += THREADS) {
                 const int row = i / 16;
                 const int vec = i % 16;
-                const int64_t src = kv_base + (int64_t)(kv_start + row) * KV_BYTES_PER_ROW + vec * 16;
-                *reinterpret_cast<uint128_vec*>(&v_lds[row * V_LDS_STRIDE + vec * 16]) =
-                    *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[src]);
+                const int g_row = kv_row_base + kv_start + row;
+                *reinterpret_cast<uint128_vec*>(&v_lds[row][vec * 16]) =
+                    *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[g_row][vec * 16]);
             }
         }
 
@@ -1601,8 +1691,7 @@ void mla_attn_v_mfma_head_merged_kernel(
             for (int i = tid; i < total_sc; i += THREADS) {
                 const int row = i / 16;
                 const int blk = i % 16;
-                v_scale_lds[row * 16 + blk] =
-                    kv_scale[sc_base + (int64_t)(kv_start + row) * B_SCALE_STRIDE + blk];
+                v_scale_lds[row][blk] = kv_scale[kv_row_base + kv_start + row][blk];
             }
         }
 
@@ -1612,18 +1701,25 @@ void mla_attn_v_mfma_head_merged_kernel(
             for (int i = tid; i < total_attn; i += THREADS) {
                 const int h = i / tile_size;
                 const int k = i % tile_size;
-                attn_f32[h * KV_TILE + k] =
-                    attn_weights[((int64_t)batch_idx * HEADS + h) * N + kv_start + k];
+                attn_f32[h][k] = attn_weights[batch_idx * HEADS + h][kv_start + k];
             }
             // Zero-fill unused portion
             for (int i = tid; i < HEADS * (KV_TILE - tile_size); i += THREADS) {
                 const int h = i / (KV_TILE - tile_size);
                 const int k = tile_size + i % (KV_TILE - tile_size);
-                attn_f32[h * KV_TILE + k] = 0.0f;
+                attn_f32[h][k] = 0.0f;
             }
         }
 
         __syncthreads();
+
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                t_load_total += t_now - t_phase;
+                t_phase = t_now;
+            }
+        }
 
         // ---- Per-warp MFMA: each warp processes 8 chunks (4 V-scale-blocks x 2 chunks) ----
         // Warp 0: chunks 0-7 (V dims 0-127, V-scale-blocks 0-3)
@@ -1640,9 +1736,8 @@ void mla_attn_v_mfma_head_merged_kernel(
             const int k_base_a = a_kgrp * 32;
             float scaled_attn[32];
             for (int j = 0; j < 32; j++) {
-                const float aw = attn_f32[a_row * KV_TILE + k_base_a + j];
-                const float vs = e8m0_to_float_fast(
-                    v_scale_lds[(k_base_a + j) * 16 + vscale_blk]);
+                const float aw = attn_f32[a_row][k_base_a + j];
+                const float vs = e8m0_to_float_fast(v_scale_lds[k_base_a + j][vscale_blk]);
                 scaled_attn[j] = aw * vs;
             }
             QuantBlock aqb = quantize_fp4_block(scaled_attn);
@@ -1656,70 +1751,116 @@ void mla_attn_v_mfma_head_merged_kernel(
             int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
                               (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
 
-            // ---- Chunk 0: gather B, execute MFMA ----
-            {
-                const int v_d = chunk0 * 16 + b_col;
-                const int v_byte = v_d / 2;
-                const int v_nib_shift = (v_d & 1) * 4;
-                const int k_base_b = b_kgrp * 32;
-
-                uint8_t packed[16];
-                for (int j = 0; j < 16; j++) {
-                    const int k0 = k_base_b + j * 2;
-                    const int k1 = k_base_b + j * 2 + 1;
-                    uint8_t n0 = (k0 < tile_size) ?
-                        ((v_lds[k0 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
-                    uint8_t n1 = (k1 < tile_size) ?
-                        ((v_lds[k1 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
-                    packed[j] = n0 | (n1 << 4);
+            if constexpr (PROFILE_PHASES) {
+                if (is_timer_block && tid == 0) {
+                    uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                    t_scale_quant_total += t_now - t_phase;
+                    t_phase = t_now;
                 }
-
-                uint32_t b_reg[8];
-                *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
-                    *reinterpret_cast<uint128_vec*>(&packed[0]);
-                b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
-
-                int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                                  (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
-                warp_acc[ci] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                    a_vec, b_vec, warp_acc[ci],
-                    FMT_FP4_MFMA, FMT_FP4_MFMA,
-                    0, a_sc, 0, b_sc_one);
             }
 
-            // ---- Chunk 1: gather B, execute MFMA (same A operand) ----
+            // ---- Gather B for both sub-chunks + execute MFMA ----
+            // Both sub-chunks access bytes within chunk0*8..chunk0*8+15 (16 contiguous bytes).
+            // Load 16 bytes per k-position once, extract both sub-chunks' nibbles from registers.
             {
-                const int v_d = (chunk0 + 1) * 16 + b_col;
-                const int v_byte = v_d / 2;
-                const int v_nib_shift = (v_d & 1) * 4;
                 const int k_base_b = b_kgrp * 32;
+                // sub=0: v_d0 = chunk0*16 + b_col, byte_off0 = v_d0/2 - chunk0*8 = b_col/2
+                // sub=1: v_d1 = (chunk0+1)*16 + b_col, byte_off1 = v_d1/2 - chunk0*8 = 8 + b_col/2
+                const int v_d0 = chunk0 * 16 + b_col;
+                const int v_d1 = (chunk0 + 1) * 16 + b_col;
+                const int nib_shift0 = (v_d0 & 1) * 4;
+                const int nib_shift1 = (v_d1 & 1) * 4;
+                const int local_off0 = b_col / 2;        // 0..7
+                const int local_off1 = 8 + b_col / 2;    // 8..15
+                const int lds_byte_base = chunk0 * 8;     // aligned start for 16-byte range
 
-                uint8_t packed[16];
+                uint8_t packed0[16], packed1[16];
+
                 for (int j = 0; j < 16; j++) {
                     const int k0 = k_base_b + j * 2;
                     const int k1 = k_base_b + j * 2 + 1;
-                    uint8_t n0 = (k0 < tile_size) ?
-                        ((v_lds[k0 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
-                    uint8_t n1 = (k1 < tile_size) ?
-                        ((v_lds[k1 * V_LDS_STRIDE + v_byte] >> v_nib_shift) & 0x0F) : 0;
-                    packed[j] = n0 | (n1 << 4);
+
+                    uint8_t raw0_s0 = 0, raw0_s1 = 0;
+                    if (k0 < tile_size) {
+                        raw0_s0 = v_lds[k0][lds_byte_base + local_off0];
+                        raw0_s1 = v_lds[k0][lds_byte_base + local_off1];
+                    }
+
+                    uint8_t raw1_s0 = 0, raw1_s1 = 0;
+                    if (k1 < tile_size) {
+                        raw1_s0 = v_lds[k1][lds_byte_base + local_off0];
+                        raw1_s1 = v_lds[k1][lds_byte_base + local_off1];
+                    }
+
+                    // Extract nibbles and pack for sub=0
+                    uint8_t n0_s0 = (raw0_s0 >> nib_shift0) & 0x0F;
+                    uint8_t n1_s0 = (raw1_s0 >> nib_shift0) & 0x0F;
+                    packed0[j] = n0_s0 | (n1_s0 << 4);
+
+                    // Extract nibbles and pack for sub=1
+                    uint8_t n0_s1 = (raw0_s1 >> nib_shift1) & 0x0F;
+                    uint8_t n1_s1 = (raw1_s1 >> nib_shift1) & 0x0F;
+                    packed1[j] = n0_s1 | (n1_s1 << 4);
                 }
 
-                uint32_t b_reg[8];
-                *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
-                    *reinterpret_cast<uint128_vec*>(&packed[0]);
-                b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+                if constexpr (PROFILE_PHASES) {
+                    if (is_timer_block && tid == 0) {
+                        uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                        t_gather_total += t_now - t_phase;
+                        t_phase = t_now;
+                    }
+                }
 
-                int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                                  (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
-                warp_acc[ci + 1] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                    a_vec, b_vec, warp_acc[ci + 1],
-                    FMT_FP4_MFMA, FMT_FP4_MFMA,
-                    0, a_sc, 0, b_sc_one);
+                // MFMA for sub=0
+                {
+                    uint32_t b_reg[8];
+                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                        *reinterpret_cast<uint128_vec*>(&packed0[0]);
+                    b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+                    int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                      (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                    warp_acc[ci] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                        a_vec, b_vec, warp_acc[ci],
+                        FMT_FP4_MFMA, FMT_FP4_MFMA,
+                        0, a_sc, 0, b_sc_one);
+                }
+
+                // MFMA for sub=1
+                {
+                    uint32_t b_reg[8];
+                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                        *reinterpret_cast<uint128_vec*>(&packed1[0]);
+                    b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+                    int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                      (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                    warp_acc[ci + 1] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                        a_vec, b_vec, warp_acc[ci + 1],
+                        FMT_FP4_MFMA, FMT_FP4_MFMA,
+                        0, a_sc, 0, b_sc_one);
+                }
+
+                if constexpr (PROFILE_PHASES) {
+                    if (is_timer_block && tid == 0) {
+                        uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                        t_mfma_total += t_now - t_phase;
+                        t_phase = t_now;
+                    }
+                }
+            }
+        }
+
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                t_compute_total = t_scale_quant_total + t_gather_total + t_mfma_total;
             }
         }
 
         __syncthreads();
+    }
+
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0)
+            t_phase = __builtin_amdgcn_s_memrealtime();
     }
 
     // ---- Store output ----
@@ -1732,8 +1873,23 @@ void mla_attn_v_mfma_head_merged_kernel(
             const int head = i + 4 * out_quad;
             const int v_dim = chunk * 16 + out_col;
             if (head < HEADS && v_dim < V_DIM) {
-                partial_out[out_base + (int64_t)head * V_DIM + v_dim] = warp_acc[ci][i];
+                partial_out[out_row][head * V_DIM + v_dim] = warp_acc[ci][i];
             }
+        }
+    }
+
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0) {
+            t_store = __builtin_amdgcn_s_memrealtime() - t_phase;
+            uint64_t t_total = __builtin_amdgcn_s_memrealtime() - t_start;
+            printf("[AttnV MFMA HM] N=%d splits=%d | load=%llu sq=%llu gather=%llu mfma=%llu store=%llu total=%llu cycles\\n",
+                   N, KV_SPLITS,
+                   (unsigned long long)t_load_total,
+                   (unsigned long long)t_scale_quant_total,
+                   (unsigned long long)t_gather_total,
+                   (unsigned long long)t_mfma_total,
+                   (unsigned long long)t_store,
+                   (unsigned long long)t_total);
         }
     }
 }
@@ -1744,8 +1900,8 @@ void mla_attn_v_mfma_head_merged_kernel(
 template <int BLOCK_SIZE, int KV_SPLITS>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_attn_v_reduce_head_merged_kernel(
-    const float* __restrict__ partial_out,
-    hip_bfloat16* __restrict__ output
+    const float partial_out[][16 * 512],
+    hip_bfloat16 output[][512]
 ) {
     constexpr int V_DIM = 512;
     constexpr int HEADS = 16;
@@ -1760,62 +1916,63 @@ void mla_attn_v_reduce_head_merged_kernel(
     const int v_dim0 = tid * 2;
     const int v_dim1 = tid * 2 + 1;
 
-    // Input layout: (batch, KV_SPLITS, 16, 512)
-    const int64_t in_batch_base = (int64_t)batch_idx * KV_SPLITS * HEADS * V_DIM;
-
     float sum0 = 0.0f;
     float sum1 = 0.0f;
 
     for (int s = 0; s < KV_SPLITS; s++) {
-        const int64_t split_base = in_batch_base + (int64_t)s * HEADS * V_DIM + (int64_t)head_idx * V_DIM;
-        sum0 += partial_out[split_base + v_dim0];
-        sum1 += partial_out[split_base + v_dim1];
+        sum0 += partial_out[batch_idx * KV_SPLITS + s][head_idx * V_DIM + v_dim0];
+        sum1 += partial_out[batch_idx * KV_SPLITS + s][head_idx * V_DIM + v_dim1];
     }
 
     // Output layout: (batch * 16, 512)
-    const int64_t out_base = ((int64_t)batch_idx * HEADS + head_idx) * V_DIM;
-    output[out_base + v_dim0] = hip_bfloat16(sum0);
-    output[out_base + v_dim1] = hip_bfloat16(sum1);
+    output[batch_idx * HEADS + head_idx][v_dim0] = hip_bfloat16(sum0);
+    output[batch_idx * HEADS + head_idx][v_dim1] = hip_bfloat16(sum1);
 }
 
 // =============================================================================
-// FUSED FlashAttention-style MLA decode kernel (v4)
+// FUSED FlashAttention-style MLA decode kernel (v5 - MFMA V)
 //
 // Replaces: QK^T GEMM + softmax + attnV with a SINGLE kernel that reads KV
 // data ONCE from HBM. Uses online softmax with V accumulator rescaling.
 //
-// QK^T: Uses SAME single-warp MFMA pattern as working mla_qkt_mxfp4_kernel
-// V accumulation: scalar FP32 with LUT-based MXFP4 dequant
+// QK^T: single-warp MFMA 16x16x128, 8 iterations over 128-position subtile
+// V accumulation: MFMA 16x16x128 with scale-absorption pattern
+//   (same as mla_attn_v_mfma_head_merged_kernel)
 //
 // Grid: (BATCH_SIZE, KV_SPLITS)
-// Block: 128 threads (2 warps) - warp 0 does MFMA, both do V accum
+// Block: 256 threads (4 warps) - warp 0 does QK^T, all 4 do MFMA V
 //
-// LDS: Q data+scale (4.9KB) + KV tile (18.4KB) + KV scales (1.2KB)
-//      + scores (1KB) = ~25.5 KB
+// LDS: Q data+scale (4.9KB) + KV tile (36.9KB) + KV scales (3.1KB)
+//      + scores (8.2KB) = ~53 KB
 // =============================================================================
 
 template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS,
-          int K_HALF, int NUM_BLOCKS, int A_K_HALF>
+          int K_HALF, int NUM_BLOCKS, int A_K_HALF, bool PROFILE_PHASES = false>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_fused_attn_kernel(
-    const hip_bfloat16* __restrict__ Q_bf16,  // (batch*16, K) BF16 queries (for future inline quant)
-    const uint8_t* __restrict__ q_data,      // (batch*16, A_K_HALF) pre-quantized Q MXFP4
-    const uint8_t* __restrict__ q_scale,     // (batch*NUM_BLOCKS*16) Q E8M0 scales
-    const uint8_t* __restrict__ kv_mxfp4,    // (batch*N, K_HALF) packed KV MXFP4
-    const uint8_t* __restrict__ kv_scale,    // (batch*N, B_SCALE_STRIDE) KV E8M0 scales
+    const hip_bfloat16* __restrict__ Q_bf16,
+    const uint8_t q_data[][A_K_HALF],
+    const uint8_t* __restrict__ q_scale,
+    const uint8_t kv_mxfp4[][K_HALF],
+    const uint8_t kv_scale[][B_SCALE_STRIDE],
     float sm_scale,
-    float* __restrict__ partial_out,          // (batch, KV_SPLITS, 16, 512) fp32
-    float* __restrict__ partial_lse           // (batch, KV_SPLITS, 16) log-sum-exp
+    float partial_out[][16 * 512],
+    float partial_lse[][16]
 ) {
     constexpr int V_DIM = 512;
-    constexpr int THREADS = BLOCK_SIZE;  // 64
+    constexpr int THREADS = BLOCK_SIZE;
     constexpr int HEADS = 16;
     constexpr int KV_PER_SPLIT = (N + KV_SPLITS - 1) / KV_SPLITS;
+    constexpr int KV_SUBTILE = 128;
+    constexpr int QKT_BATCH = 16;
     constexpr int IM = 16;
-    constexpr int IN = 16;
     constexpr int BPC = 4;
     constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
-    constexpr int K = NUM_BLOCKS * 32;
+
+    constexpr int V_CHUNKS = V_DIM / 16;
+    constexpr int WARPS = THREADS / 64;
+    constexpr int CHUNKS_PER_WARP = V_CHUNKS / WARPS;
+    constexpr int V_LDS_STRIDE = 256;
 
     const int batch_idx = __builtin_amdgcn_readfirstlane(blockIdx.x);
     const int split_idx = __builtin_amdgcn_readfirstlane(blockIdx.y);
@@ -1826,49 +1983,53 @@ void mla_fused_attn_kernel(
     const int kv_start_global = split_idx * KV_PER_SPLIT;
     const int kv_end_global = min(kv_start_global + KV_PER_SPLIT, N);
 
-    // ---- LDS layout ----
-    __shared__ uint8_t q_lds_data[HEADS * A_K_HALF];
-    __shared__ uint8_t q_lds_scale[NUM_BLOCKS * HEADS];
-    __shared__ uint8_t kv_lds_data[IN * K_HALF];         // 16 KV positions at a time
-    __shared__ uint8_t kv_lds_scale_tile[IN * B_SCALE_STRIDE];
-    __shared__ float   scores_lds[HEADS * IN];            // 16 * 16 = 256 floats
+    [[maybe_unused]] const bool is_timer_block = PROFILE_PHASES && (blockIdx.x == 0 && blockIdx.y == 0);
+    [[maybe_unused]] uint64_t t_start = 0, t_load_total = 0, t_qkt_total = 0, t_sv_total = 0, t_store = 0;
+    [[maybe_unused]] uint64_t t_softmax_total = 0, t_mfma_v_total = 0;
+    [[maybe_unused]] uint64_t t_phase = 0;
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0)
+            t_start = __builtin_amdgcn_s_memrealtime();
+    }
 
-    // ---- Per-thread V accumulators + online softmax state ----
-    // 256 threads: V_PER_THREAD=2, all 16 heads, 64 VGPRs total (safe)
-    constexpr int V_PER_THREAD = V_DIM / THREADS;  // 512/256 = 2
-    float acc[HEADS * V_PER_THREAD];      // 32 floats
-    float running_max[HEADS];              // 16 floats
-    float running_sum[HEADS];              // 16 floats
+    // ---- LDS layout ----
+    __shared__ uint8_t q_lds_data[HEADS][A_K_HALF];
+    __shared__ uint8_t q_lds_scale[NUM_BLOCKS * HEADS];
+    __shared__ uint8_t kv_lds_data[KV_SUBTILE][K_HALF];
+    __shared__ uint8_t kv_lds_scale_tile[KV_SUBTILE][B_SCALE_STRIDE];
+    __shared__ float   scores_lds[HEADS][KV_SUBTILE];
+
+    // ---- Per-warp MFMA V accumulators + online softmax state ----
+    float4_t v_acc[CHUNKS_PER_WARP];
+    float running_max[HEADS];
+    float running_sum[HEADS];
+    for (int c = 0; c < CHUNKS_PER_WARP; c++) {
+        v_acc[c] = {};
+    }
     for (int h = 0; h < HEADS; h++) {
-        acc[h * 2] = 0.0f;
-        acc[h * 2 + 1] = 0.0f;
         running_max[h] = -INFINITY;
         running_sum[h] = 0.0f;
     }
 
-    // Pre-compute V dimension mappings for this thread
-    int v_dims[V_PER_THREAD];
-    int v_byte_offsets[V_PER_THREAD];
-    int v_blocks[V_PER_THREAD];
-    int v_nibble_shifts[V_PER_THREAD];
-    for (int v = 0; v < V_PER_THREAD; v++) {
-        int vd = tid * V_PER_THREAD + v;
-        v_dims[v] = vd;
-        int vblk = vd / 32;
-        int vwithin = vd % 32;
-        v_byte_offsets[v] = vblk * 16 + vwithin / 2;
-        v_blocks[v] = vblk;
-        v_nibble_shifts[v] = (vwithin % 2) * 4;
-    }
+    const int out_row = __builtin_amdgcn_readfirstlane(batch_idx * KV_SPLITS + split_idx);
+
+    // MFMA lane indices (used for both QK^T and V accumulation)
+    const int mfma_a_row = lane % 16;
+    const int mfma_a_kgrp = lane / 16;
+    const int mfma_b_col = lane % 16;
+    const int mfma_b_kgrp = lane / 16;
+    const int32_t b_sc_one = mla_broadcast_scale(127);
 
     // ---- Step 1: Load pre-quantized Q into LDS (one-time) ----
     {
-        const uint8_t* q_d = q_data + batch_idx * HEADS * A_K_HALF;
         const int total_q_bytes = HEADS * A_K_HALF;
         for (int i = tid * 16; i < total_q_bytes; i += THREADS * 16) {
-            if (i + 16 <= total_q_bytes)
-                *reinterpret_cast<uint128_vec*>(&q_lds_data[i]) =
-                    *reinterpret_cast<const uint128_vec*>(&q_d[i]);
+            if (i + 16 <= total_q_bytes) {
+                const int h = i / A_K_HALF;
+                const int col = i % A_K_HALF;
+                *reinterpret_cast<uint128_vec*>(&q_lds_data[h][col]) =
+                    *reinterpret_cast<const uint128_vec*>(&q_data[batch_idx * HEADS + h][col]);
+            }
         }
         const uint8_t* q_s = q_scale + batch_idx * NUM_BLOCKS * HEADS;
         const int total_q_scales = NUM_BLOCKS * HEADS;
@@ -1877,147 +2038,346 @@ void mla_fused_attn_kernel(
         }
     }
     if (kv_start_global >= N) {
-        const int64_t out_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM;
-        const int64_t lse_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS;
-        for (int h = 0; h < HEADS; h++) {
-            partial_out[out_base + (int64_t)h * V_DIM + v_dims[0]] = 0.0f;
-            partial_out[out_base + (int64_t)h * V_DIM + v_dims[1]] = 0.0f;
+        for (int i = tid; i < HEADS * V_DIM; i += THREADS) {
+            partial_out[out_row][i] = 0.0f;
         }
-        if (tid < HEADS) partial_lse[lse_base + tid] = -INFINITY;
+        if (tid < HEADS) partial_lse[out_row][tid] = -INFINITY;
         return;
     }
 
     __syncthreads();
 
-    // ---- Step 2: Iterate over KV in subtiles of 16 positions ----
-    const int64_t kv_data_base = (int64_t)batch_idx * N * K_HALF;
-    const int64_t kv_scale_base = (int64_t)batch_idx * N * B_SCALE_STRIDE;
+    // ---- Step 2: Iterate over KV in subtiles of 128 positions ----
+    const int kv_row_base = __builtin_amdgcn_readfirstlane(batch_idx * N);
 
-    for (int kv_pos = kv_start_global; kv_pos < kv_end_global; kv_pos += IN) {
-        const int subtile_end = min(kv_pos + IN, kv_end_global);
+    for (int kv_pos = kv_start_global; kv_pos < kv_end_global; kv_pos += KV_SUBTILE) {
+        const int subtile_end = min(kv_pos + KV_SUBTILE, kv_end_global);
         const int subtile_size = subtile_end - kv_pos;
 
-        // ---- 2a: Load 16 KV positions into LDS (all 256 threads = 4x faster) ----
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0)
+                t_phase = __builtin_amdgcn_s_memrealtime();
+        }
+
+        // ---- 2a: Load 128 KV positions into LDS ----
         {
             const int total_bytes = subtile_size * K_HALF;
             for (int i = tid * 16; i < total_bytes; i += THREADS * 16) {
                 const int row = i / K_HALF;
                 const int col = i % K_HALF;
                 if (row < subtile_size) {
-                    *reinterpret_cast<uint128_vec*>(&kv_lds_data[row * K_HALF + col]) =
-                        *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[kv_data_base + (int64_t)(kv_pos + row) * K_HALF + col]);
+                    *reinterpret_cast<uint128_vec*>(&kv_lds_data[row][col]) =
+                        *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[kv_row_base + kv_pos + row][col]);
                 }
             }
             const int total_sc = subtile_size * B_SCALE_STRIDE;
             for (int i = tid; i < total_sc; i += THREADS) {
                 const int row = i / B_SCALE_STRIDE;
                 const int blk = i % B_SCALE_STRIDE;
-                kv_lds_scale_tile[row * B_SCALE_STRIDE + blk] =
-                    kv_scale[kv_scale_base + (int64_t)(kv_pos + row) * B_SCALE_STRIDE + blk];
+                kv_lds_scale_tile[row][blk] =
+                    kv_scale[kv_row_base + kv_pos + row][blk];
             }
         }
 
         __syncthreads();
 
-        // ---- 2b: QK^T via MFMA (warp 0 only) ----
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                t_load_total += t_now - t_phase;
+                t_phase = t_now;
+            }
+        }
+
+        // ---- 2b: QK^T via 8 iterations of MFMA 16x16x128 (warp 0 only) ----
         if (warp_id == 0) {
-            float4_t mfma_acc = {};
-            for (int ki = 0; ki < K_ITERS; ki++) {
-                int blk0 = ki * BPC;
-                int a_row = lane % IM;
-                int a_blk = blk0 + lane / IM;
-                uint32_t a_reg[8] = {};
-                if (a_blk < NUM_BLOCKS) {
-                    int a_off = a_row * A_K_HALF + a_blk * 16;
-                    *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
-                        *reinterpret_cast<const uint128_vec*>(&q_lds_data[a_off]);
+            for (int qkt_iter = 0; qkt_iter < KV_SUBTILE / QKT_BATCH; qkt_iter++) {
+                float4_t mfma_acc = {};
+                for (int ki = 0; ki < K_ITERS; ki++) {
+                    int blk0 = ki * BPC;
+                    int qa_row = lane % IM;
+                    int qa_blk = blk0 + lane / IM;
+                    uint32_t qa_reg[8] = {};
+                    if (qa_blk < NUM_BLOCKS) {
+                        *reinterpret_cast<uint128_vec*>(&qa_reg[0]) =
+                            *reinterpret_cast<const uint128_vec*>(&q_lds_data[qa_row][qa_blk * 16]);
+                    }
+                    uint8_t qa_e = 127;
+                    if (qa_row < HEADS && qa_blk < NUM_BLOCKS)
+                        qa_e = q_lds_scale[qa_row + qa_blk * HEADS];
+                    else
+                        qa_reg[0] = qa_reg[1] = qa_reg[2] = qa_reg[3] = 0;
+                    int32_t qa_sc = mla_broadcast_scale(qa_e);
+
+                    int kb_row = lane % IM;
+                    int kb_abs = qkt_iter * QKT_BATCH + kb_row;
+                    int kb_blk = blk0 + lane / IM;
+                    uint32_t kb_reg[8] = {};
+                    if (kb_abs < subtile_size && kb_blk < NUM_BLOCKS) {
+                        *reinterpret_cast<uint128_vec*>(&kb_reg[0]) =
+                            *reinterpret_cast<const uint128_vec*>(&kv_lds_data[kb_abs][kb_blk * 16]);
+                    }
+                    uint8_t kb_e = 127;
+                    if (kb_abs < subtile_size && kb_blk < NUM_BLOCKS)
+                        kb_e = kv_lds_scale_tile[kb_abs][kb_blk];
+                    else
+                        kb_reg[0] = kb_reg[1] = kb_reg[2] = kb_reg[3] = 0;
+                    int32_t kb_sc = mla_broadcast_scale(kb_e);
+
+                    qa_reg[4]=qa_reg[5]=qa_reg[6]=qa_reg[7]=0;
+                    kb_reg[4]=kb_reg[5]=kb_reg[6]=kb_reg[7]=0;
+
+                    int8_vec qa_vec = {(int)qa_reg[0],(int)qa_reg[1],(int)qa_reg[2],(int)qa_reg[3],
+                                       (int)qa_reg[4],(int)qa_reg[5],(int)qa_reg[6],(int)qa_reg[7]};
+                    int8_vec kb_vec = {(int)kb_reg[0],(int)kb_reg[1],(int)kb_reg[2],(int)kb_reg[3],
+                                       (int)kb_reg[4],(int)kb_reg[5],(int)kb_reg[6],(int)kb_reg[7]};
+                    mfma_acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                        qa_vec, kb_vec, mfma_acc, FMT_FP4_MFMA, FMT_FP4_MFMA,
+                        0, qa_sc, 0, kb_sc);
                 }
-                uint8_t a_e = 127;
-                if (a_row < HEADS && a_blk < NUM_BLOCKS)
-                    a_e = q_lds_scale[a_row + a_blk * HEADS];
-                else
-                    a_reg[0] = a_reg[1] = a_reg[2] = a_reg[3] = 0;
-                int32_t a_sc = mla_broadcast_scale(a_e);
-
-                int b_row = lane % IM;
-                int b_blk = blk0 + lane / IM;
-                uint32_t b_reg[8] = {};
-                if (b_row < subtile_size && b_blk < NUM_BLOCKS) {
-                    int b_off = b_row * K_HALF + b_blk * 16;
-                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
-                        *reinterpret_cast<const uint128_vec*>(&kv_lds_data[b_off]);
+                int col = lane % 16;
+                int quad = lane / 16;
+                int eff_col = qkt_iter * QKT_BATCH + col;
+                for (int i = 0; i < 4; i++) {
+                    int head = i + 4 * quad;
+                    if (head < HEADS && eff_col < subtile_size)
+                        scores_lds[head][eff_col] = mfma_acc[i] * sm_scale;
                 }
-                uint8_t b_e = 127;
-                if (b_row < subtile_size && b_blk < NUM_BLOCKS)
-                    b_e = kv_lds_scale_tile[b_row * B_SCALE_STRIDE + b_blk];
-                else
-                    b_reg[0] = b_reg[1] = b_reg[2] = b_reg[3] = 0;
-                int32_t b_sc = mla_broadcast_scale(b_e);
-
-                a_reg[4]=a_reg[5]=a_reg[6]=a_reg[7]=0;
-                b_reg[4]=b_reg[5]=b_reg[6]=b_reg[7]=0;
-
-                int8_vec a_vec = {(int)a_reg[0],(int)a_reg[1],(int)a_reg[2],(int)a_reg[3],
-                                  (int)a_reg[4],(int)a_reg[5],(int)a_reg[6],(int)a_reg[7]};
-                int8_vec b_vec = {(int)b_reg[0],(int)b_reg[1],(int)b_reg[2],(int)b_reg[3],
-                                  (int)b_reg[4],(int)b_reg[5],(int)b_reg[6],(int)b_reg[7]};
-                mfma_acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                    a_vec, b_vec, mfma_acc, FMT_FP4_MFMA, FMT_FP4_MFMA,
-                    0, a_sc, 0, b_sc);
-            }
-            int col = lane % 16;
-            int quad = lane / 16;
-            for (int i = 0; i < 4; i++) {
-                int head = i + 4 * quad;
-                if (head < HEADS && col < subtile_size)
-                    scores_lds[head * IN + col] = mfma_acc[i] * sm_scale;
             }
         }
 
         __syncthreads();
 
-        // ---- 2c: Online softmax + V accumulation (all 256 threads, 2 V dims each) ----
-        for (int ki = 0; ki < subtile_size; ki++) {
-            float v_val0, v_val1;
-            {
-                float bs0 = e8m0_to_float_fast(kv_lds_scale_tile[ki * B_SCALE_STRIDE + v_blocks[0]]);
-                uint8_t p0 = kv_lds_data[ki * K_HALF + v_byte_offsets[0]];
-                v_val0 = FP4_E2M1_LUT[(p0 >> v_nibble_shifts[0]) & 0x0F] * bs0;
-
-                float bs1 = e8m0_to_float_fast(kv_lds_scale_tile[ki * B_SCALE_STRIDE + v_blocks[1]]);
-                uint8_t p1 = kv_lds_data[ki * K_HALF + v_byte_offsets[1]];
-                v_val1 = FP4_E2M1_LUT[(p1 >> v_nibble_shifts[1]) & 0x0F] * bs1;
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                t_qkt_total += t_now - t_phase;
+                t_phase = t_now;
             }
+        }
 
-            #pragma unroll
-            for (int h = 0; h < HEADS; h++) {
-                const float s = scores_lds[h * IN + ki];
+        // ---- 2c: Softmax over 128 scores + rescale MFMA V accumulators ----
+        // Only threads 0..15 compute softmax (one head each) - eliminates 240 threads of redundant expf
+        __shared__ float rescale_lds[HEADS];
+        __shared__ float new_max_lds[HEADS];
+        {
+            if (tid < HEADS) {
+                const int h = tid;
+                // Find max in subtile
+                float subtile_max = -INFINITY;
+                for (int ki = 0; ki < subtile_size; ki++) {
+                    subtile_max = fmaxf(subtile_max, scores_lds[h][ki]);
+                }
                 const float old_max = running_max[h];
-                const float new_max = fmaxf(old_max, s);
-                const float rescale = __expf(old_max - new_max);
-                const float exp_s = __expf(s - new_max);
+                const float new_max = fmaxf(old_max, subtile_max);
+                const float prev_rescale = __expf(old_max - new_max);
+
+                // Write rescale factor + new_max to LDS for all threads
+                rescale_lds[h] = prev_rescale;
+                new_max_lds[h] = new_max;
+
+                // Update this thread's running state
                 running_max[h] = new_max;
-                running_sum[h] = running_sum[h] * rescale + exp_s;
-                acc[h * 2]     = acc[h * 2] * rescale + exp_s * v_val0;
-                acc[h * 2 + 1] = acc[h * 2 + 1] * rescale + exp_s * v_val1;
+                running_sum[h] *= prev_rescale;
+
+                // Compute exp-sum
+                float subtile_sum = 0.0f;
+                for (int ki = 0; ki < subtile_size; ki++) {
+                    subtile_sum += __expf(scores_lds[h][ki] - new_max);
+                }
+                running_sum[h] += subtile_sum;
+
+                // Write exp weights to scores_lds for V accumulation
+                for (int ki = 0; ki < subtile_size; ki++) {
+                    scores_lds[h][ki] = __expf(scores_lds[h][ki] - new_max);
+                }
+                for (int ki = subtile_size; ki < KV_SUBTILE; ki++) {
+                    scores_lds[h][ki] = 0.0f;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // ALL threads: update their own running state + rescale v_acc using LDS values
+        {
+            // Update running_max/running_sum for threads 16..255 (threads 0..15 already did it)
+            if (tid >= HEADS) {
+                for (int h = 0; h < HEADS; h++) {
+                    running_max[h] = new_max_lds[h];
+                    // running_sum doesn't matter for threads > 15 until output
+                }
+            }
+
+            // ALL threads rescale their MFMA V accumulators
+            const int out_quad = lane / 16;
+            for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
+                for (int i = 0; i < 4; i++) {
+                    const int head = i + 4 * out_quad;
+                    if (head < HEADS)
+                        v_acc[ci][i] *= rescale_lds[head];
+                }
+            }
+        }
+
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                t_softmax_total += t_now - t_phase;
+                t_phase = t_now;
+            }
+        }
+
+        // ---- 2d: MFMA Attn*V with scale-absorption pattern ----
+        for (int ci = 0; ci < CHUNKS_PER_WARP; ci += 2) {
+            const int chunk0 = warp_id * CHUNKS_PER_WARP + ci;
+            const int vscale_blk = chunk0 / 2;
+
+            // A operand: attn * v_scale, quantized to FP4
+            const int k_base_a = mfma_a_kgrp * 32;
+            float scaled_attn[32];
+            for (int j = 0; j < 32; j++) {
+                const float aw = scores_lds[mfma_a_row][k_base_a + j];
+                const float vs = e8m0_to_float_fast(kv_lds_scale_tile[k_base_a + j][vscale_blk]);
+                scaled_attn[j] = aw * vs;
+            }
+            QuantBlock aqb = quantize_fp4_block(scaled_attn);
+
+            uint32_t a_reg[8];
+            *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
+                *reinterpret_cast<uint128_vec*>(&aqb.data);
+            a_reg[4] = a_reg[5] = a_reg[6] = a_reg[7] = 0;
+            int32_t a_sc = mla_broadcast_scale(aqb.e8m0);
+
+            int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
+                              (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
+
+            // B operand: gather V nibbles for both sub-chunks
+            {
+                const int k_base_b = mfma_b_kgrp * 32;
+                const int v_d0 = chunk0 * 16 + mfma_b_col;
+                const int v_d1 = (chunk0 + 1) * 16 + mfma_b_col;
+                const int nib_shift0 = (v_d0 & 1) * 4;
+                const int nib_shift1 = (v_d1 & 1) * 4;
+                const int local_off0 = mfma_b_col / 2;
+                const int local_off1 = 8 + mfma_b_col / 2;
+                const int lds_byte_base = chunk0 * 8;
+
+                uint8_t packed0[16], packed1[16];
+
+                for (int j = 0; j < 16; j++) {
+                    const int k0 = k_base_b + j * 2;
+                    const int k1 = k_base_b + j * 2 + 1;
+
+                    uint8_t raw0_s0 = 0, raw0_s1 = 0;
+                    if (k0 < subtile_size) {
+                        raw0_s0 = kv_lds_data[k0][lds_byte_base + local_off0];
+                        raw0_s1 = kv_lds_data[k0][lds_byte_base + local_off1];
+                    }
+
+                    uint8_t raw1_s0 = 0, raw1_s1 = 0;
+                    if (k1 < subtile_size) {
+                        raw1_s0 = kv_lds_data[k1][lds_byte_base + local_off0];
+                        raw1_s1 = kv_lds_data[k1][lds_byte_base + local_off1];
+                    }
+
+                    uint8_t n0_s0 = (raw0_s0 >> nib_shift0) & 0x0F;
+                    uint8_t n1_s0 = (raw1_s0 >> nib_shift0) & 0x0F;
+                    packed0[j] = n0_s0 | (n1_s0 << 4);
+
+                    uint8_t n0_s1 = (raw0_s1 >> nib_shift1) & 0x0F;
+                    uint8_t n1_s1 = (raw1_s1 >> nib_shift1) & 0x0F;
+                    packed1[j] = n0_s1 | (n1_s1 << 4);
+                }
+
+                // MFMA for sub-chunk 0
+                {
+                    uint32_t b_reg[8];
+                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                        *reinterpret_cast<uint128_vec*>(&packed0[0]);
+                    b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+                    int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                      (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                    v_acc[ci] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                        a_vec, b_vec, v_acc[ci],
+                        FMT_FP4_MFMA, FMT_FP4_MFMA,
+                        0, a_sc, 0, b_sc_one);
+                }
+
+                // MFMA for sub-chunk 1
+                {
+                    uint32_t b_reg[8];
+                    *reinterpret_cast<uint128_vec*>(&b_reg[0]) =
+                        *reinterpret_cast<uint128_vec*>(&packed1[0]);
+                    b_reg[4] = b_reg[5] = b_reg[6] = b_reg[7] = 0;
+                    int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
+                                      (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                    v_acc[ci + 1] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                        a_vec, b_vec, v_acc[ci + 1],
+                        FMT_FP4_MFMA, FMT_FP4_MFMA,
+                        0, a_sc, 0, b_sc_one);
+                }
+            }
+        }
+
+        if constexpr (PROFILE_PHASES) {
+            if (is_timer_block && tid == 0) {
+                uint64_t t_now = __builtin_amdgcn_s_memrealtime();
+                t_mfma_v_total += t_now - t_phase;
+                t_sv_total = t_softmax_total + t_mfma_v_total;
             }
         }
 
         __syncthreads();
     }
 
-    // ---- Step 3: Write partial output + LSE ----
-    const int64_t out_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS * V_DIM;
-    for (int h = 0; h < HEADS; h++) {
-        float inv_sum = (running_sum[h] > 0.0f) ? (1.0f / running_sum[h]) : 0.0f;
-        partial_out[out_base + (int64_t)h * V_DIM + v_dims[0]] = acc[h * 2] * inv_sum;
-        partial_out[out_base + (int64_t)h * V_DIM + v_dims[1]] = acc[h * 2 + 1] * inv_sum;
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0)
+            t_phase = __builtin_amdgcn_s_memrealtime();
     }
 
-    const int64_t lse_base = ((int64_t)batch_idx * KV_SPLITS + split_idx) * HEADS;
+    // ---- Step 3: Broadcast running_sum via LDS, then write partial output ----
+    // running_sum is only correct on threads 0..15; broadcast to all via scores_lds
+    if (tid < HEADS) {
+        scores_lds[tid][0] = running_sum[tid];
+    }
+    __syncthreads();
+
+    {
+        const int out_col = lane % 16;
+        const int out_quad = lane / 16;
+        for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
+            const int chunk = warp_id * CHUNKS_PER_WARP + ci;
+            for (int i = 0; i < 4; i++) {
+                const int head = i + 4 * out_quad;
+                const int v_dim = chunk * 16 + out_col;
+                if (head < HEADS && v_dim < V_DIM) {
+                    float rs = scores_lds[head][0];
+                    float inv_sum = (rs > 0.0f) ? (1.0f / rs) : 0.0f;
+                    partial_out[out_row][head * V_DIM + v_dim] = v_acc[ci][i] * inv_sum;
+                }
+            }
+        }
+    }
+
     if (tid < HEADS) {
         float lse = running_max[tid] + logf(fmaxf(running_sum[tid], 1e-20f));
-        partial_lse[lse_base + tid] = lse;
+        partial_lse[out_row][tid] = lse;
+    }
+
+    if constexpr (PROFILE_PHASES) {
+        if (is_timer_block && tid == 0) {
+            t_store = __builtin_amdgcn_s_memrealtime() - t_phase;
+            uint64_t t_total = __builtin_amdgcn_s_memrealtime() - t_start;
+            printf("[Fused Attn] N=%d splits=%d | load=%llu qkt=%llu softmax=%llu mfma_v=%llu store=%llu total=%llu cycles\\n",
+                   N, KV_SPLITS,
+                   (unsigned long long)t_load_total,
+                   (unsigned long long)t_qkt_total,
+                   (unsigned long long)t_softmax_total,
+                   (unsigned long long)t_mfma_v_total,
+                   (unsigned long long)t_store,
+                   (unsigned long long)t_total);
+        }
     }
 }
 
@@ -2030,9 +2390,9 @@ void mla_fused_attn_kernel(
 template <int BLOCK_SIZE, int KV_SPLITS>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_fused_reduce_kernel(
-    const float* __restrict__ partial_out,    // (batch, KV_SPLITS, 16, 512)
-    const float* __restrict__ partial_lse,    // (batch, KV_SPLITS, 16)
-    hip_bfloat16* __restrict__ output         // (batch * 16, 512)
+    const float partial_out[][16 * 512],         // (batch * KV_SPLITS, 16 * 512)
+    const float partial_lse[][16],               // (batch * KV_SPLITS, 16)
+    hip_bfloat16 output[][512]                   // (batch * 16, 512)
 ) {
     constexpr int V_DIM = 512;
     constexpr int HEADS = 16;
@@ -2044,31 +2404,26 @@ void mla_fused_reduce_kernel(
     const int v_dim0 = tid * 2;
     const int v_dim1 = tid * 2 + 1;
 
-    const int64_t lse_batch_base = (int64_t)batch_idx * KV_SPLITS * HEADS;
-    const int64_t v_batch_base = (int64_t)batch_idx * KV_SPLITS * HEADS * V_DIM;
-
     // Pass 1: Find max LSE across all splits (no array needed)
     float max_lse = -INFINITY;
     for (int s = 0; s < KV_SPLITS; s++) {
-        float lse = partial_lse[lse_batch_base + (int64_t)s * HEADS + head_idx];
+        float lse = partial_lse[batch_idx * KV_SPLITS + s][head_idx];
         max_lse = fmaxf(max_lse, lse);
     }
 
     // Pass 2: Accumulate weighted partials using max_lse
     float sum0 = 0.0f, sum1 = 0.0f, denom = 0.0f;
     for (int s = 0; s < KV_SPLITS; s++) {
-        float lse = partial_lse[lse_batch_base + (int64_t)s * HEADS + head_idx];
+        float lse = partial_lse[batch_idx * KV_SPLITS + s][head_idx];
         float w = expf(lse - max_lse);
         denom += w;
-        const int64_t split_base = v_batch_base + (int64_t)s * HEADS * V_DIM + (int64_t)head_idx * V_DIM;
-        sum0 += w * partial_out[split_base + v_dim0];
-        sum1 += w * partial_out[split_base + v_dim1];
+        sum0 += w * partial_out[batch_idx * KV_SPLITS + s][(int64_t)head_idx * V_DIM + v_dim0];
+        sum1 += w * partial_out[batch_idx * KV_SPLITS + s][(int64_t)head_idx * V_DIM + v_dim1];
     }
 
     float inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-    const int64_t out_base = ((int64_t)batch_idx * HEADS + head_idx) * V_DIM;
-    output[out_base + v_dim0] = hip_bfloat16(sum0 * inv_denom);
-    output[out_base + v_dim1] = hip_bfloat16(sum1 * inv_denom);
+    output[batch_idx * HEADS + head_idx][v_dim0] = hip_bfloat16(sum0 * inv_denom);
+    output[batch_idx * HEADS + head_idx][v_dim1] = hip_bfloat16(sum1 * inv_denom);
 }
 
 '''
@@ -2240,9 +2595,9 @@ torch::Tensor mla_mxfp4_pipeline_impl(
 
     hipEvent_t e0, e1, e2, e3, e4;
     if (do_profile) {
-        hipEventCreate(&e0); hipEventCreate(&e1); hipEventCreate(&e2);
-        hipEventCreate(&e3); hipEventCreate(&e4);
-        hipEventRecord(e0);
+        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1); (void)hipEventCreate(&e2);
+        (void)hipEventCreate(&e3); (void)hipEventCreate(&e4);
+        (void)hipEventRecord(e0);
     }
 
     // ---- Step 1: Quantize Q to MXFP4 ----
@@ -2252,11 +2607,11 @@ torch::Tensor mla_mxfp4_pipeline_impl(
         constexpr int q_grid = (total_q_blocks + q_block - 1) / q_block;
         mla_quant_q_batched_kernel<M, K, K_HALF, NUM_BLOCKS, BATCH_SIZE, q_block>
             <<<dim3(q_grid), dim3(q_block)>>>(
-            reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
-            reinterpret_cast<uint8_t*>(q_data_buf.data_ptr()),
+            reinterpret_cast<const hip_bfloat16(*)[K]>(Q_bf16.data_ptr()),
+            reinterpret_cast<uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
             reinterpret_cast<uint8_t*>(q_scale_buf.data_ptr()));
     }
-    if (do_profile) hipEventRecord(e1);
+    if (do_profile) (void)hipEventRecord(e1);
 
     // ---- Step 2: QK^T GEMM (with fused sm_scale) + 2-pass softmax ----
     // Step 2a: Single-warp QK^T writes pre-scaled scores directly to attn_buf
@@ -2267,11 +2622,11 @@ torch::Tensor mla_mxfp4_pipeline_impl(
         dim3 block(BS);
         mla_qkt_mxfp4_kernel<M, N, K_HALF, NUM_BLOCKS, B_SCALE_STRIDE, A_K_HALF, BS>
             <<<grid, block>>>(
-            reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
+            reinterpret_cast<const uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
+            reinterpret_cast<const uint8_t(*)[K_HALF]>(KV_data.data_ptr()),
             reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
-            reinterpret_cast<float*>(attn_buf.data_ptr()),
+            reinterpret_cast<const uint8_t(*)[B_SCALE_STRIDE]>(KV_scale.data_ptr()),
+            reinterpret_cast<float(*)[N]>(attn_buf.data_ptr()),
             sm_scale);
     }
     // Step 2b: 2-pass softmax in-place on attn_buf (scores already scaled)
@@ -2280,10 +2635,10 @@ torch::Tensor mla_mxfp4_pipeline_impl(
         dim3 grid(BATCH_SIZE, NUM_HEADS);
         dim3 block(BS);
         mla_softmax_2pass_kernel<N, BS><<<grid, block>>>(
-            reinterpret_cast<float*>(attn_buf.data_ptr()),
+            reinterpret_cast<float(*)[N]>(attn_buf.data_ptr()),
             0);
     }
-    if (do_profile) hipEventRecord(e2);
+    if (do_profile) (void)hipEventRecord(e2);
 
     // ---- Step 3: Head-merged attn x V (split-K) ----
     // Compile-time dispatch: scalar kernel for most shapes (fewer LDS ops),
@@ -2292,21 +2647,21 @@ torch::Tensor mla_mxfp4_pipeline_impl(
         constexpr int BS = 256;
         dim3 grid1(BATCH_SIZE, KV_SPLITS);
         dim3 block1(BS);
-        if constexpr (BATCH_SIZE >= 256 && N >= 8192) {
-            mla_attn_v_mfma_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS><<<grid1, block1>>>(
-                reinterpret_cast<const float*>(attn_buf.data_ptr()),
-                reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
-                reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
-                reinterpret_cast<float*>(partial_buf.data_ptr()));
-        } else {
-            mla_attn_v_splitk_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS><<<grid1, block1>>>(
-                reinterpret_cast<const float*>(attn_buf.data_ptr()),
-                reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
-                reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
-                reinterpret_cast<float*>(partial_buf.data_ptr()));
-        }
+        //if constexpr (BATCH_SIZE >= 256 && N >= 8192) {
+            mla_attn_v_mfma_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS, (BATCH_SIZE > 64 && N >= 8192)><<<grid1, block1>>>(
+                reinterpret_cast<const float(*)[N]>(attn_buf.data_ptr()),
+                reinterpret_cast<const uint8_t(*)[288]>(KV_data.data_ptr()),
+                reinterpret_cast<const uint8_t(*)[B_SCALE_STRIDE]>(KV_scale.data_ptr()),
+                reinterpret_cast<float(*)[16 * 512]>(partial_buf.data_ptr()));
+        /*} else {
+            mla_attn_v_splitk_head_merged_kernel<N, BS, B_SCALE_STRIDE, KV_SPLITS, (BATCH_SIZE > 64 && N >= 8192)><<<grid1, block1>>>(
+                reinterpret_cast<const float(*)[N]>(attn_buf.data_ptr()),
+                reinterpret_cast<const uint8_t(*)[288]>(KV_data.data_ptr()),
+                reinterpret_cast<const uint8_t(*)[B_SCALE_STRIDE]>(KV_scale.data_ptr()),
+                reinterpret_cast<float(*)[16 * 512]>(partial_buf.data_ptr()));
+        }*/
     }
-    if (do_profile) hipEventRecord(e3);
+    if (do_profile) (void)hipEventRecord(e3);
 
     // ---- Step 4: Head-merged reduce + output ----
     auto output = torch::empty({TOTAL_HEADS, V_DIM},
@@ -2316,18 +2671,18 @@ torch::Tensor mla_mxfp4_pipeline_impl(
         dim3 r_grid(BATCH_SIZE, NUM_HEADS);
         dim3 r_block(R_BLOCK);
         mla_attn_v_reduce_head_merged_kernel<R_BLOCK, KV_SPLITS><<<r_grid, r_block>>>(
-            reinterpret_cast<const float*>(partial_buf.data_ptr()),
-            reinterpret_cast<hip_bfloat16*>(output.data_ptr()));
+            reinterpret_cast<const float(*)[16 * 512]>(partial_buf.data_ptr()),
+            reinterpret_cast<hip_bfloat16(*)[512]>(output.data_ptr()));
     }
 
     if (do_profile) {
-        hipEventRecord(e4);
-        hipEventSynchronize(e4);
+        (void)hipEventRecord(e4);
+        (void)hipEventSynchronize(e4);
         float d01, d12, d23, d34;
-        hipEventElapsedTime(&d01, e0, e1);
-        hipEventElapsedTime(&d12, e1, e2);
-        hipEventElapsedTime(&d23, e2, e3);
-        hipEventElapsedTime(&d34, e3, e4);
+        (void)hipEventElapsedTime(&d01, e0, e1);
+        (void)hipEventElapsedTime(&d12, e1, e2);
+        (void)hipEventElapsedTime(&d23, e2, e3);
+        (void)hipEventElapsedTime(&d34, e3, e4);
         stats.t_quant += d01; stats.t_qkt_softmax += d12;
         stats.t_attnv += d23; stats.t_reduce += d34;
         int n = stats.count / PROFILE_INTERVAL;
@@ -2340,8 +2695,8 @@ torch::Tensor mla_mxfp4_pipeline_impl(
                 stats.t_attnv/n*1000, stats.t_reduce/n*1000,
                 (stats.t_quant+stats.t_qkt_softmax+stats.t_attnv+stats.t_reduce)/n*1000, n);
         }
-        hipEventDestroy(e0); hipEventDestroy(e1); hipEventDestroy(e2);
-        hipEventDestroy(e3); hipEventDestroy(e4);
+        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1); (void)hipEventDestroy(e2);
+        (void)hipEventDestroy(e3); (void)hipEventDestroy(e4);
     }
 
     return output;
@@ -2385,9 +2740,7 @@ torch::Tensor mla_fused_pipeline_impl(
     constexpr int V_DIM = 512;
     constexpr int A_K_HALF = NUM_BLOCKS * 16;
     constexpr int TOTAL_HEADS = BATCH_SIZE * NUM_HEADS;
-    constexpr int KV_SPLITS = get_kv_split<BATCH_SIZE, N>();
-
-    // ---- Static scratch buffers ----
+    constexpr int KV_SPLITS = get_fused_kv_split<BATCH_SIZE, N>();
     static torch::Tensor q_data_buf, q_scale_buf, partial_v_buf, partial_lse_buf;
     static int last_n = 0, last_splits = 0;
 
@@ -2418,9 +2771,9 @@ torch::Tensor mla_fused_pipeline_impl(
 
     hipEvent_t e0, e1, e2, e3;
     if (do_profile) {
-        hipEventCreate(&e0); hipEventCreate(&e1);
-        hipEventCreate(&e2); hipEventCreate(&e3);
-        hipEventRecord(e0);
+        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1);
+        (void)hipEventCreate(&e2); (void)hipEventCreate(&e3);
+        (void)hipEventRecord(e0);
     }
 
     // ---- Step 1: Quantize Q to MXFP4 ----
@@ -2430,11 +2783,11 @@ torch::Tensor mla_fused_pipeline_impl(
         constexpr int q_grid = (total_q_blocks + q_block - 1) / q_block;
         mla_quant_q_batched_kernel<M, K, K_HALF, NUM_BLOCKS, BATCH_SIZE, q_block>
             <<<dim3(q_grid), dim3(q_block)>>>(
-            reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
-            reinterpret_cast<uint8_t*>(q_data_buf.data_ptr()),
+            reinterpret_cast<const hip_bfloat16(*)[K]>(Q_bf16.data_ptr()),
+            reinterpret_cast<uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
             reinterpret_cast<uint8_t*>(q_scale_buf.data_ptr()));
     }
-    if (do_profile) hipEventRecord(e1);
+    if (do_profile) (void)hipEventRecord(e1);
 
     // ---- Step 2: Fused attention (QK^T MFMA + online softmax + V accumulation) ----
     {
@@ -2444,15 +2797,15 @@ torch::Tensor mla_fused_pipeline_impl(
         mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF>
             <<<grid, block>>>(
             reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
-            reinterpret_cast<const uint8_t*>(q_data_buf.data_ptr()),
+            reinterpret_cast<const uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
             reinterpret_cast<const uint8_t*>(q_scale_buf.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_data.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_scale.data_ptr()),
+            reinterpret_cast<const uint8_t(*)[K_HALF]>(KV_data.data_ptr()),
+            reinterpret_cast<const uint8_t(*)[STRIDE]>(KV_scale.data_ptr()),
             sm_scale,
-            reinterpret_cast<float*>(partial_v_buf.data_ptr()),
-            reinterpret_cast<float*>(partial_lse_buf.data_ptr()));
+            reinterpret_cast<float(*)[16 * 512]>(partial_v_buf.data_ptr()),
+            reinterpret_cast<float(*)[16]>(partial_lse_buf.data_ptr()));
     }
-    if (do_profile) hipEventRecord(e2);
+    if (do_profile) (void)hipEventRecord(e2);
 
     // ---- Step 3: LSE-corrected reduce across splits ----
     auto output = torch::empty({TOTAL_HEADS, V_DIM},
@@ -2462,18 +2815,18 @@ torch::Tensor mla_fused_pipeline_impl(
         dim3 r_grid(BATCH_SIZE, NUM_HEADS);
         dim3 r_block(R_BLOCK);
         mla_fused_reduce_kernel<R_BLOCK, KV_SPLITS><<<r_grid, r_block>>>(
-            reinterpret_cast<const float*>(partial_v_buf.data_ptr()),
-            reinterpret_cast<const float*>(partial_lse_buf.data_ptr()),
-            reinterpret_cast<hip_bfloat16*>(output.data_ptr()));
+            reinterpret_cast<const float(*)[16 * 512]>(partial_v_buf.data_ptr()),
+            reinterpret_cast<const float(*)[16]>(partial_lse_buf.data_ptr()),
+            reinterpret_cast<hip_bfloat16(*)[512]>(output.data_ptr()));
     }
 
     if (do_profile) {
-        hipEventRecord(e3);
-        hipEventSynchronize(e3);
+        (void)hipEventRecord(e3);
+        (void)hipEventSynchronize(e3);
         float d01, d12, d23;
-        hipEventElapsedTime(&d01, e0, e1);
-        hipEventElapsedTime(&d12, e1, e2);
-        hipEventElapsedTime(&d23, e2, e3);
+        (void)hipEventElapsedTime(&d01, e0, e1);
+        (void)hipEventElapsedTime(&d12, e1, e2);
+        (void)hipEventElapsedTime(&d23, e2, e3);
         stats.t_quant += d01; stats.t_fused += d12; stats.t_reduce += d23;
         int n = stats.count / PROFILE_INTERVAL;
         if (n < 5) {
@@ -2484,8 +2837,8 @@ torch::Tensor mla_fused_pipeline_impl(
                 stats.t_quant/n*1000, stats.t_fused/n*1000, stats.t_reduce/n*1000,
                 (stats.t_quant+stats.t_fused+stats.t_reduce)/n*1000, n);
         }
-        hipEventDestroy(e0); hipEventDestroy(e1);
-        hipEventDestroy(e2); hipEventDestroy(e3);
+        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1);
+        (void)hipEventDestroy(e2); (void)hipEventDestroy(e3);
     }
 
     return output;
@@ -2514,7 +2867,7 @@ torch::Tensor mla_mxfp4_pipeline(
         return mla_fused_pipeline_impl<BS, N, STR>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
 
     // Use fused pipeline for all shapes
-    /*MLA_FUSED(4, 1024, 18);
+    MLA_FUSED(4, 1024, 18);
     MLA_FUSED(4, 1024, 24);
     MLA_FUSED(4, 8192, 18);
     MLA_FUSED(4, 8192, 24);
@@ -2529,8 +2882,8 @@ torch::Tensor mla_mxfp4_pipeline(
     MLA_FUSED(256, 1024, 18);
     MLA_FUSED(256, 1024, 24);
     MLA_FUSED(256, 8192, 18);
-    MLA_FUSED(256, 8192, 24);*/
-    MLA_MXFP4(4, 1024, 18);
+    MLA_FUSED(256, 8192, 24);
+    /*MLA_MXFP4(4, 1024, 18);
     MLA_MXFP4(4, 1024, 24);
     MLA_MXFP4(4, 8192, 18);
     MLA_MXFP4(4, 8192, 24);
@@ -2545,7 +2898,7 @@ torch::Tensor mla_mxfp4_pipeline(
     MLA_MXFP4(256, 1024, 18);
     MLA_MXFP4(256, 1024, 24);
     MLA_MXFP4(256, 8192, 18);
-    MLA_MXFP4(256, 8192, 24);
+    MLA_MXFP4(256, 8192, 24);*/
     TORCH_CHECK(false, "Unsupported batch_size: ", batch_size);
 }
 
@@ -3233,47 +3586,32 @@ def _pytorch_mla_attention(
 # Dispatcher: select kernel based on QKV_DTYPE
 # ---------------------------------------------------------------------------
 def custom_kernel(data: input_t) -> output_t:
+    """
+    Hybrid dispatch: MXFP4 HIP pipeline for bandwidth-bound cases (small batches),
+    aiter a8w8 for compute-bound cases (large batches).
+
+    MXFP4 pipeline wins via 4x bandwidth savings when memory-bound:
+      bs=4,  kv=1k:  32us (MXFP4) vs ~118us (a8w8) -> 3.7x faster
+      bs=4,  kv=8k:  70us (MXFP4) vs ~113us (a8w8) -> 1.6x faster
+      bs=32, kv=1k:  50us (MXFP4) vs  ??us (a8w8)
+
+    aiter a8w8 ASM kernel wins when compute-bound (large batch x long KV):
+      bs=64,  kv=8k: 359us (MXFP4) vs ~171us (a8w8) -> a8w8 2.1x faster
+      bs=256, kv=8k: 1362us (MXFP4) vs ~349us (a8w8) -> a8w8 3.9x faster
+    """
+    # q, kv_data, qo_indptr, kv_indptr, config = data
+    # batch_size = config["batch_size"]
+    # kv_seq_len = config["kv_seq_len"]
+
+    # # MXFP4 pipeline: wins when bandwidth-bound (small batch or short KV)
+    # if batch_size <= 4:
+    #     return custom_kernel_mxfp4_qkt(data)
+    # if kv_seq_len <= 1024:
+    #     return custom_kernel_mxfp4_qkt(data)
+
+    # # aiter a8w8: wins for large batch x long KV (compute-bound)
+    # return custom_kernel_fp8(data)
     return custom_kernel_mxfp4_qkt(data)
-
-# def custom_kernel(data: input_t) -> output_t:
-#     """Dispatch to the appropriate kernel based on QKV_DTYPE."""
-#     global HAS_HIP_KERNEL
-
-#     q, kv_data, qo_indptr, kv_indptr, config = data
-#     batch_size = config["batch_size"]
-#     kv_seq_len = config["kv_seq_len"]
-#     qkv_type = QKV_DTYPE
-#     if batch_size == 4:
-#       if kv_seq_len <= 1024:
-#         qkv_type = "bf16"
-#       else:
-#         qkv_type = "fp8"
-#     elif batch_size == 32:
-#       if kv_seq_len <= 1024:
-#         qkv_type = "bf16"
-#       else:
-#         qkv_type = "fp8"
-#     elif batch_size == 64:
-#       if kv_seq_len <= 1024:
-#         qkv_type = "bf16"
-#       else:
-#         qkv_type = "fp8"
-#     elif batch_size == 256:
-#       if kv_seq_len <= 1024:
-#         qkv_type = "fp8"
-#       else:
-#         qkv_type = "fp8"
-
-#     if qkv_type == "fp8":
-#         return custom_kernel_fp8(data)
-#     elif qkv_type == "bf16":
-#         return custom_kernel_bf16(data)
-#     elif qkv_type == "mxfp4_dequant":
-#         return custom_kernel_mxfp4_dequant(data)
-#     elif qkv_type == "mxfp4_native":
-#         return custom_kernel_mxfp4_native(data)
-#     else:
-#         raise ValueError(f"Invalid QKV_DTYPE: {qkv_type}")
 
 
 # ---------------------------------------------------------------------------
