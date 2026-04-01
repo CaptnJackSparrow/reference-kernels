@@ -1,5 +1,5 @@
 "**MI355X on GitHub ✅ success**
-> Workflow [23773456585](<https://github.com/gpu-mode/kernelbot/actions/runs/23773456585>) completed
+> Workflow [23825228226](<https://github.com/gpu-mode/kernelbot/actions/runs/23825228226>) completed
 > Downloading artifacts... done
 > ✅ Compilation successful
 > ✅ Benchmarking successful
@@ -11,45 +11,45 @@ Running on:
 * Runtime: `ROCm`
 * Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
 * Torch: `2.10.0+rocm7.1`
-* Hostname: `arc-runner-set-h82gb-runner-5fx4v`
+* Hostname: `arc-runner-set-hbp2z-runner-s7mzf`
 
 
 ## Benchmarks:
 ```
 k: 512; m: 4; n: 2880; seed: 4565
- ⏱ 10.1 ± 0.18 µs
- ⚡ 7.52 µs 🐌 42.4 µs
+ ⏱ 8.14 ± 0.018 µs
+ ⚡ 7.32 µs 🐌 12.8 µs
 
 k: 7168; m: 16; n: 2112; seed: 15
- ⏱ 15.7 ± 0.25 µs
- ⚡ 12.5 µs 🐌 49.6 µs
+ ⏱ 13.5 ± 0.02 µs
+ ⚡ 12.8 µs 🐌 18.4 µs
 
 k: 512; m: 32; n: 4096; seed: 457
- ⏱ 11.1 ± 0.21 µs
- ⚡ 8.20 µs 🐌 41.7 µs
+ ⏱ 8.93 ± 0.021 µs
+ ⚡ 8.24 µs 🐌 13.9 µs
 
 k: 512; m: 32; n: 2880; seed: 54
- ⏱ 14.5 ± 1.05 µs
- ⚡ 10.3 µs 🐌 1031 µs
+ ⏱ 11.9 ± 0.02 µs
+ ⚡ 11.3 µs 🐌 16.7 µs
 
 k: 2048; m: 64; n: 7168; seed: 687
- ⏱ 20.0 ± 0.24 µs
- ⚡ 16.6 µs 🐌 61.7 µs
+ ⏱ 24.4 ± 0.03 µs
+ ⚡ 23.5 µs 🐌 31.5 µs
 
 k: 1536; m: 256; n: 3072; seed: 7856
- ⏱ 19.3 ± 0.23 µs
- ⚡ 16.4 µs 🐌 56.7 µs
+ ⏱ 19.7 ± 0.02 µs
+ ⚡ 18.8 µs 🐌 24.5 µs
 ```
 
 ## Program stderr:
 ```
 [aiter] start build [module_aiter_enum] under /home/runner/aiter/aiter/jit/build/module_aiter_enum
-[aiter] \u001b[32mfinish build [module_aiter_enum], cost 7.6s \u001b[0m
+[aiter] \u001b[32mfinish build [module_aiter_enum], cost 7.7s \u001b[0m
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 \u001b[92mSuccessfully preprocessed all matching files.\u001b[0m
 [aiter] start build [module_gemm_common] under /home/runner/aiter/aiter/jit/build/module_gemm_common
-[aiter] \u001b[32mfinish build [module_gemm_common], cost 22.0s \u001b[0m
+[aiter] \u001b[32mfinish build [module_gemm_common], cost 22.6s \u001b[0m
 [aiter] import [module_gemm_common] under /home/runner/aiter/aiter/jit/module_gemm_common.so
 [aiter] type hints mismatch, override to --> get_padded_m(M: int | typing.SupportsIndex, N: int | typing.SupportsIndex, K: int | typing.SupportsIndex, gl: int | typing.SupportsIndex) -> int
 [aiter] shape is M:4, N:2880, K:512, not found tuned config in CKGEMM or asmGEMM, will use default config!
@@ -58,7 +58,7 @@ k: 1536; m: 256; n: 3072; seed: 7856
   pd.set_option(\"future.no_silent_downcasting\", True)
 /home/runner/aiter/hsa/codegen.py:86: Pandas4Warning: The copy keyword is deprecated and will be removed in a future version. Copy-on-Write is active in pandas since 3.0 which utilizes a lazy copy mechanism that defers copies until necessary. Use .copy() to make an eager copy if necessary.
   pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
-[aiter] \u001b[32mfinish build [module_gemm_a4w4_asm], cost 19.8s \u001b[0m
+[aiter] \u001b[32mfinish build [module_gemm_a4w4_asm], cost 20.6s \u001b[0m
 [aiter] import [module_gemm_a4w4_asm] under /home/runner/aiter/aiter/jit/module_gemm_a4w4_asm.so
 [aiter] type hints mismatch, override to --> gemm_a4w4_asm(A: torch.Tensor, B: torch.Tensor, A_scale: torch.Tensor, B_scale: torch.Tensor, out: torch.Tensor, kernelName: str, bias: Optional[torch.Tensor] = None, alpha: float | Optional[typing.SupportsIndex] = 1.0, beta: float | Optional[typing.SupportsIndex] = 0.0, bpreshuffle: Optional[bool] = True, log2_k_split: int | Optional[typing.SupportsIndex] = None) -> torch.Tensor
 [aiter] shape is M:16, N:2112, K:7168, not found tuned config in CKGEMM or asmGEMM, will use default config!
@@ -74,24 +74,8 @@ Total number of unsupported CUDA function calls: 0
 
 Total number of replaced kernel launches: 14
 [1/1] clang++ hip.cuda.o main.o -shared -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_hip -ltorch_cpu -ltorch_hip -ltorch -ltorch_python -L/opt/rocm/lib -lamdhip64 -o mxfp4_mfma_v8.so
-[mxfp4-mm] MFMA kernel compiled in 0.6s
+[mxfp4-mm] MFMA kernel compiled in 0.5s
 [aiter] hipModuleLoad: /home/runner/aiter/hsa//gfx950/f4gemm/f4gemm_bf16_per1x32Fp4_BpreShuffle_192x128.co GetFunction: _ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_192x128E
 [aiter] hipModuleGetFunction: _ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_192x128E Success
-[Simple Fused] m=4 n=2880 k=512 | total=7.5us (avg over 1)
-[Simple Fused] m=4 n=2880 k=512 | total=7.6us (avg over 2)
-[Simple Fused] m=4 n=2880 k=512 | total=7.7us (avg over 3)
-[Simple Fused] m=4 n=2880 k=512 | total=7.8us (avg over 4)
-[Tiled Split-K Fused] m=16 n=2112 k=7168 splits=28 | gemm+quant=10.5us reduce=6.0us | total=16.5us (avg over 1)
-[Tiled Split-K Fused] m=16 n=2112 k=7168 splits=28 | gemm+quant=10.5us reduce=6.1us | total=16.6us (avg over 2)
-[Tiled Split-K Fused] m=16 n=2112 k=7168 splits=28 | gemm+quant=10.6us reduce=6.1us | total=16.7us (avg over 3)
-[Tiled Split-K Fused] m=16 n=2112 k=7168 splits=28 | gemm+quant=10.6us reduce=6.1us | total=16.7us (avg over 4)
-[Simple Fused] m=32 n=4096 k=512 | total=8.6us (avg over 1)
-[Simple Fused] m=32 n=4096 k=512 | total=8.4us (avg over 2)
-[Simple Fused] m=32 n=4096 k=512 | total=8.5us (avg over 3)
-[Simple Fused] m=32 n=4096 k=512 | total=8.5us (avg over 4)
-[Simple GEMM] m=32 n=2880 k=512 | quant=6.6us gemm=6.7us | total=13.2us (avg over 1)
-[Simple GEMM] m=32 n=2880 k=512 | quant=6.5us gemm=6.7us | total=13.2us (avg over 2)
-[Simple GEMM] m=32 n=2880 k=512 | quant=6.5us gemm=6.7us | total=13.2us (avg over 3)
-[Simple GEMM] m=32 n=2880 k=512 | quant=6.6us gemm=6.7us | total=13.3us (avg over 4)
 [aiter] hipModuleLoad: /home/runner/aiter/hsa//gfx950/f4gemm/f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128.co GetFunction: _ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E
 [aiter] hipModuleGetFunction: _ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E Success```"
