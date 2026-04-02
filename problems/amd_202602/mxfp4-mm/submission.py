@@ -27,12 +27,22 @@ typedef uint32_t __attribute__((ext_vector_type(4))) uint128_vec;
 
 template <int SCALE_N>
 __device__ __forceinline__ int sh_scale_off(int row, int col) {
-    return (row%32)/16
-         + (col%8)/4 * 2
-         + (row%16)  * 4
-         + (col%4)   * 64
-         + (col/8)   * 256
-         + (row/32)  * 32 * SCALE_N;
+    // Using Bit Field Extract (BFE) to replace modulo and division
+    // __builtin_amdgcn_ubfe_i32(value, offset, width)
+
+    int t0 = __builtin_amdgcn_ubfe(row, 4, 1);      // bit 4 -> (row%32)/16
+    int t1 = __builtin_amdgcn_ubfe(col, 2, 1) << 1; // bit 2 -> (col%8)/4 * 2
+    int t2 = __builtin_amdgcn_ubfe(row, 0, 4) << 2; // bits 0-3 -> (row%16) * 4
+    int t3 = __builtin_amdgcn_ubfe(col, 0, 2) << 6; // bits 0-1 -> (col%4) * 64
+
+    // (col/8) * 256
+    int t4 = (col >> 3) << 8;
+
+    // (row/32) * (32 * SCALE_N)
+    constexpr int row_stride = 32 * SCALE_N;
+    int t5 = (row >> 5) * row_stride;
+
+    return t0 + t1 + t2 + t3 + t4 + t5;
 }
 
 template <int M, int K, int OUTER_M, int OUTER_K, int BLOCK_SIZE>
@@ -147,6 +157,20 @@ __device__ __forceinline__ uint8_t quantize_fp4_pair_hw_bf16(
     return cvt.u8[0];
 }*/
 
+__device__ __forceinline__ uint32_t pack_fp4_to_u32(uint8_t p0, uint8_t p1, uint8_t p2, uint8_t p3) {
+    // Combine into two dwords:
+    // srcA: [0][0][p1][p0]  srcB: [0][0][p3][p2]
+    uint32_t srcA = (uint32_t)p0 | ((uint32_t)p1 << 8);
+    uint32_t srcB = (uint32_t)p2 | ((uint32_t)p3 << 8);
+
+    // Selector 0x05040100:
+    // 00: Byte 0 of srcA (p0) -> Output Byte 0
+    // 01: Byte 1 of srcA (p1) -> Output Byte 1
+    // 04: Byte 0 of srcB (p2) -> Output Byte 2
+    // 05: Byte 1 of srcB (p3) -> Output Byte 3
+    return __builtin_amdgcn_perm(srcB, srcA, 0x05040100);
+}
+
 // Quantize 32 BF16 values to packed FP4 + E8M0 scale using BF16 hw intrinsic.
 // amax computed in BF16 - no FP32 intermediate.
 __device__ __forceinline__ QuantBlock quantize_fp4_block_bf16(const hip_bfloat16* src) {
@@ -160,10 +184,14 @@ __device__ __forceinline__ QuantBlock quantize_fp4_block_bf16(const hip_bfloat16
 
     E8M0Scale sc = compute_e8m0_scale(amax_bf16);
 
-    uint32_t pack[4] = {0, 0, 0, 0};
-    for (int i = 0; i < 16; i++) {
-        uint8_t packed = quantize_fp4_pair_hw_bf16(src[2*i], src[2*i+1], sc.quant_scale);
-        pack[i / 4] |= ((uint32_t)packed) << ((i % 4) * 8);
+    uint32_t pack[4];
+    for (int j = 0; j < 4; j++) {
+        int base = j << 3;
+        uint8_t p0 = quantize_fp4_pair_hw_bf16(src[base], src[base + 1], sc.quant_scale);
+        uint8_t p1 = quantize_fp4_pair_hw_bf16(src[base + 2], src[base + 3], sc.quant_scale);
+        uint8_t p2 = quantize_fp4_pair_hw_bf16(src[base + 4], src[base + 5], sc.quant_scale);
+        uint8_t p3 = quantize_fp4_pair_hw_bf16(src[base + 6], src[base + 7], sc.quant_scale);
+        pack[j] = pack_fp4_to_u32(p0, p1, p2, p3);
     }
 
     QuantBlock result;
@@ -294,7 +322,7 @@ struct MfmaTraits {
 
     template <int M, int N>
     static __device__ __forceinline__ void store(
-        hip_bfloat16 C[][N], const acc_t& acc,
+        float C[][N], const acc_t& acc,
         int tile_m, int tile_n, int lane
     ) {
         if constexpr (IM == 32) {
@@ -305,7 +333,7 @@ struct MfmaTraits {
                 int gm = tile_m + row;
                 int gn = tile_n + col;
                 if (gm < M && gn < N)
-                    C[gm][gn] = static_cast<hip_bfloat16>(acc[i]);
+                    C[gm][gn] = acc[i];
             }
         } else {
             int col = lane % 16;
@@ -315,7 +343,7 @@ struct MfmaTraits {
                 int gm = tile_m + row;
                 int gn = tile_n + col;
                 if (gm < M && gn < N)
-                    C[gm][gn] = static_cast<hip_bfloat16>(acc[i]);
+                    C[gm][gn] = acc[i];
             }
         }
     }
@@ -364,9 +392,9 @@ struct MfmaTraits {
         }
     }
 
-    template <int N>
+    template <int N, int K_SPLITS>
     static __device__ __forceinline__ void store_f32(
-        float* ws, const acc_t& acc,
+        float C[][N], const acc_t& acc,
         int tile_m, int tile_n, int lane
     ) {
         if constexpr (IM == 32) {
@@ -374,14 +402,22 @@ struct MfmaTraits {
             int half = lane / 32;
             for (int i = 0; i < 16; i++) {
                 int row = (i % 4) + 4 * half + 8 * (i / 4);
-                ws[(tile_m + row) * N + tile_n + col] = acc[i];
+                if constexpr (K_SPLITS == 1) {
+                    C[tile_m + row][tile_n + col] = acc[i];
+                } else {
+                    unsafeAtomicAdd(&C[tile_m + row][tile_n + col], acc[i]);
+                }
             }
         } else {
             int col = lane % 16;
             int quad = lane / 16;
             for (int i = 0; i < 4; i++) {
                 int row = i + 4 * quad;
-                ws[(tile_m + row) * N + tile_n + col] = acc[i];
+                if constexpr (K_SPLITS == 1) {
+                    C[tile_m + row][tile_n + col] = acc[i];
+                } else {
+                    unsafeAtomicAdd(&C[tile_m + row][tile_n + col], acc[i]);
+                }
             }
         }
     }
@@ -555,7 +591,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_simple(
     const uint8_t B_data[][K_HALF],
     const uint8_t A_scale[][NUM_BLOCKS],
     const uint8_t* __restrict__ B_scale,
-    hip_bfloat16 C[][N]
+    float C[][N]
 ) {
     using Traits = MfmaTraits<IM, IN, IK>;
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
@@ -615,7 +651,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_simple_fused(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][K_HALF],
     const uint8_t* __restrict__ B_scale,
-    hip_bfloat16 C[][N]
+    float C[][N]
 ) {
     using Traits = MfmaTraits<IM, IN, IK>;
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
@@ -693,7 +729,7 @@ __global__ void mfma_fp4_gemm_coop_simple(
     uint8_t A_scale[][NUM_BLOCKS],
     const uint8_t B_data[][K_HALF],
     const uint8_t* __restrict__ B_scale,
-    hip_bfloat16 C[][N],
+    float C[][N],
     int* __restrict__ quant_counter
 ) {
     using Traits = MfmaTraits<IM, IN, IK>;
@@ -977,33 +1013,11 @@ __device__ __forceinline__ void load_b_to_lds(
     }
 }
 
-// Store C from shared memory to global memory (BF16 output)
-template <int M, int N, int OUTER_M, int OUTER_N, int BLOCK_SIZE>
-__device__ __forceinline__ void store_c_from_smem(
-    const float smem_c[][OUTER_N],
-    hip_bfloat16 C[][N],
-    int outer_m, int outer_n, int tid
-) {
-    constexpr int TOTAL = OUTER_M * OUTER_N;
-    constexpr int PER_THREAD = (TOTAL + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (int i = 0; i < PER_THREAD; i++) {
-        int idx = tid + i * BLOCK_SIZE;
-        if (idx < TOTAL) {
-            int local_m = idx / OUTER_N;
-            int local_n = idx % OUTER_N;
-            int gm = outer_m + local_m;
-            int gn = outer_n + local_n;
-            if (gm < M && gn < N)
-                C[gm][gn] = static_cast<hip_bfloat16>(smem_c[local_m][local_n]);
-        }
-    }
-}
-
 // Store C from shared memory to workspace (float output for split-K)
-template <int M, int N, int OUTER_M, int OUTER_N, int BLOCK_SIZE>
+template <int M, int N, int OUTER_M, int OUTER_N, int BLOCK_SIZE, int K_SPLITS = 1>
 __device__ __forceinline__ void store_c_from_smem_f32(
     const float smem_c[][OUTER_N],
-    float* __restrict__ workspace,
+    float C[][N],
     int outer_m, int outer_n, int tid
 ) {
     constexpr int TOTAL = OUTER_M * OUTER_N;
@@ -1015,7 +1029,11 @@ __device__ __forceinline__ void store_c_from_smem_f32(
             int local_n = idx % OUTER_N;
             int gm = outer_m + local_m;
             int gn = outer_n + local_n;
-            workspace[gm * N + gn] = smem_c[local_m][local_n];
+            if constexpr (K_SPLITS == 1) {
+                C[gm][gn] = smem_c[local_m][local_n];
+            } else {
+                unsafeAtomicAdd(&C[gm][gn], smem_c[local_m][local_n]);
+            }
         }
     }
 }
@@ -1137,7 +1155,7 @@ mfma_fp4_gemm_tiled(
     const uint8_t B_data[][K_HALF],
     const uint8_t A_scale[][NUM_BLOCKS],
     const uint8_t* __restrict__ B_scale,
-    hip_bfloat16 C[][N]
+    float C[][N]
 ) {
     constexpr int WARPS_M = OUTER_M / (IM * WARP_TILES_M);
     constexpr int WARPS_N = OUTER_N / (IN * WARP_TILES_N);
@@ -1275,7 +1293,7 @@ mfma_fp4_gemm_tiled(
         if constexpr (WARPS > 1) {
             __syncthreads();
         }
-        store_c_from_smem<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
+        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
             smem_c_data, C, outer_m, outer_n, tid);
     }
 }
@@ -1292,7 +1310,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
     const uint8_t B_data[][K_HALF],
     const uint8_t A_scale[][NUM_BLOCKS],
     const uint8_t* __restrict__ B_scale,
-    float* __restrict__ workspace
+    float C[][N]
 ) {
     using Traits = MfmaTraits<IM, IN, IK>;
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
@@ -1339,9 +1357,6 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
 
     // Last tile
     acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
-
-    // Store fp32 partial sums to workspace[split_id * M * N + ...]
-    float* ws = workspace + split_id * M * N;
     if constexpr (IM == 32) {
         int col = lane % 32;
         int half = lane / 32;
@@ -1350,7 +1365,11 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
             int gm = tile_m + row;
             int gn = tile_n + col;
             //if (gm < M && gn < N)
-                ws[gm * N + gn] = acc[i];
+            if constexpr (K_SPLITS == 1) {
+                C[gm][gn] = acc[i];
+            } else {
+                unsafeAtomicAdd(&C[gm][gn], acc[i]);
+            }
         }
     } else {
         int col = lane % 16;
@@ -1360,7 +1379,11 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
             int gm = tile_m + row;
             int gn = tile_n + col;
             //if (gm < M && gn < N)
-                ws[gm * N + gn] = acc[i];
+            if constexpr (K_SPLITS == 1) {
+                C[gm][gn] = acc[i];
+            } else {
+                unsafeAtomicAdd(&C[gm][gn], acc[i]);
+            }
         }
     }
 }
@@ -1377,7 +1400,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][N],
     const uint8_t* __restrict__ B_scale,
-    float* __restrict__ workspace
+    float C[][N]
 ) {
     using Traits = MfmaTraits<IM, IN, IK>;
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
@@ -1447,8 +1470,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
     // Last tile
     acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
 
-    // Store fp32 partial sums to workspace[split_id * M * N + ...]
-    float* ws = workspace + split_id * M * N;
     if constexpr (IM == 32) {
         int col = lane % 32;
         int half = lane / 32;
@@ -1456,7 +1477,11 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
             int row = (i % 4) + 4 * half + 8 * (i / 4);
             int gm = tile_m + row;
             int gn = tile_n + col;
-            ws[gm * N + gn] = acc[i];
+            if constexpr (K_SPLITS == 1) {
+                C[gm][gn] = acc[i];
+            } else {
+                unsafeAtomicAdd(&C[gm][gn], acc[i]);
+            }
         }
     } else {
         int col = lane % 16;
@@ -1465,7 +1490,11 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
             int row = i + 4 * quad;
             int gm = tile_m + row;
             int gn = tile_n + col;
-            ws[gm * N + gn] = acc[i];
+            if constexpr (K_SPLITS == 1) {
+                C[gm][gn] = acc[i];
+            } else {
+                unsafeAtomicAdd(&C[gm][gn], acc[i]);
+            }
         }
     }
 }
@@ -1483,7 +1512,7 @@ mfma_fp4_gemm_tiled_splitk_fused(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][K_HALF],
     const uint8_t* __restrict__ B_scale,
-    float* __restrict__ workspace
+    float C[][N]
 ) {
     constexpr int WARPS_M = OUTER_M / (IM * WARP_TILES_M);
     constexpr int WARPS_N = OUTER_N / (IN * WARP_TILES_N);
@@ -1598,16 +1627,14 @@ mfma_fp4_gemm_tiled_splitk_fused(
     }
 
     if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
-        float* ws = workspace + split_id * M * N;
-        Traits::template store_f32<N>(ws, reg_acc,
+        Traits::template store_f32<N, K_SPLITS>(C, reg_acc,
             outer_m + warp_m * IM, outer_n + warp_n * IN, lane);
     } else {
         if constexpr (WARPS > 1) {
             __syncthreads();
         }
-        float* ws = workspace + split_id * M * N;
-        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
-            smem_c_data, ws, outer_m, outer_n, tid);
+        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE, K_SPLITS>(
+            smem_c_data, C, outer_m, outer_n, tid);
     }
 }
 
@@ -1627,9 +1654,8 @@ mfma_fp4_gemm_tiled_splitk_coop(
     uint8_t A_scale[][NUM_BLOCKS],
     const uint8_t B_data[][N],
     const uint8_t* __restrict__ B_scale,
-    float* __restrict__ workspace,
-    int* __restrict__ quant_counter,
-    int* __restrict__ split_ready  // array of K_SPLITS ints: counts completed chunks per K-split
+    float C[][N],
+    int* __restrict__ quant_counter
 ) {
     constexpr int WARPS_M = OUTER_M / (IM * WARP_TILES_M);
     constexpr int WARPS_N = OUTER_N / (IN * WARP_TILES_N);
@@ -1809,10 +1835,8 @@ mfma_fp4_gemm_tiled_splitk_coop(
         __syncthreads();
     }
 
-    // Write fp32 partials to workspace from shared memory
-    float* ws = workspace + split_id * M * N;
-    store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
-        smem_c_data, ws, outer_m, outer_n, tid);
+    store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE, K_SPLITS>(
+        smem_c_data, C, outer_m, outer_n, tid);
 
     if constexpr (PROFILE_PHASES) {
         if (is_timer_block && tid == 0) {
@@ -1824,23 +1848,6 @@ mfma_fp4_gemm_tiled_splitk_coop(
                    (unsigned long long)(t_phase3 - t_start));
         }
     }
-}
-// =====================================================================
-
-template <int M, int N, int K_SPLITS>
-__global__ void reduce_splitk_kernel(
-    const float* __restrict__ workspace,
-    hip_bfloat16* __restrict__ C
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    constexpr int TOTAL = M * N;
-    if (idx >= TOTAL) return;
-
-    float sum = 0.0f;
-    for (int s = 0; s < K_SPLITS; s++) {
-        sum += workspace[s * TOTAL + idx];
-    }
-    C[idx] = static_cast<hip_bfloat16>(sum);
 }
 '''
 
@@ -1917,7 +1924,7 @@ void launch_simple(torch::Tensor A_bf16,
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t(*)[NUM_BLOCKS]>(A_scale_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
-        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()));
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
 
     if (do_profile) {
         (void)hipEventRecord(e2);
@@ -1970,7 +1977,7 @@ void launch_simple_fused(torch::Tensor A_bf16,
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
-        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()));
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
 
     if (do_profile) {
         (void)hipEventRecord(e1);
@@ -2033,7 +2040,7 @@ void launch_coop_simple(torch::Tensor A_bf16,
     auto A_scale_ptr = reinterpret_cast<uint8_t*>(A_scale_buf.data_ptr());
     auto B_data_ptr = reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr());
     auto B_scale_ptr = reinterpret_cast<const uint8_t*>(B_scale.data_ptr());
-    auto C_ptr = reinterpret_cast<hip_bfloat16*>(C.data_ptr());
+    auto C_ptr = reinterpret_cast<float(*)[N]>(C.data_ptr());
     auto qc_ptr = reinterpret_cast<int*>(quant_ctr_buf.data_ptr());
 
     void* args[] = {
@@ -2115,7 +2122,7 @@ void launch_tiled(torch::Tensor A_bf16,
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t(*)[NUM_BLOCKS]>(A_scale_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
-        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()));
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
 
     if (do_profile) {
         (void)hipEventRecord(e2);
@@ -2153,7 +2160,7 @@ void launch_tiled_fused(torch::Tensor A_bf16, torch::Tensor B,
         reinterpret_cast<const uint8_t(*)[K / 2]>(B.data_ptr()),
         reinterpret_cast<const uint8_t(*)[NUM_BLOCKS]>((const void*)0),
         reinterpret_cast<const uint8_t*>(Bs.data_ptr()),
-        reinterpret_cast<hip_bfloat16(*)[N]>(C.data_ptr()));
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
 }
 
 template <int M, int N, int K,
@@ -2164,15 +2171,18 @@ void launch_splitk(torch::Tensor A_bf16,
                    torch::Tensor B_data, torch::Tensor B_scale,
                    torch::Tensor C, bool profile) {
     // Pre-allocated scratch
-    static torch::Tensor A_data_buf, A_scale_buf, ws_buf;
+    static torch::Tensor A_data_buf, A_scale_buf;
     static int local_gen = -1;
     if (local_gen != g_generation) {
         auto u8opts = torch::TensorOptions().dtype(torch::kUInt8).device(A_bf16.device());
         auto f32opts = torch::TensorOptions().dtype(torch::kFloat32).device(A_bf16.device());
         A_data_buf = torch::empty({M, K_HALF}, u8opts);
         A_scale_buf = torch::empty({NUM_BLOCKS * M}, u8opts);
-        ws_buf = torch::empty({K_SPLITS * M * N}, f32opts);
         local_gen = g_generation;
+    }
+
+    if constexpr (K_SPLITS > 1) {
+        C.zero_();
     }
 
     static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
@@ -2180,9 +2190,9 @@ void launch_splitk(torch::Tensor A_bf16,
     stats.count++;
     bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
 
-    hipEvent_t e0, e1, e2, e3;
+    hipEvent_t e0, e1, e2;
     if (do_profile) {
-        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1); (void)hipEventCreate(&e2); (void)hipEventCreate(&e3);
+        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1); (void)hipEventCreate(&e2);
         (void)hipEventRecord(e0);
     }
 
@@ -2212,37 +2222,25 @@ void launch_splitk(torch::Tensor A_bf16,
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(A_scale_buf.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
-        reinterpret_cast<float*>(ws_buf.data_ptr()));
-
-    if (do_profile) (void)hipEventRecord(e2);
-
-    // Launch reduction
-    constexpr int r_total = M * N;
-    constexpr int r_block = 256;
-    constexpr int r_grid = (r_total + r_block - 1) / r_block;
-    reduce_splitk_kernel<M, N, K_SPLITS>
-        <<<dim3(r_grid), dim3(r_block)>>>(
-        reinterpret_cast<const float*>(ws_buf.data_ptr()),
-        reinterpret_cast<hip_bfloat16*>(C.data_ptr()));
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
 
     if (do_profile) {
-        (void)hipEventRecord(e3);
-        (void)hipEventSynchronize(e3);
-        float d01, d12, d23;
+        (void)hipEventRecord(e2);
+        (void)hipEventSynchronize(e2);
+        float d01, d12;
         (void)hipEventElapsedTime(&d01, e0, e1);
         (void)hipEventElapsedTime(&d12, e1, e2);
-        (void)hipEventElapsedTime(&d23, e2, e3);
-        stats.t_quant += d01; stats.t_gemm += d12; stats.t_reduce += d23;
+        stats.t_quant += d01; stats.t_gemm += d12;
         int n = stats.count / PROFILE_INTERVAL;
         if (n < 5) {
             printf("[Split-K GEMM] m=%d n=%d k=%d | "
-                "quant=%.1fus gemm=%.1fus reduce=%.1fus | "
+                "quant=%.1fus gemm=%.1fus | "
                 "total=%.1fus (avg over %d)\n",
                 M, N, K,
-                stats.t_quant/n*1000, stats.t_gemm/n*1000, stats.t_reduce/n*1000,
+                stats.t_quant/n*1000, stats.t_gemm/n*1000,
                 (stats.t_quant+stats.t_gemm)/n*1000, n);
         }
-        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1); (void)hipEventDestroy(e2);  (void)hipEventDestroy(e3);
+        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1); (void)hipEventDestroy(e2);
     }
 }
 
@@ -2257,22 +2255,20 @@ void launch_splitk_fused(torch::Tensor A_bf16,
                          torch::Tensor B_data, torch::Tensor B_scale,
                          torch::Tensor C, bool profile) {
     auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(A_bf16.device());
-    static torch::Tensor ws_buf;
-    {
-        int need = K_SPLITS * M * N;
-        if (!ws_buf.defined() || ws_buf.numel() < need)
-            ws_buf = torch::empty({need}, opts_f32);
-    }
 
     static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
     auto& stats = perf_map[M][N][K_HALF];
     stats.count++;
     bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
 
-    hipEvent_t e0, e1, e2;
+    hipEvent_t e0, e1;
     if (do_profile) {
-        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1); (void)hipEventCreate(&e2);
+        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1);
         (void)hipEventRecord(e0);
+    }
+
+    if constexpr (K_SPLITS > 1) {
+        C.zero_();
     }
 
     // Launch fused split-K GEMM (quantize A on-the-fly)
@@ -2285,36 +2281,23 @@ void launch_splitk_fused(torch::Tensor A_bf16,
         reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
-        reinterpret_cast<float*>(ws_buf.data_ptr()));
-
-    if (do_profile) (void)hipEventRecord(e1);
-
-    // Launch reduction
-    constexpr int r_total = M * N;
-    constexpr int r_block = 256;
-    constexpr int r_grid = (r_total + r_block - 1) / r_block;
-    reduce_splitk_kernel<M, N, K_SPLITS>
-        <<<dim3(r_grid), dim3(r_block)>>>(
-        reinterpret_cast<const float*>(ws_buf.data_ptr()),
-        reinterpret_cast<hip_bfloat16*>(C.data_ptr()));
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
 
     if (do_profile) {
-        (void)hipEventRecord(e2);
-        (void)hipEventSynchronize(e2);
-        float d01, d12;
+        (void)hipEventRecord(e1);
+        (void)hipEventSynchronize(e1);
+        float d01;
         (void)hipEventElapsedTime(&d01, e0, e1);
-        (void)hipEventElapsedTime(&d12, e1, e2);
-        stats.t_gemm += d01; stats.t_reduce += d12;
+        stats.t_gemm += d01;
         int n = stats.count / PROFILE_INTERVAL;
         if (n < 5) {
             printf("[Split-K Fused] m=%d n=%d k=%d splits=%d | "
-                "gemm+quant=%.1fus reduce=%.1fus | "
-                "total=%.1fus (avg over %d)\n",
+                "gemm+quant=%.1fus | "
+                "(avg over %d)\n",
                 M, N, K, K_SPLITS,
-                stats.t_gemm/n*1000, stats.t_reduce/n*1000,
-                (stats.t_gemm+stats.t_reduce)/n*1000, n);
+                stats.t_gemm/n*1000, n);
         }
-        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1); (void)hipEventDestroy(e2);
+        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1);
     }
 }
 
@@ -2326,14 +2309,6 @@ template <int M, int N, int K,
 void launch_tiled_splitk_fused(torch::Tensor A_bf16,
                                 torch::Tensor B_data, torch::Tensor B_scale,
                                 torch::Tensor C, bool profile) {
-    static torch::Tensor ws_buf;
-    static int local_gen = -1;
-    if (local_gen != g_generation) {
-        auto f32opts = torch::TensorOptions().dtype(torch::kFloat32).device(A_bf16.device());
-        ws_buf = torch::empty({K_SPLITS * M * N}, f32opts);
-        local_gen = g_generation;
-    }
-
     constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
 
     static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
@@ -2341,10 +2316,14 @@ void launch_tiled_splitk_fused(torch::Tensor A_bf16,
     stats.count++;
     bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
 
-    hipEvent_t e0, e1, e2;
+    hipEvent_t e0, e1;
     if (do_profile) {
-        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1); (void)hipEventCreate(&e2);
+        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1);
         (void)hipEventRecord(e0);
+    }
+
+    if constexpr (K_SPLITS > 1) {
+        C.zero_();
     }
 
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON, K_SPLITS);
@@ -2354,36 +2333,23 @@ void launch_tiled_splitk_fused(torch::Tensor A_bf16,
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
-        reinterpret_cast<float*>(ws_buf.data_ptr()));
-
-    if (do_profile) (void)hipEventRecord(e1);
-
-    // Separate reduction
-    constexpr int r_total = M * N;
-    constexpr int r_block = 256;
-    constexpr int r_grid = (r_total + r_block - 1) / r_block;
-    reduce_splitk_kernel<M, N, K_SPLITS>
-        <<<dim3(r_grid), dim3(r_block)>>>(
-        reinterpret_cast<const float*>(ws_buf.data_ptr()),
-        reinterpret_cast<hip_bfloat16*>(C.data_ptr()));
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
 
     if (do_profile) {
-        (void)hipEventRecord(e2);
-        (void)hipEventSynchronize(e2);
+        (void)hipEventRecord(e1);
+        (void)hipEventSynchronize(e1);
         float d01, d12;
         (void)hipEventElapsedTime(&d01, e0, e1);
-        (void)hipEventElapsedTime(&d12, e1, e2);
-        stats.t_gemm += d01; stats.t_reduce += d12;
+        stats.t_gemm += d01;
         int n = stats.count / PROFILE_INTERVAL;
         if (n < 5) {
             printf("[Tiled Split-K Fused] m=%d n=%d k=%d splits=%d | "
-                "gemm+quant=%.1fus reduce=%.1fus | "
-                "total=%.1fus (avg over %d)\n",
+                "gemm+quant=%.1fus | "
+                "(avg over %d)\n",
                 M, N, K, K_SPLITS,
-                stats.t_gemm/n*1000, stats.t_reduce/n*1000,
-                (stats.t_gemm+stats.t_reduce)/n*1000, n);
+                stats.t_gemm/n*1000, n);
         }
-        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1); (void)hipEventDestroy(e2);
+        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1);
     }
 }
 
@@ -2395,7 +2361,7 @@ template <int M, int N, int K,
 void launch_tiled_splitk_coop(torch::Tensor A_bf16,
                                torch::Tensor B_data, torch::Tensor B_scale,
                                torch::Tensor C, bool profile) {
-    static torch::Tensor A_data_buf, A_scale_buf, ws_buf, quant_ctr_buf, split_ready_buf;
+    static torch::Tensor A_data_buf, A_scale_buf, quant_ctr_buf, split_ready_buf;
     static int local_gen = -1;
     if (local_gen != g_generation) {
         auto u8opts = torch::TensorOptions().dtype(torch::kUInt8).device(A_bf16.device());
@@ -2403,7 +2369,6 @@ void launch_tiled_splitk_coop(torch::Tensor A_bf16,
         auto i32opts = torch::TensorOptions().dtype(torch::kInt32).device(A_bf16.device());
         A_data_buf = torch::empty({M, K_HALF}, u8opts);
         A_scale_buf = torch::empty({NUM_BLOCKS * M}, u8opts);
-        ws_buf = torch::empty({K_SPLITS * M * N}, f32opts);
         quant_ctr_buf = torch::zeros({1}, i32opts);
         split_ready_buf = torch::zeros({K_SPLITS}, i32opts);  // per-split completion counters
         local_gen = g_generation;
@@ -2420,14 +2385,17 @@ void launch_tiled_splitk_coop(torch::Tensor A_bf16,
     stats.count++;
     bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
 
-    hipEvent_t e0, e1, e2;
+    hipEvent_t e0, e1;
     if (do_profile) {
-        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1); (void)hipEventCreate(&e2);
+        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1);
         (void)hipEventRecord(e0);
     }
 
+    if constexpr (K_SPLITS > 1) {
+        C.zero_();
+    }
+
     int* quant_counter = reinterpret_cast<int*>(quant_ctr_buf.data_ptr());
-    int* split_ready = reinterpret_cast<int*>(split_ready_buf.data_ptr());
 
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON, K_SPLITS);
     dim3 block(WARPS * 64);
@@ -2438,45 +2406,32 @@ void launch_tiled_splitk_coop(torch::Tensor A_bf16,
     auto A_scale_ptr = reinterpret_cast<uint8_t*>(A_scale_buf.data_ptr());
     auto B_data_ptr = reinterpret_cast<const uint8_t*>(B_data.data_ptr());
     auto B_scale_ptr = reinterpret_cast<const uint8_t*>(B_scale.data_ptr());
-    auto ws_ptr = reinterpret_cast<float*>(ws_buf.data_ptr());
+    auto C_ptr = reinterpret_cast<float(*)[N]>(C.data_ptr());
 
     void* args[] = {
         &A_bf16_ptr, &A_data_ptr, &A_scale_ptr,
-        &B_data_ptr, &B_scale_ptr, &ws_ptr,
-        &quant_counter, &split_ready
+        &B_data_ptr, &B_scale_ptr, &C_ptr,
+        &quant_counter
     };
     (void)hipLaunchCooperativeKernel(
         (const void*)mfma_fp4_gemm_tiled_splitk_coop<WARPS,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>,
         grid, block, args, 0, 0);
 
-    if (do_profile) (void)hipEventRecord(e1);
-
-    // Reduction
-    constexpr int r_total = M * N;
-    constexpr int r_block = 256;
-    constexpr int r_grid = (r_total + r_block - 1) / r_block;
-    reduce_splitk_kernel<M, N, K_SPLITS>
-        <<<dim3(r_grid), dim3(r_block)>>>(
-        reinterpret_cast<const float*>(ws_buf.data_ptr()),
-        reinterpret_cast<hip_bfloat16*>(C.data_ptr()));
-
     if (do_profile) {
-        (void)hipEventRecord(e2);
-        (void)hipEventSynchronize(e2);
+        (void)hipEventRecord(e1);
+        (void)hipEventSynchronize(e1);
         float d01, d12;
         (void)hipEventElapsedTime(&d01, e0, e1);
-        (void)hipEventElapsedTime(&d12, e1, e2);
-        stats.t_gemm += d01; stats.t_reduce += d12;
+        stats.t_gemm += d01;
         int n = stats.count / PROFILE_INTERVAL;
         if (n < 5) {
             printf("[Tiled Split-K Coop] m=%d n=%d k=%d splits=%d | "
-                "gemm+quant=%.1fus reduce=%.1fus | "
-                "total=%.1fus (avg over %d)\n",
+                "gemm+quant=%.1fus | "
+                "(avg over %d)\n",
                 M, N, K, K_SPLITS,
-                stats.t_gemm/n*1000, stats.t_reduce/n*1000,
-                (stats.t_gemm+stats.t_reduce)/n*1000, n);
+                stats.t_gemm/n*1000, n);
         }
-        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1); (void)hipEventDestroy(e2);
+        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1);
     }
 }
 
@@ -2528,7 +2483,9 @@ void mfma_gemm(
     //SF16(32, 4096, 512, 1, 1) //--> 8.88 BEST
     //ITER2: SF32(32, 4096, 512, 1, 1) --> 14.5
     //ITER3: T(32, 4096, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.0
-    SF16(32, 4096, 512, 1, 2) //--> 8.48 BEST
+    SF16(32, 4096, 512, 1, 1) //--> 8.29 BEST
+    //RE-TUNE3: SF16(32, 4096, 512, 1, 2) --> 8.39
+    //RE-TUNE2: SF32(32, 4096, 512, 1, 1) --> 13.6
     //ITER6: SF16(32, 4096, 512, 2, 1) --> 8.74
     //ITER7: SF16(32, 4096, 512, 2, 2) --> 9.05
     //ITER8: S16(32, 4096, 512, 1, 1) --> 10.2
@@ -2537,7 +2494,9 @@ void mfma_gemm(
     //S32(32, 2880, 512, 1, 1) //--> 11.9
     //ITER1: T(32, 2880, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.1
     //SF16(32, 2880, 512, 1, 1) //--> 8.74 NEW BEST
-    SF16(32, 2880, 512, 1, 2) //--> 8.47 BEST
+    SF16(32, 2880, 512, 1, 1) //--> 8.18 BEST
+    //RE-TUNE3: SF16(32, 2880, 512, 1, 2) --> 8.34
+    //RE-TUNE2: SF32(32, 2880, 512, 1, 1) --> 13.5
     //ITER5: SF16(32, 2880, 512, 2, 1) --> 8.55
     //ITER6: SF16(32, 2880, 512, 2, 2) --> 8.98
     //ITER8: S16(32, 2880, 512, 1, 1) --> 9.76
@@ -2583,10 +2542,16 @@ void mfma_gemm(
     //ITER12: TSK(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 3, 1, -1) --> 21.6
     //ITER13: F2(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1, 1) --> 24.2
     //ITER14: TSK(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 4, 1, -1) --> 21.5
-    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //--> 17.1 BEST
+    //RE-TUNE1: S32(256, 3072, 1536, 1, 1) --> 19.2
+    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //--> 16.3 BEST
+    //RE-TUNE3: TSK(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1, 1, -1) --> 23.6
+    //RE-TUNE2: T(256, 3072, 1536, 64, 64, 256, 32, 32, 64, 1, 1, 1) --> 34.4
 
     // Simple 16x16x128
-    SF16(4,  2880, 512, 1, 1) //--> 8.32 BEST
+    SF16(4,  2880, 512, 1, 1) //--> 7.77 BEST
+    //RE-TUNE3: SF16(4, 2880, 512, 1, 2) --> 8.34
+    //RE-TUNE1: SF16(4, 2880, 512, 2, 1) --> 8.11
+    //RE-TUNE2: SF32(4, 2880, 512, 1, 1) --> 13.1
     //ITER2: SF32(4, 2880, 512, 1, 1) --> 13.7
     //ITER3: T(4, 2880, 512, 16, 32, 128, 16, 16, 128, 1, 1, 1) --> 11.1
     //ITER5: SF16(4, 2880, 512, 1, 2) --> 8.53
@@ -2613,13 +2578,17 @@ void mfma_gemm(
     //ITER5: TSK(64, 7168, 2048, 32, 64, 256, 16, 16, 128, 1, 2, 4, 1, -1) --> 22.6
     //ITER6: TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 2, 2, 4, 1, -1) --> 26.8
     //ITER7: TSK(64, 7168, 2048, 16, 64, 128, 16, 16, 128, 1, 2, 4, 1, -1) --> 26.3
-    //ITER8: TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 4, 1, 1) --> 20.3
+    //ITER8: TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 4, 1, 1) --> 22.8
     //ITER9: TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 4, 2, -1) --> 19.8 NEW BEST
     //ITER11: TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 3, 2, -1) --> 20.8
     //ITER12: TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 6, 2, -1) --> 21.3
     //ITER13: TSK(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 4, 2, -1) --> 21.7
-    //ITER14: T(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 2) --> 20.8
-    TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 4, 2, -1) //--> 19.8 BEST
+    //ITER14: T(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 2) --> 20.1
+    //RE-TUNE1: TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 4, 1, -1) --> 22.7 NEW BEST
+    //RE-TUNE2: TSK(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 4, 1, -1) --> 22.7
+    //TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 4, 1, -1) //--> 22.7 BEST
+    //RE-TUNE3: TSK(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 4, 1, -1) --> 22.6
+    T(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 2)
     //ITER10: try TSK(32,64,128, 1,2, 3, 2, -1) split-K=3
     //TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 3, 2, -1) //ITER10 TBD
     //T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 2, 1, 1) --> 70.0
@@ -2631,19 +2600,21 @@ void mfma_gemm(
 
     // Split-K
     //SKF(16, 2112, 7168, 16,16,128, 1,1, 28)
-    //TSK(16, 2112, 7168, 16,64,256, 16,16,128, 1,1, 28, 1, 1) //--> 13.0 BEST
-    //ITER2: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 14, 1, 1) --> 15.8
-    //ITER3: TSK(16, 2112, 7168, 16, 32, 128, 16, 16, 128, 1, 1, 28, 1, -1) --> 13.7
-    //ITER4: TSK(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 28, 1, -1) --> 13.2
-    //ITER6: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) --> 15.1
-    //ITER8: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, -1) --> 12.9
+    //TSK(16, 2112, 7168, 16,64,256, 16,16,128, 1,1, 28, 1, 1) --> 15.5
+    //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 14, 1, 1) --> 17.6
+    //TSK(16, 2112, 7168, 16, 32, 128, 16, 16, 128, 1, 1, 28, 1, -1) --> 16.8
+    //TSK(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 28, 1, -1) --> 16.1
+    TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) //--> 15.1
+    //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, -1) --> 16.0
     //ITER9: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 56, 1, -1) --> INCORRECT
-    //ITER10: TSK(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 28, 2, -1) --> 13.4
-    //ITER11: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, 1) --> 13.2
-    //ITER12: TSK(16, 2112, 7168, 16, 32, 256, 16, 16, 128, 1, 1, 28, 1, -1) --> 13.8
-    //ITER13: TSK(16, 2112, 7168, 16, 64, 512, 16, 16, 128, 1, 1, 14, 1, -1) --> 14.6
-    //ITER14: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 7, 1, -1) --> 20.8
-    TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, -1) //--> 12.9 BEST
+    //TSK(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 28, 2, -1) --> 16.3
+    //ITER11: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, 1) --> 15.4
+    //TSK(16, 2112, 7168, 16, 32, 256, 16, 16, 128, 1, 1, 28, 1, -1) --> 16.6
+    //TSK(16, 2112, 7168, 16, 64, 512, 16, 16, 128, 1, 1, 14, 1, -1) --> 17.4
+    //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 7, 1, -1) --> 22.2
+    //RE-TUNE1: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, 1) --> 15.6
+    //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, -1) //--> 15.6 BEST
+    //RE-TUNE2: T(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 1) --> 37.1
     //ITER7: try bufs=2 on winning config
     //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, -1) //ITER7 TBD
     //TSKC(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 14, 1, 2)
@@ -2680,7 +2651,7 @@ def _try_compile():
         t0 = time.time()
         _hip_module = load_inline(
             name='mxfp4_mfma_v8', cpp_sources='', cuda_sources=[src],
-            extra_cflags=['-O3'], extra_cuda_cflags=['-O3', '--offload-arch=gfx950', '-DHIP_ENABLE_EXTRA_WARP_SYNC_TYPES'],
+            extra_cflags=['-O3'], extra_cuda_cflags=['-O3', '-ffast-math', '-munsafe-fp-atomics', '--offload-arch=gfx950', '-DHIP_ENABLE_EXTRA_WARP_SYNC_TYPES'],
             extra_include_paths=[f'{rocm_home}/include'], verbose=True)
         print(f"[mxfp4-mm] MFMA kernel compiled in {time.time()-t0:.1f}s")
         HAS_HIP_KERNEL = True
@@ -2761,6 +2732,6 @@ def custom_kernel(data: input_t) -> output_t:
     if not HAS_HIP_KERNEL:
         return
 
-    C = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+    C = torch.empty((m, n), dtype=torch.float32, device=A.device)
     _hip_module.mfma_gemm(A, B_data, B_sc, C, m, n, k, PROFILE)
     return C
