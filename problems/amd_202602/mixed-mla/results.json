@@ -1,5 +1,5 @@
 "**MI355X on GitHub ✅ success**
-> Workflow [23876590304](<https://github.com/gpu-mode/kernelbot/actions/runs/23876590304>) completed
+> Workflow [23888237125](<https://github.com/gpu-mode/kernelbot/actions/runs/23888237125>) completed
 > Downloading artifacts... done
 > ✅ Compilation successful
 > ✅ Benchmarking successful
@@ -11,42 +11,42 @@ Running on:
 * Runtime: `ROCm`
 * Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
 * Torch: `2.10.0+rocm7.1`
-* Hostname: `arc-runner-set-hbp2z-runner-frtll`
+* Hostname: `arc-runner-set-hbp2z-runner-xkzwp`
 
 
 ## Benchmarks:
 ```
 seed: 4217; qseqlen: 1; kvseqlen: 1024; batchsize: 4
- ⏱ 38.2 ± 0.04 µs
- ⚡ 37.0 µs 🐌 42.0 µs
+ ⏱ 38.7 ± 0.25 µs
+ ⚡ 34.9 µs 🐌 77.2 µs
 
 seed: 4220; qseqlen: 1; kvseqlen: 8192; batchsize: 4
- ⏱ 44.2 ± 0.04 µs
- ⚡ 43.3 µs 🐌 49.4 µs
+ ⏱ 43.1 ± 0.26 µs
+ ⚡ 39.5 µs 🐌 88.2 µs
 
 seed: 5412; qseqlen: 1; kvseqlen: 1024; batchsize: 32
- ⏱ 37.6 ± 0.04 µs
- ⚡ 36.8 µs 🐌 40.9 µs
+ ⏱ 36.6 ± 0.27 µs
+ ⚡ 33.0 µs 🐌 81.9 µs
 
 seed: 5415; qseqlen: 1; kvseqlen: 8192; batchsize: 32
- ⏱ 177 ± 0.5 µs
- ⚡ 165 µs 🐌 378 µs
+ ⏱ 138 ± 0.3 µs
+ ⚡ 133 µs 🐌 191 µs
 
 seed: 1357; qseqlen: 1; kvseqlen: 1024; batchsize: 64
- ⏱ 73.3 ± 0.07 µs
- ⚡ 72.1 µs 🐌 79.1 µs
+ ⏱ 64.8 ± 0.27 µs
+ ⚡ 61.0 µs 🐌 109 µs
 
 seed: 1360; qseqlen: 1; kvseqlen: 8192; batchsize: 64
- ⏱ 231 ± 0.4 µs
- ⚡ 217 µs 🐌 407 µs
+ ⏱ 332 ± 0.3 µs
+ ⚡ 325 µs 🐌 386 µs
 
 seed: 9823; qseqlen: 1; kvseqlen: 1024; batchsize: 256
- ⏱ 156 ± 0.2 µs
- ⚡ 154 µs 🐌 161 µs
+ ⏱ 136 ± 0.3 µs
+ ⚡ 131 µs 🐌 178 µs
 
 seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
- ⏱ 380 ± 0.4 µs
- ⚡ 366 µs 🐌 561 µs
+ ⏱ 1311 ± 1.3 µs
+ ⚡ 1279 µs 🐌 1354 µs
 ```
 
 ## Program stderr:
@@ -55,7 +55,7 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 \u001b[92mSuccessfully preprocessed all matching files.\u001b[0m
 [aiter] start build [module_mla_metadata] under /home/runner/aiter/aiter/jit/build/module_mla_metadata
-[aiter] \u001b[32mfinish build [module_mla_metadata], cost 31.5s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_metadata], cost 30.9s \u001b[0m
 [aiter] import [module_mla_metadata] under /home/runner/aiter/aiter/jit/module_mla_metadata.so
 [aiter] type hints mismatch, override to --> get_mla_metadata_v1(seqlens_qo_indptr: torch.Tensor, seqlens_kv_indptr: torch.Tensor, kv_last_page_lens: torch.Tensor, num_heads_per_head_k: int | typing.SupportsIndex, num_heads_k: int | typing.SupportsIndex, is_causal: bool, work_metadata_ptrs: torch.Tensor, work_info_set: torch.Tensor, work_indptr: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: torch.Tensor, reduce_partial_map: torch.Tensor, page_size: int | typing.SupportsIndex = 1, kv_granularity: int | typing.SupportsIndex = 16, max_seqlen_qo: int | typing.SupportsIndex = -1, uni_seqlen_qo: int | typing.SupportsIndex = -1, fast_mode: bool = True, topk: int | typing.SupportsIndex = -1, max_split_per_batch: int | typing.SupportsIndex = -1, intra_batch_mode: bool = False, dtype_q: Optional[torch.dtype] = None, dtype_kv: Optional[torch.dtype] = None) -> None
 [aiter] start build [module_mla_asm] under /home/runner/aiter/aiter/jit/build/module_mla_asm
@@ -67,7 +67,7 @@ seed: 9826; qseqlen: 1; kvseqlen: 8192; batchsize: 256
 [aiter] import [module_mla_asm] under /home/runner/aiter/aiter/jit/module_mla_asm.so
 [aiter] type hints mismatch, override to --> mla_decode_stage1_asm_fwd(Q: torch.Tensor, KV: torch.Tensor, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_page_indices: torch.Tensor, kv_last_page_lens: torch.Tensor, num_kv_splits_indptr: Optional[torch.Tensor], work_meta_data: Optional[torch.Tensor], work_indptr: Optional[torch.Tensor], work_info_set: Optional[torch.Tensor], max_seqlen_q: int | typing.SupportsIndex, page_size: int | typing.SupportsIndex, nhead_kv: int | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, splitData: torch.Tensor, splitLse: torch.Tensor, output: torch.Tensor, q_scale: Optional[torch.Tensor] = None, kv_scale: Optional[torch.Tensor] = None) -> None
 [aiter] start build [module_mla_reduce] under /home/runner/aiter/aiter/jit/build/module_mla_reduce
-[aiter] \u001b[32mfinish build [module_mla_reduce], cost 170.7s \u001b[0m
+[aiter] \u001b[32mfinish build [module_mla_reduce], cost 169.8s \u001b[0m
 [aiter] import [module_mla_reduce] under /home/runner/aiter/aiter/jit/module_mla_reduce.so
 [aiter] type hints mismatch, override to --> mla_reduce_v1(partial_output: torch.Tensor, partial_lse: torch.Tensor, reduce_indptr: torch.Tensor, reduce_final_map: Optional[torch.Tensor], reduce_partial_map: torch.Tensor, max_seqlen_q: int | typing.SupportsIndex, final_output: torch.Tensor, final_lse: Optional[torch.Tensor] = None) -> None```
 
@@ -82,8 +82,145 @@ Total number of unsupported CUDA function calls: 0
 
 
 Total number of replaced kernel launches: 3
-[1/1] clang++ hip.cuda.o main.o -shared -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_hip -ltorch_cpu -ltorch_hip -ltorch -ltorch_python -L/opt/rocm/lib -lamdhip64 -o mla_mxfp4_hip_torch_v13.so
-[PyTorch] load_inline took 0.45s
-[PyTorch] Total compilation time: 0.45s
+ninja: no work to do.
+[PyTorch] load_inline took 0.29s
+[PyTorch] Total compilation time: 0.29s
 [aiter] hipModuleLoad: /home/runner/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co GetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE
-[aiter] hipModuleGetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE Success```"
+[aiter] hipModuleGetFunction: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE Success
+[MLA FUSED] bs=4 kv=1024 splits=16 | quant=7.0us fused_attn=28.8us reduce=6.0us | total=41.8us (avg over 1)
+[MLA FUSED] bs=4 kv=1024 splits=16 | quant=7.1us fused_attn=29.4us reduce=6.0us | total=42.5us (avg over 2)
+[MLA FUSED] bs=4 kv=1024 splits=16 | quant=7.0us fused_attn=29.4us reduce=6.0us | total=42.4us (avg over 3)
+[MLA FUSED] bs=4 kv=1024 splits=16 | quant=7.0us fused_attn=29.4us reduce=6.0us | total=42.4us (avg over 4)
+[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.8us fused_attn=26.8us reduce=11.0us | total=44.6us (avg over 1)
+[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.8us fused_attn=26.7us reduce=11.0us | total=44.6us (avg over 2)
+[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.8us fused_attn=26.8us reduce=11.0us | total=44.6us (avg over 3)
+[MLA FUSED] bs=4 kv=8192 splits=64 | quant=6.8us fused_attn=26.8us reduce=11.0us | total=44.6us (avg over 4)
+[MLA FUSED] bs=32 kv=1024 splits=8 | quant=7.0us fused_attn=28.8us reduce=6.2us | total=41.9us (avg over 1)
+[MLA FUSED] bs=32 kv=1024 splits=8 | quant=6.8us fused_attn=27.6us reduce=6.1us | total=40.6us (avg over 2)
+[MLA FUSED] bs=32 kv=1024 splits=8 | quant=6.8us fused_attn=27.2us reduce=6.1us | total=40.1us (avg over 3)
+[MLA FUSED] bs=32 kv=1024 splits=8 | quant=6.8us fused_attn=27.0us reduce=6.1us | total=39.9us (avg over 4)
+[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.7us fused_attn=125.9us reduce=6.6us | total=139.1us (avg over 1)
+[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.7us fused_attn=125.8us reduce=7.0us | total=139.5us (avg over 2)
+[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.7us fused_attn=125.9us reduce=6.9us | total=139.4us (avg over 3)
+[MLA FUSED] bs=32 kv=8192 splits=16 | quant=6.7us fused_attn=126.2us reduce=6.8us | total=139.7us (avg over 4)
+[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.9us fused_attn=54.9us reduce=6.2us | total=68.0us (avg over 1)
+[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.9us fused_attn=56.3us reduce=7.0us | total=70.1us (avg over 2)
+[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.9us fused_attn=55.9us reduce=6.7us | total=69.5us (avg over 3)
+[MLA FUSED] bs=64 kv=1024 splits=4 | quant=6.8us fused_attn=56.2us reduce=7.5us | total=70.5us (avg over 4)
+[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.7us fused_attn=325.8us reduce=6.3us | total=338.8us (avg over 1)
+[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.8us fused_attn=323.0us reduce=6.4us | total=336.1us (avg over 2)
+[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.8us fused_attn=323.4us reduce=6.4us | total=336.6us (avg over 3)
+[MLA FUSED] bs=64 kv=8192 splits=8 | quant=6.8us fused_attn=323.8us reduce=6.4us | total=337.0us (avg over 4)
+[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.7us fused_attn=122.9us reduce=7.3us | total=137.9us (avg over 1)
+[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.5us fused_attn=123.5us reduce=7.1us | total=138.2us (avg over 2)
+[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.4us fused_attn=124.0us reduce=7.1us | total=138.6us (avg over 3)
+[MLA FUSED] bs=256 kv=1024 splits=2 | quant=7.4us fused_attn=124.2us reduce=7.1us | total=138.7us (avg over 4)
+[Fused Attn] N=8192 splits=4 | load=20860 qkt=5708 softmax=7136 mfma_v=20624 store=360 total=55180 cycles
+[Fused Attn] N=8192 splits=4 | load=22440 qkt=5788 softmax=7408 mfma_v=20588 store=332 total=57044 cycles
+[Fused Attn] N=8192 splits=4 | load=22808 qkt=5440 softmax=6880 mfma_v=20196 store=328 total=56108 cycles
+[Fused Attn] N=8192 splits=4 | load=22540 qkt=5652 softmax=7276 mfma_v=20056 store=316 total=56288 cycles
+[Fused Attn] N=8192 splits=4 | load=22396 qkt=5660 softmax=7144 mfma_v=19996 store=488 total=56156 cycles
+[Fused Attn] N=8192 splits=4 | load=21968 qkt=5504 softmax=6600 mfma_v=19636 store=332 total=54520 cycles
+[Fused Attn] N=8192 splits=4 | load=22888 qkt=5624 softmax=6700 mfma_v=20184 store=348 total=56264 cycles
+[Fused Attn] N=8192 splits=4 | load=21164 qkt=5600 softmax=6692 mfma_v=20660 store=312 total=54992 cycles
+[Fused Attn] N=8192 splits=4 | load=22912 qkt=5432 softmax=6928 mfma_v=19576 store=332 total=55620 cycles
+[Fused Attn] N=8192 splits=4 | load=22460 qkt=5748 softmax=7208 mfma_v=20188 store=580 total=56672 cycles
+[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.6us fused_attn=1297.9us reduce=9.5us | total=1315.0us (avg over 1)
+[Fused Attn] N=8192 splits=4 | load=22168 qkt=5708 softmax=7204 mfma_v=20564 store=440 total=56548 cycles
+[Fused Attn] N=8192 splits=4 | load=23028 qkt=5560 softmax=7068 mfma_v=19948 store=344 total=56424 cycles
+[Fused Attn] N=8192 splits=4 | load=22512 qkt=5692 softmax=7044 mfma_v=21060 store=412 total=57208 cycles
+[Fused Attn] N=8192 splits=4 | load=22868 qkt=5640 softmax=6908 mfma_v=20120 store=340 total=56364 cycles
+[Fused Attn] N=8192 splits=4 | load=21004 qkt=5556 softmax=6644 mfma_v=22428 store=384 total=56624 cycles
+[Fused Attn] N=8192 splits=4 | load=21960 qkt=5568 softmax=7348 mfma_v=19608 store=368 total=55380 cycles
+[Fused Attn] N=8192 splits=4 | load=22792 qkt=5420 softmax=6692 mfma_v=20184 store=336 total=55860 cycles
+[Fused Attn] N=8192 splits=4 | load=23016 qkt=5624 softmax=6708 mfma_v=20128 store=332 total=56260 cycles
+[Fused Attn] N=8192 splits=4 | load=22736 qkt=5504 softmax=6636 mfma_v=19572 store=332 total=55228 cycles
+[Fused Attn] N=8192 splits=4 | load=22080 qkt=5664 softmax=6880 mfma_v=22132 store=336 total=57536 cycles
+[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.3us fused_attn=1304.2us reduce=9.5us | total=1321.0us (avg over 2)
+[Fused Attn] N=8192 splits=4 | load=22392 qkt=5572 softmax=7048 mfma_v=19952 store=388 total=55780 cycles
+[Fused Attn] N=8192 splits=4 | load=22856 qkt=5376 softmax=6600 mfma_v=20140 store=328 total=55748 cycles
+[Fused Attn] N=8192 splits=4 | load=23212 qkt=5596 softmax=6664 mfma_v=19744 store=344 total=56064 cycles
+[Fused Attn] N=8192 splits=4 | load=22816 qkt=5360 softmax=6636 mfma_v=19708 store=340 total=55296 cycles
+[Fused Attn] N=8192 splits=4 | load=21712 qkt=5752 softmax=7096 mfma_v=22720 store=376 total=58220 cycles
+[Fused Attn] N=8192 splits=4 | load=21964 qkt=5776 softmax=6964 mfma_v=20356 store=460 total=56024 cycles
+[Fused Attn] N=8192 splits=4 | load=22928 qkt=5524 softmax=6796 mfma_v=19580 store=332 total=55604 cycles
+[Fused Attn] N=8192 splits=4 | load=22592 qkt=5372 softmax=6616 mfma_v=20100 store=344 total=55504 cycles
+[Fused Attn] N=8192 splits=4 | load=22548 qkt=5624 softmax=7188 mfma_v=19992 store=600 total=56440 cycles
+[Fused Attn] N=8192 splits=4 | load=21868 qkt=5752 softmax=7112 mfma_v=20592 store=468 total=56316 cycles
+[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.2us fused_attn=1302.8us reduce=9.5us | total=1319.6us (avg over 3)
+[Fused Attn] N=8192 splits=4 | load=22544 qkt=5484 softmax=6876 mfma_v=20112 store=332 total=55808 cycles
+[Fused Attn] N=8192 splits=4 | load=22660 qkt=5508 softmax=6532 mfma_v=19832 store=324 total=55308 cycles
+[Fused Attn] N=8192 splits=4 | load=22448 qkt=5648 softmax=7168 mfma_v=19924 store=628 total=56272 cycles
+[Fused Attn] N=8192 splits=4 | load=22728 qkt=5628 softmax=6716 mfma_v=20120 store=328 total=55984 cycles
+[Fused Attn] N=8192 splits=4 | load=21536 qkt=5660 softmax=6920 mfma_v=22680 store=512 total=57740 cycles
+[Fused Attn] N=8192 splits=4 | load=22204 qkt=5652 softmax=6904 mfma_v=21488 store=480 total=57196 cycles
+[Fused Attn] N=8192 splits=4 | load=21812 qkt=5780 softmax=7180 mfma_v=20628 store=496 total=56340 cycles
+[Fused Attn] N=8192 splits=4 | load=22820 qkt=5564 softmax=6652 mfma_v=19900 store=324 total=55708 cycles
+[Fused Attn] N=8192 splits=4 | load=23032 qkt=5492 softmax=6792 mfma_v=20308 store=348 total=56412 cycles
+[Fused Attn] N=8192 splits=4 | load=21296 qkt=5504 softmax=6636 mfma_v=20784 store=336 total=55096 cycles
+[MLA FUSED] bs=256 kv=8192 splits=4 | quant=7.3us fused_attn=1300.1us reduce=9.5us | total=1316.9us (avg over 4)
+[Fused Attn] N=8192 splits=4 | load=22528 qkt=5376 softmax=6652 mfma_v=20288 store=328 total=55604 cycles
+[Fused Attn] N=8192 splits=4 | load=22720 qkt=5360 softmax=6648 mfma_v=20340 store=368 total=55900 cycles
+[Fused Attn] N=8192 splits=4 | load=22368 qkt=5588 softmax=7100 mfma_v=19856 store=416 total=55764 cycles
+[Fused Attn] N=8192 splits=4 | load=22268 qkt=5640 softmax=7132 mfma_v=20164 store=428 total=56072 cycles
+[Fused Attn] N=8192 splits=4 | load=22764 qkt=5484 softmax=6692 mfma_v=19724 store=336 total=55480 cycles
+[Fused Attn] N=8192 splits=4 | load=22076 qkt=5632 softmax=7156 mfma_v=20052 store=524 total=55884 cycles
+[Fused Attn] N=8192 splits=4 | load=22496 qkt=5632 softmax=7000 mfma_v=19600 store=988 total=56176 cycles
+[Fused Attn] N=8192 splits=4 | load=22796 qkt=5440 softmax=6692 mfma_v=19968 store=340 total=55692 cycles
+[Fused Attn] N=8192 splits=4 | load=22864 qkt=5644 softmax=7024 mfma_v=19880 store=324 total=56220 cycles
+[Fused Attn] N=8192 splits=4 | load=22580 qkt=5580 softmax=6792 mfma_v=20184 store=336 total=55944 cycles
+[Fused Attn] N=8192 splits=4 | load=20988 qkt=5632 softmax=6952 mfma_v=23128 store=392 total=57612 cycles
+[Fused Attn] N=8192 splits=4 | load=22036 qkt=5412 softmax=6584 mfma_v=21152 store=328 total=55952 cycles
+[Fused Attn] N=8192 splits=4 | load=21552 qkt=5776 softmax=6856 mfma_v=22132 store=704 total=57560 cycles
+[Fused Attn] N=8192 splits=4 | load=22384 qkt=5580 softmax=7132 mfma_v=19860 store=352 total=55780 cycles
+[Fused Attn] N=8192 splits=4 | load=22692 qkt=5608 softmax=7064 mfma_v=19848 store=328 total=55996 cycles
+[Fused Attn] N=8192 splits=4 | load=22492 qkt=5552 softmax=7076 mfma_v=19944 store=540 total=56052 cycles
+[Fused Attn] N=8192 splits=4 | load=22536 qkt=5520 softmax=6908 mfma_v=20404 store=348 total=56164 cycles
+[Fused Attn] N=8192 splits=4 | load=22308 qkt=5504 softmax=6592 mfma_v=20428 store=340 total=55688 cycles
+[Fused Attn] N=8192 splits=4 | load=21200 qkt=5648 softmax=6732 mfma_v=22104 store=448 total=56732 cycles
+[Fused Attn] N=8192 splits=4 | load=22900 qkt=5380 softmax=6600 mfma_v=19992 store=340 total=55652 cycles
+[Fused Attn] N=8192 splits=4 | load=20440 qkt=5480 softmax=6704 mfma_v=21744 store=492 total=55300 cycles
+[Fused Attn] N=8192 splits=4 | load=20524 qkt=5604 softmax=6840 mfma_v=19988 store=348 total=53800 cycles
+[Fused Attn] N=8192 splits=4 | load=22732 qkt=5408 softmax=6604 mfma_v=20096 store=340 total=55628 cycles
+[Fused Attn] N=8192 splits=4 | load=22000 qkt=5400 softmax=6784 mfma_v=21516 store=472 total=56616 cycles
+[Fused Attn] N=8192 splits=4 | load=22832 qkt=5520 softmax=6792 mfma_v=19540 store=332 total=55472 cycles
+[Fused Attn] N=8192 splits=4 | load=21636 qkt=5488 softmax=6728 mfma_v=20324 store=324 total=54964 cycles
+[Fused Attn] N=8192 splits=4 | load=23060 qkt=5496 softmax=6932 mfma_v=20028 store=344 total=56344 cycles
+[Fused Attn] N=8192 splits=4 | load=22768 qkt=5636 softmax=6716 mfma_v=20168 store=364 total=56124 cycles
+[Fused Attn] N=8192 splits=4 | load=20992 qkt=5468 softmax=6620 mfma_v=21508 store=332 total=55404 cycles
+[Fused Attn] N=8192 splits=4 | load=22128 qkt=5608 softmax=7212 mfma_v=19928 store=412 total=55780 cycles
+[Fused Attn] N=8192 splits=4 | load=22704 qkt=5680 softmax=7116 mfma_v=20240 store=572 total=56756 cycles
+[Fused Attn] N=8192 splits=4 | load=21396 qkt=5784 softmax=6984 mfma_v=23596 store=396 total=58596 cycles
+[Fused Attn] N=8192 splits=4 | load=22396 qkt=5616 softmax=7444 mfma_v=19688 store=588 total=56164 cycles
+[Fused Attn] N=8192 splits=4 | load=22452 qkt=5476 softmax=6828 mfma_v=20952 store=364 total=56508 cycles
+[Fused Attn] N=8192 splits=4 | load=21996 qkt=5596 softmax=7244 mfma_v=19988 store=500 total=55764 cycles
+[Fused Attn] N=8192 splits=4 | load=22792 qkt=5548 softmax=6976 mfma_v=19652 store=340 total=55788 cycles
+[Fused Attn] N=8192 splits=4 | load=21812 qkt=5680 softmax=7040 mfma_v=21820 store=660 total=57536 cycles
+[Fused Attn] N=8192 splits=4 | load=21476 qkt=5668 softmax=6840 mfma_v=22868 store=752 total=58124 cycles
+[Fused Attn] N=8192 splits=4 | load=21768 qkt=5740 softmax=6924 mfma_v=22312 store=492 total=57688 cycles
+[Fused Attn] N=8192 splits=4 | load=22024 qkt=5684 softmax=7388 mfma_v=20296 store=744 total=56628 cycles
+[Fused Attn] N=8192 splits=4 | load=22748 qkt=5760 softmax=7288 mfma_v=20236 store=588 total=57064 cycles
+[Fused Attn] N=8192 splits=4 | load=21612 qkt=5496 softmax=6800 mfma_v=20920 store=332 total=55612 cycles
+[Fused Attn] N=8192 splits=4 | load=22148 qkt=5736 softmax=7116 mfma_v=21680 store=468 total=57640 cycles
+[Fused Attn] N=8192 splits=4 | load=22856 qkt=5568 softmax=6672 mfma_v=19508 store=304 total=55372 cycles
+[Fused Attn] N=8192 splits=4 | load=22808 qkt=5584 softmax=7028 mfma_v=19780 store=416 total=56068 cycles
+[Fused Attn] N=8192 splits=4 | load=22712 qkt=5520 softmax=6608 mfma_v=19904 store=332 total=55576 cycles
+[Fused Attn] N=8192 splits=4 | load=20932 qkt=5668 softmax=6932 mfma_v=23648 store=528 total=58156 cycles
+[Fused Attn] N=8192 splits=4 | load=22136 qkt=5768 softmax=7028 mfma_v=20924 store=584 total=56892 cycles
+[Fused Attn] N=8192 splits=4 | load=21580 qkt=5768 softmax=6968 mfma_v=22856 store=464 total=58124 cycles
+[Fused Attn] N=8192 splits=4 | load=22388 qkt=5580 softmax=7088 mfma_v=20076 store=500 total=56052 cycles
+[Fused Attn] N=8192 splits=4 | load=22504 qkt=5596 softmax=7500 mfma_v=19844 store=512 total=56396 cycles
+[Fused Attn] N=8192 splits=4 | load=22408 qkt=5600 softmax=7140 mfma_v=19888 store=496 total=55964 cycles
+[Fused Attn] N=8192 splits=4 | load=21948 qkt=5472 softmax=6676 mfma_v=20132 store=344 total=55084 cycles
+[Fused Attn] N=8192 splits=4 | load=22896 qkt=5524 softmax=6536 mfma_v=19764 store=344 total=55536 cycles
+[Fused Attn] N=8192 splits=4 | load=21164 qkt=5492 softmax=6624 mfma_v=20420 store=312 total=54556 cycles
+[Fused Attn] N=8192 splits=4 | load=22688 qkt=5400 softmax=6868 mfma_v=19944 store=324 total=55668 cycles
+[Fused Attn] N=8192 splits=4 | load=20192 qkt=5616 softmax=6680 mfma_v=21956 store=488 total=55440 cycles
+[Fused Attn] N=8192 splits=4 | load=22348 qkt=5612 softmax=7084 mfma_v=20016 store=436 total=56000 cycles
+[Fused Attn] N=8192 splits=4 | load=22364 qkt=5640 softmax=7164 mfma_v=20028 store=392 total=56040 cycles
+[Fused Attn] N=8192 splits=4 | load=22652 qkt=5440 softmax=6744 mfma_v=20420 store=340 total=56048 cycles
+[Fused Attn] N=8192 splits=4 | load=22192 qkt=5668 softmax=7080 mfma_v=20140 store=440 total=55956 cycles
+[Fused Attn] N=8192 splits=4 | load=22192 qkt=5676 softmax=7076 mfma_v=21692 store=436 total=57588 cycles
+[Fused Attn] N=8192 splits=4 | load=22592 qkt=5456 softmax=6612 mfma_v=19816 store=344 total=55264 cycles
+[Fused Attn] N=8192 splits=4 | load=22160 qkt=5768 softmax=7348 mfma_v=19904 store=808 total=56444 cycles
+[Fused Attn] N=8192 splits=4 | load=22136 qkt=5776 softmax=7176 mfma_v=20548 store=440 total=56508 cycles```"
