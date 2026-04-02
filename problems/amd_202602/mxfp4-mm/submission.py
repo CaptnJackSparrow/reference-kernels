@@ -814,7 +814,7 @@ __global__ void mfma_fp4_gemm_coop_simple(
 // Tiled kernel helpers: load global -> registers, store registers -> LDS
 // =====================================================================
 
-template <int OUTER_M, int OUTER_N, int OUTER_K, int WARP_TILES_M = 1, int WARP_TILES_N = 1>
+template <int OUTER_M, int OUTER_N, int OUTER_K, bool USE_C_SHARED>
 struct LdsLayout {
     static constexpr int LIMIT    = 160 * 1024;
     static constexpr int OK_HALF   = OUTER_K / 2;
@@ -826,7 +826,7 @@ struct LdsLayout {
     static constexpr int C_DATA_FLOATS = OUTER_M * OUTER_N;
     static constexpr int C_DATA_BYTES  = C_DATA_FLOATS * 4;
     static constexpr int TOTAL    = A_DATA + A_SCALE + B_DATA + B_SCALE +
-                                    ((WARP_TILES_M * WARP_TILES_N > 1) ? C_DATA_BYTES : 0);
+                                    (USE_C_SHARED ? C_DATA_BYTES : 0);
     static constexpr int OCCUPANCY= LIMIT / TOTAL;
 };
 
@@ -1038,6 +1038,25 @@ __device__ __forceinline__ void store_c_from_smem_f32(
     }
 }
 
+// Reduction kernel: sum K_SPLITS fp32 partial results and write to float C
+template <int M, int N, int K_SPLITS>
+__global__ void reduce_splitk_kernel(
+    const float workspace[][M][N],
+    float C[][N]
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int TOTAL = M * N;
+    if (idx >= TOTAL) return;
+
+    int row = idx / N;
+    int col = idx % N;
+    float sum = 0.0f;
+    for (int s = 0; s < K_SPLITS; s++) {
+        sum += workspace[s][row][col];
+    }
+    C[row][col] = sum;
+}
+
 template <int OUTER_K, int OUTER_N, int IM, int IN, int IK,
           int WARP_TILES_M = 1, int WARP_TILES_N = 1, int OK_HALF = OUTER_K / 2>
 __device__ __forceinline__ void inner_mfma_loop(
@@ -1146,9 +1165,11 @@ template <int WARPS, int M, int N, int K, int NUM_BLOCKS,
           int IM, int IN, int IK,
           int WARP_TILES_M = 1, int WARP_TILES_N = 1,
           bool FUSE_A_QUANT = false, int BUFFERS = 1,
-          int OCCUPANCY = -1, int K_HALF = K / 2>
+          int OCCUPANCY = -1, int K_HALF = K / 2,
+          bool USE_C_SHARED = (WARP_TILES_M * WARP_TILES_N > 1),
+          typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
 __global__ void
-__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? (LdsLayout<OUTER_M, OUTER_N, OUTER_K, WARP_TILES_M, WARP_TILES_N>::OCCUPANCY) / BUFFERS : OCCUPANCY)
+__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
 mfma_fp4_gemm_tiled(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t A_data[][K_HALF],
@@ -1162,7 +1183,6 @@ mfma_fp4_gemm_tiled(
     static_assert(WARPS == WARPS_M * WARPS_N);
 
     using Traits = MfmaTraits<IM, IN, IK>;
-    using Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, WARP_TILES_M, WARP_TILES_N>;
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int OUTER_K_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
@@ -1189,14 +1209,12 @@ mfma_fp4_gemm_tiled(
     __shared__ uint8_t smem_b_data[BUFFERS][OK_BLOCKS][OUTER_N * 16];
     __shared__ uint8_t smem_b_scale[BUFFERS][OK_BLOCKS][OUTER_N];
     extern __shared__ float smem_c_raw[];
-    auto (&smem_c_data)[OUTER_M][OUTER_N] = *reinterpret_cast<float (*)[OUTER_M][OUTER_N]>(smem_c_raw);
+    auto (*smem_c_data)[OUTER_N] = reinterpret_cast<float(*)[OUTER_N]>(smem_c_raw);
 
     typename Traits::acc_t reg_acc;
-    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+    if constexpr (!USE_C_SHARED) {
         reg_acc = Traits::zero_acc();
-    }
-
-    if constexpr (WARP_TILES_M * WARP_TILES_N > 1) {
+    } else {
         for (int i = tid; i < Lds::C_DATA_FLOATS; i += BLOCK_SIZE)
             reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
     }
@@ -1286,7 +1304,7 @@ mfma_fp4_gemm_tiled(
         smem_b_data[buf], smem_b_scale[buf],
         warp_m, warp_n, lane, smem_c_data, reg_acc);
 
-    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+    if constexpr (!USE_C_SHARED) {
         Traits::template store<M, N>(C, reg_acc,
             outer_m + warp_m * IM, outer_n + warp_n * IN, lane);
     } else {
@@ -1499,16 +1517,24 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
     }
 }
 
+// =====================================================================
+// Shared computation + store for tiled split-K fused kernels.
+// Handles all setup, quantize-A + tiled GEMM loop, and final store.
+// STORE_K_SPLITS controls atomicAdd behavior:
+//   K_SPLITS  -> atomicAdd accumulation (mfma_fp4_gemm_tiled_splitk_fused)
+//   1         -> direct write to workspace slice (reduce variant)
+// =====================================================================
+
 template <int WARPS, int M, int N, int K,
           int OUTER_M, int OUTER_N, int OUTER_K,
           int IM, int IN, int IK,
-          int WARP_TILES_M = 1, int WARP_TILES_N = 1,
-          int K_SPLITS = 1, int BUFFERS = 1,
-          int OCCUPANCY = -1,
-          int K_HALF = K / 2, int NUM_BLOCKS = K / 32>
-__global__ void
-__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? (LdsLayout<OUTER_M, OUTER_N, OUTER_K>::OCCUPANCY) / BUFFERS : OCCUPANCY)
-mfma_fp4_gemm_tiled_splitk_fused(
+          int WARP_TILES_M, int WARP_TILES_N,
+          int K_SPLITS, int BUFFERS,
+          int STORE_K_SPLITS,
+          int K_HALF = K / 2, int NUM_BLOCKS = K / 32,
+          bool USE_C_SHARED = (WARP_TILES_M * WARP_TILES_N > 1),
+          typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
+__device__ __forceinline__ void tiled_splitk_fused_compute(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][K_HALF],
     const uint8_t* __restrict__ B_scale,
@@ -1519,16 +1545,11 @@ mfma_fp4_gemm_tiled_splitk_fused(
     static_assert(WARPS == WARPS_M * WARPS_N);
 
     using Traits = MfmaTraits<IM, IN, IK>;
-    using Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K>;
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int TOTAL_OK_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
     constexpr int ITERS_PER_SPLIT = (TOTAL_OK_ITERS + K_SPLITS - 1) / K_SPLITS;
     constexpr int BLOCK_SIZE = WARPS * 64;
-
-    using Q = QuantAPerThread<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>;
-    constexpr int B_DATA_PER_THREAD = ((OUTER_N * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    constexpr int B_SCALE_PER_THREAD = ((OUTER_N * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     const int outer_m = __builtin_amdgcn_readfirstlane(blockIdx.x * OUTER_M);
     const int outer_n = __builtin_amdgcn_readfirstlane(blockIdx.y * OUTER_N);
@@ -1548,17 +1569,20 @@ mfma_fp4_gemm_tiled_splitk_fused(
     __shared__ uint8_t smem_a_scale[BUFFERS][OUTER_M][OK_BLOCKS];
     __shared__ uint8_t smem_b_data[BUFFERS][OK_BLOCKS][OUTER_N * 16];
     __shared__ uint8_t smem_b_scale[BUFFERS][OK_BLOCKS][OUTER_N];
-    __shared__ float smem_c_data[OUTER_M][OUTER_N];
+    extern __shared__ float smem_c_raw[];
+    auto (*smem_c_data)[OUTER_N] = reinterpret_cast<float(*)[OUTER_N]>(smem_c_raw);
 
     typename Traits::acc_t reg_acc;
-    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
+    if constexpr (!USE_C_SHARED) {
         reg_acc = Traits::zero_acc();
-    }
-
-    if constexpr (WARP_TILES_M * WARP_TILES_N > 1) {
+    } else {
         for (int i = tid; i < Lds::C_DATA_FLOATS; i += BLOCK_SIZE)
             reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
     }
+
+    using Q = QuantAPerThread<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>;
+    constexpr int B_DATA_PER_THREAD = ((OUTER_N * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    constexpr int B_SCALE_PER_THREAD = ((OUTER_N * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Load first tile: quantize A from BF16, load pre-quantized B
     {
@@ -1626,14 +1650,13 @@ mfma_fp4_gemm_tiled_splitk_fused(
             warp_m, warp_n, lane, smem_c_data, reg_acc);
     }
 
-    if constexpr (WARP_TILES_M * WARP_TILES_N == 1) {
-        Traits::template store_f32<N, K_SPLITS>(C, reg_acc,
+    // Store results
+    if constexpr (!USE_C_SHARED) {
+        Traits::template store_f32<N, STORE_K_SPLITS>(C, reg_acc,
             outer_m + warp_m * IM, outer_n + warp_n * IN, lane);
     } else {
-        if constexpr (WARPS > 1) {
-            __syncthreads();
-        }
-        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE, K_SPLITS>(
+        if constexpr (WARPS > 1) __syncthreads();
+        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE, STORE_K_SPLITS>(
             smem_c_data, C, outer_m, outer_n, tid);
     }
 }
@@ -1644,10 +1667,57 @@ template <int WARPS, int M, int N, int K,
           int WARP_TILES_M = 1, int WARP_TILES_N = 1,
           int K_SPLITS = 1, int BUFFERS = 1,
           int OCCUPANCY = -1,
-          bool PROFILE_PHASES = false,
-          int K_HALF = K / 2, int NUM_BLOCKS = K / 32>
+          int K_HALF = K / 2, int NUM_BLOCKS = K / 32,
+          bool USE_C_SHARED = (WARP_TILES_M * WARP_TILES_N > 1),
+          typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
 __global__ void
-__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? (LdsLayout<OUTER_M, OUTER_N, OUTER_K>::OCCUPANCY) / BUFFERS : OCCUPANCY)
+__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
+mfma_fp4_gemm_tiled_splitk_fused(
+    const hip_bfloat16 A_bf16[][K],
+    const uint8_t B_data[][K_HALF],
+    const uint8_t* __restrict__ B_scale,
+    float C[][N]
+) {
+    tiled_splitk_fused_compute<WARPS, M, N, K, OUTER_M, OUTER_N, OUTER_K,
+                               IM, IN, IK, WARP_TILES_M, WARP_TILES_N,
+                               K_SPLITS, BUFFERS, K_SPLITS>(
+        A_bf16, B_data, B_scale, C);
+}
+
+// Reduce-based variant: writes to per-split workspace slices, no atomicAdd
+template <int WARPS, int M, int N, int K,
+          int OUTER_M, int OUTER_N, int OUTER_K,
+          int IM, int IN, int IK,
+          int WARP_TILES_M, int WARP_TILES_N,
+          int K_SPLITS = 1, int BUFFERS = 1, int OCCUPANCY = -1,
+          bool USE_C_SHARED = (WARP_TILES_M * WARP_TILES_N > 1),
+          typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
+__global__ void __launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
+mfma_fp4_gemm_tiled_splitk_fused_reduce(
+    const hip_bfloat16 A_bf16[][K],
+    const uint8_t B_data[][K / 2],
+    const uint8_t* __restrict__ B_scale,
+    float workspace[][M][N]
+) {
+    const int split_id = __builtin_amdgcn_readfirstlane(blockIdx.z);
+    tiled_splitk_fused_compute<WARPS, M, N, K, OUTER_M, OUTER_N, OUTER_K,
+                               IM, IN, IK, WARP_TILES_M, WARP_TILES_N,
+                               K_SPLITS, BUFFERS, 1>(
+        A_bf16, B_data, B_scale, workspace[split_id]);
+}
+
+template <int WARPS, int M, int N, int K,
+          int OUTER_M, int OUTER_N, int OUTER_K,
+          int IM, int IN, int IK,
+          int WARP_TILES_M = 1, int WARP_TILES_N = 1,
+          int K_SPLITS = 1, int BUFFERS = 1,
+          int OCCUPANCY = -1,
+          bool PROFILE_PHASES = false,
+          int K_HALF = K / 2, int NUM_BLOCKS = K / 32,
+          bool USE_C_SHARED = true,
+          typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
+__global__ void
+__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
 mfma_fp4_gemm_tiled_splitk_coop(
     const hip_bfloat16 A_bf16[][K],
     uint8_t A_data[][K_HALF],
@@ -1662,7 +1732,6 @@ mfma_fp4_gemm_tiled_splitk_coop(
     static_assert(WARPS == WARPS_M * WARPS_N);
 
     using Traits = MfmaTraits<IM, IN, IK>;
-    using Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K>;
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int TOTAL_OK_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
@@ -2151,10 +2220,11 @@ template <int M, int N, int K,
 void launch_tiled_fused(torch::Tensor A_bf16, torch::Tensor B,
                         torch::Tensor Bs, torch::Tensor C) {
     constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+    constexpr size_t smem_c_size = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
     dim3 block(WARPS * 64);
     mfma_fp4_gemm_tiled<WARPS,M,N,K,NUM_BLOCKS,OM,ON,OK,IM,IN,IK,WTM,WTN,true,BUFFERS,OCCUPANCY>
-        <<<grid, block>>>(
+        <<<grid, block, smem_c_size>>>(
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K / 2]>((const void*)0),
         reinterpret_cast<const uint8_t(*)[K / 2]>(B.data_ptr()),
@@ -2328,8 +2398,9 @@ void launch_tiled_splitk_fused(torch::Tensor A_bf16,
 
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON, K_SPLITS);
     dim3 block(WARPS * 64);
+    constexpr size_t smem_c_size = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
     mfma_fp4_gemm_tiled_splitk_fused<WARPS,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>
-        <<<grid, block>>>(
+        <<<grid, block, smem_c_size>>>(
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
         reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
@@ -2350,6 +2421,79 @@ void launch_tiled_splitk_fused(torch::Tensor A_bf16,
                 stats.t_gemm/n*1000, n);
         }
         (void)hipEventDestroy(e0); (void)hipEventDestroy(e1);
+    }
+}
+
+// =====================================================================
+// Reduce-based Tiled Split-K Fused: uses workspace + reduction kernel
+// =====================================================================
+template <int M, int N, int K,
+          int OM, int ON, int OK, int IM, int IN, int IK,
+          int WTM = 1, int WTN = 1, int K_SPLITS = 1,
+          int BUFFERS = 1, int OCCUPANCY = -1,
+          int K_HALF = K / 2, int NUM_BLOCKS = K / 32>
+void launch_tiled_splitk_fused_reduce(torch::Tensor A_bf16,
+                                torch::Tensor B_data, torch::Tensor B_scale,
+                                torch::Tensor C, bool profile) {
+    static torch::Tensor ws_buf;
+    static int local_gen = -1;
+    if (local_gen != g_generation) {
+        auto f32opts = torch::TensorOptions().dtype(torch::kFloat32).device(A_bf16.device());
+        ws_buf = torch::empty({K_SPLITS * M * N}, f32opts);
+        local_gen = g_generation;
+    }
+
+    constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+
+    static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
+    auto& stats = perf_map[M][N][K];
+    stats.count++;
+    bool do_profile = profile && (stats.count % PROFILE_INTERVAL == 0);
+
+    hipEvent_t e0, e1, e2;
+    if (do_profile) {
+        (void)hipEventCreate(&e0); (void)hipEventCreate(&e1); (void)hipEventCreate(&e2);
+        (void)hipEventRecord(e0);
+    }
+
+    dim3 grid((M+OM-1)/OM, (N+ON-1)/ON, K_SPLITS);
+    dim3 block(WARPS * 64);
+    constexpr size_t smem_c_size = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
+    mfma_fp4_gemm_tiled_splitk_fused_reduce<WARPS,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>
+        <<<grid, block, smem_c_size>>>(
+        reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
+        reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
+        reinterpret_cast<const uint8_t*>(B_scale.data_ptr()),
+        reinterpret_cast<float(*)[M][N]>(ws_buf.data_ptr()));
+
+    if (do_profile) (void)hipEventRecord(e1);
+
+    // Reduction: sum across K_SPLITS slices and write to C
+    constexpr int r_total = M * N;
+    constexpr int r_block = 256;
+    constexpr int r_grid = (r_total + r_block - 1) / r_block;
+    reduce_splitk_kernel<M, N, K_SPLITS>
+        <<<dim3(r_grid), dim3(r_block)>>>(
+        reinterpret_cast<const float(*)[M][N]>(ws_buf.data_ptr()),
+        reinterpret_cast<float(*)[N]>(C.data_ptr()));
+
+    if (do_profile) {
+        (void)hipEventRecord(e2);
+        (void)hipEventSynchronize(e2);
+        float d01, d12;
+        (void)hipEventElapsedTime(&d01, e0, e1);
+        (void)hipEventElapsedTime(&d12, e1, e2);
+        stats.t_gemm += d01; stats.t_reduce += d12;
+        int n = stats.count / PROFILE_INTERVAL;
+        if (n < 5) {
+            printf("[Tiled Split-K Fused Reduce] m=%d n=%d k=%d splits=%d | "
+                "gemm+quant=%.1fus reduce=%.1fus | "
+                "total=%.1fus (avg over %d)\\n",
+                M, N, K, K_SPLITS,
+                stats.t_gemm/n*1000, stats.t_reduce/n*1000,
+                (stats.t_gemm+stats.t_reduce)/n*1000, n);
+        }
+        (void)hipEventDestroy(e0); (void)hipEventDestroy(e1); (void)hipEventDestroy(e2);
     }
 }
 
@@ -2413,9 +2557,10 @@ void launch_tiled_splitk_coop(torch::Tensor A_bf16,
         &B_data_ptr, &B_scale_ptr, &C_ptr,
         &quant_counter
     };
+    constexpr size_t smem_c_size = OM * ON * sizeof(float);
     (void)hipLaunchCooperativeKernel(
         (const void*)mfma_fp4_gemm_tiled_splitk_coop<WARPS,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>,
-        grid, block, args, 0, 0);
+        grid, block, args, smem_c_size, 0);
 
     if (do_profile) {
         (void)hipEventRecord(e1);
@@ -2465,6 +2610,8 @@ void mfma_gemm(
     if(M==m&&N==n&&K==k){return launch_simple_fused<m,n,k,16,16,128,wm,wn>(A_data,B_data,B_scale,C, profile);}
 #define TSK(m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ) \
     if(M==m&&N==n&&K==k){return launch_tiled_splitk_fused<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile);}
+#define TSKR(m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ) \
+    if(M==m&&N==n&&K==k){return launch_tiled_splitk_fused_reduce<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile);}
 #define TSKC(m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ) \
     if(M==m&&N==n&&K==k){return launch_tiled_splitk_coop<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile);}
 
@@ -2604,7 +2751,11 @@ void mfma_gemm(
     //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 14, 1, 1) --> 17.6
     //TSK(16, 2112, 7168, 16, 32, 128, 16, 16, 128, 1, 1, 28, 1, -1) --> 16.8
     //TSK(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 28, 1, -1) --> 16.1
-    TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) //--> 15.1
+    //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) //--> 15.1 BEST (atomicAdd)
+    //SPLITK-SWEEP: k=4 --> 17.3, k=2 --> 71.6, k=21 --> INCORRECT (not divisor of 28)
+    //TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) //--> 14.9 NEW BEST
+    //TSKR-SWEEP: k=14 --> 18.9
+    TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, 1) //--> 14.9 BEST
     //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, -1) --> 16.0
     //ITER9: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 56, 1, -1) --> INCORRECT
     //TSK(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 28, 2, -1) --> 16.3
