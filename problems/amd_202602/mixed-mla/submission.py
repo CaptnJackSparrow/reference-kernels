@@ -1123,7 +1123,7 @@ def _try_compile_hip_kernel_torch():
             cpp_sources='',
             cuda_sources=[kernel_source],
             extra_cflags=['-O3'],
-            extra_cuda_cflags=['-O3', '--offload-arch=gfx950'],
+            extra_cuda_cflags=['-O3', '-ffast-math', '-munsafe-fp-atomics', '--offload-arch=gfx950'],
             extra_include_paths=[f'{rocm_home}/include'],
             verbose=True,  # Enable verbose to see what's happening
         )
