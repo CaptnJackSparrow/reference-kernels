@@ -1,5 +1,5 @@
 "**MI355X on GitHub ✅ success**
-> Workflow [23825384003](<https://github.com/gpu-mode/kernelbot/actions/runs/23825384003>) completed
+> Workflow [23925655250](<https://github.com/gpu-mode/kernelbot/actions/runs/23925655250>) completed
 > Downloading artifacts... done
 > ✅ Compilation successful
 > ✅ Testing successful
@@ -13,74 +13,74 @@ Running on:
 * Runtime: `ROCm`
 * Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
 * Torch: `2.10.0+rocm7.1`
-* Hostname: `arc-runner-set-hbp2z-runner-pg9w5`
+* Hostname: `arc-runner-set-hbp2z-runner-l64mp`
 
 
 ## ✅ Passed 4/4 tests:
 ```
 ✅ k: 7168; m: 8; n: 2112; seed: 124
-> Maximum error: 0.0
+> Maximum error: 1.0
 ✅ k: 1536; m: 16; n: 3072; seed: 6635
-> Maximum error: 0.0
+> Maximum error: 0.5
 ✅ k: 1536; m: 64; n: 3072; seed: 45
-> Maximum error: 0.0
+> Maximum error: 0.5
 ✅ k: 512; m: 256; n: 2880; seed: 78
-> Maximum error: 0.0```
+> Maximum error: 0.25```
 
 ## Benchmarks:
 ```
 k: 512; m: 4; n: 2880; seed: 4565
- ⏱ 8.16 ± 0.019 µs
- ⚡ 7.36 µs 🐌 12.9 µs
+ ⏱ 7.74 ± 0.019 µs
+ ⚡ 7.16 µs 🐌 15.5 µs
 
 k: 7168; m: 16; n: 2112; seed: 15
- ⏱ 13.5 ± 0.02 µs
- ⚡ 12.8 µs 🐌 18.5 µs
+ ⏱ 12.8 ± 0.02 µs
+ ⚡ 12.2 µs 🐌 17.8 µs
 
 k: 512; m: 32; n: 4096; seed: 457
- ⏱ 8.78 ± 0.017 µs
- ⚡ 8.24 µs 🐌 13.4 µs
+ ⏱ 8.32 ± 0.018 µs
+ ⚡ 7.68 µs 🐌 12.7 µs
 
 k: 512; m: 32; n: 2880; seed: 54
- ⏱ 11.9 ± 0.02 µs
- ⚡ 11.3 µs 🐌 17.6 µs
+ ⏱ 8.21 ± 0.018 µs
+ ⚡ 7.60 µs 🐌 13.2 µs
 
 k: 2048; m: 64; n: 7168; seed: 687
- ⏱ 24.2 ± 0.02 µs
- ⚡ 23.3 µs 🐌 29.1 µs
+ ⏱ 20.3 ± 0.02 µs
+ ⚡ 19.3 µs 🐌 26.0 µs
 
 k: 1536; m: 256; n: 3072; seed: 7856
- ⏱ 19.6 ± 0.02 µs
- ⚡ 18.9 µs 🐌 24.8 µs
+ ⏱ 16.1 ± 0.02 µs
+ ⚡ 15.6 µs 🐌 21.7 µs
 ```
 
 ## Ranked Benchmark:
 ```
 k: 512; m: 4; n: 2880; seed: 4565
- ⏱ 8.16 ± 0.058 µs
- ⚡ 7.56 µs 🐌 11.7 µs
+ ⏱ 7.97 ± 0.067 µs
+ ⚡ 7.24 µs 🐌 12.6 µs
 
 k: 7168; m: 16; n: 2112; seed: 15
- ⏱ 13.0 ± 0.04 µs
- ⚡ 12.3 µs 🐌 14.8 µs
+ ⏱ 12.4 ± 0.05 µs
+ ⚡ 11.9 µs 🐌 16.7 µs
 
 k: 512; m: 32; n: 4096; seed: 457
- ⏱ 8.96 ± 0.046 µs
- ⚡ 8.36 µs 🐌 12.3 µs
+ ⏱ 8.56 ± 0.078 µs
+ ⚡ 7.84 µs 🐌 12.2 µs
 
 k: 512; m: 32; n: 2880; seed: 54
- ⏱ 12.1 ± 0.06 µs
- ⚡ 11.4 µs 🐌 16.4 µs
+ ⏱ 8.28 µs
+ ⚡ 8.28 µs 🐌 8.28 µs
 
 k: 2048; m: 64; n: 7168; seed: 687
- ⏱ 24.6 ± 0.07 µs
- ⚡ 23.6 µs 🐌 27.3 µs
+ ⏱ 20.6 ± 0.09 µs
+ ⚡ 19.8 µs 🐌 24.8 µs
 
 k: 1536; m: 256; n: 3072; seed: 7856
- ⏱ 20.4 ± 0.05 µs
- ⚡ 19.7 µs 🐌 24.2 µs
+ ⏱ 16.8 ± 0.08 µs
+ ⚡ 16.2 µs 🐌 21.6 µs
 ```","**MI355X on GitHub (secret) ✅ success**
-> Workflow [23825384145](<https://github.com/gpu-mode/kernelbot/actions/runs/23825384145>) completed
+> Workflow [23925655430](<https://github.com/gpu-mode/kernelbot/actions/runs/23925655430>) completed
 > Downloading artifacts... done
 > ✅ Compilation successful
 > ✅ Testing successful
