@@ -86,7 +86,6 @@ __device__ __forceinline__ void mla_qkt_mfma(
     const uint8_t kv_data[][K_HALF],
     const uint8_t kv_scale[][B_SCALE_STRIDE],
     float scores[][KV_SUBTILE],
-    int subtile_size,
     float sm_scale,
     int lane, int warp_id
 ) {
@@ -120,12 +119,12 @@ __device__ __forceinline__ void mla_qkt_mfma(
             int kb_abs = qkt_iter * QKT_BATCH + kb_row;
             int kb_blk = blk0 + lane / IM;
             uint32_t kb_reg[8] = {};
-            if (kb_abs < subtile_size && kb_blk < NUM_BLOCKS) {
+            if (kb_abs < KV_SUBTILE && kb_blk < NUM_BLOCKS) {
                 *reinterpret_cast<uint128_vec*>(&kb_reg[0]) =
                     *reinterpret_cast<const uint128_vec*>(&kv_data[kb_abs][kb_blk * 16]);
             }
             uint8_t kb_e = 127;
-            if (kb_abs < subtile_size && kb_blk < NUM_BLOCKS)
+            if (kb_abs < KV_SUBTILE && kb_blk < NUM_BLOCKS)
                 kb_e = kv_scale[kb_abs][kb_blk];
             else
                 kb_reg[0] = kb_reg[1] = kb_reg[2] = kb_reg[3] = 0;
@@ -139,7 +138,7 @@ __device__ __forceinline__ void mla_qkt_mfma(
             mfma_acc = Traits::mfma(qa_vec, qa_sc, kb_vec, kb_sc, mfma_acc);
         }
         Traits::template store_scores<HEADS, KV_SUBTILE>(
-            mfma_acc, lane, qkt_iter * QKT_BATCH, subtile_size,
+            mfma_acc, lane, qkt_iter * QKT_BATCH,
             sm_scale, scores);
     }
 }
@@ -155,7 +154,6 @@ __device__ __forceinline__ void mla_parallel_softmax(
     float running_max[HEADS],
     float running_sum[HEADS],
     typename Traits::acc_t v_acc[CHUNKS_PER_WARP],
-    int subtile_size,
     int tid, int lane, int warp_id
 ) {
     __shared__ float rescale_lds[HEADS];
@@ -170,7 +168,7 @@ __device__ __forceinline__ void mla_parallel_softmax(
     float local_max = -INFINITY;
     for (int j = 0; j < SM_ELEMS_PER_THREAD; j++) {
         const int ki = sm_base + j;
-        if (ki < subtile_size)
+        if (ki < KV_SUBTILE)
             local_max = fmaxf(local_max, scores[sm_h][ki]);
     }
 
@@ -210,7 +208,7 @@ __device__ __forceinline__ void mla_parallel_softmax(
     float local_sum = 0.0f;
     for (int j = 0; j < SM_ELEMS_PER_THREAD; j++) {
         const int ki = sm_base + j;
-        if (ki < subtile_size) {
+        if (ki < KV_SUBTILE) {
             float w = __expf(scores[sm_h][ki] - nm);
             scores[sm_h][ki] = w;
             local_sum += w;
@@ -478,14 +476,14 @@ struct MlaMfmaTraits {
     // Store accumulator values to scores_lds with sm_scale
     template <int HEADS, int KV_SUBTILE>
     static __device__ __forceinline__ void store_scores(
-        const acc_t& acc, int lane, int batch_col_offset, int subtile_size,
+        const acc_t& acc, int lane, int batch_col_offset,
         float sm_scale, float scores[][KV_SUBTILE]
     ) {
         int col = lane_to_col(lane);
         int eff_col = batch_col_offset + col;
         for (int i = 0; i < ACC_SIZE; i++) {
             int head = acc_to_head(i, lane);
-            if (head < HEADS && eff_col < subtile_size)
+            if (head < HEADS && eff_col < KV_SUBTILE)
                 scores[head][eff_col] = acc[i] * sm_scale;
         }
     }
@@ -505,11 +503,11 @@ struct MlaMfmaTraits {
     }
 
     // Store V accumulator to partial output
-    template <int HEADS, int V_DIM, int CHUNKS_PER_WARP>
+    template <int HEADS, int V_DIM, int CHUNKS_PER_WARP, int KV_SUBTILE>
     static __device__ __forceinline__ void store_v_output(
         const acc_t v_acc[], int lane, int warp_id,
         int out_row, float partial_out[][16 * 512],
-        const float running_sum_lds[][128]
+        const float running_sum_lds[][KV_SUBTILE]
     ) {
         int col = lane_to_col(lane);
         for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
@@ -546,7 +544,7 @@ struct MlaMfmaTraits {
 
 template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS,
           int K_HALF, int NUM_BLOCKS, int A_K_HALF,
-          bool USE_32x32 = false, bool PROFILE_PHASES = false>
+          int KV_SUBTILE, bool USE_32x32 = false, bool PROFILE_PHASES = false>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_fused_attn_kernel(
     const hip_bfloat16* __restrict__ Q_bf16,
@@ -558,10 +556,11 @@ void mla_fused_attn_kernel(
     float partial_out[][16 * 512],
     float partial_lse[][16]
 ) {
+    static_assert(N % KV_SPLITS == 0);
     constexpr int V_DIM = 512;
     constexpr int HEADS = 16;
-    constexpr int KV_PER_SPLIT = (N + KV_SPLITS - 1) / KV_SPLITS;
-    constexpr int KV_SUBTILE = 128;
+    constexpr int KV_PER_SPLIT = N / KV_SPLITS;
+    static_assert(KV_PER_SPLIT % KV_SUBTILE == 0);
 
     // MFMA variant traits
     using Traits = MlaMfmaTraits<USE_32x32>;
@@ -584,8 +583,8 @@ void mla_fused_attn_kernel(
     const int warp_id = __builtin_amdgcn_readfirstlane(tid / 64);
     const int lane = tid % 64;
 
-    const int kv_start_global = split_idx * KV_PER_SPLIT;
-    const int kv_end_global = min(kv_start_global + KV_PER_SPLIT, N);
+    const int kv_start_global = __builtin_amdgcn_readfirstlane(split_idx * KV_PER_SPLIT);
+    const int kv_end_global = __builtin_amdgcn_readfirstlane(min(kv_start_global + KV_PER_SPLIT, N));
 
     [[maybe_unused]] const bool is_timer_block = PROFILE_PHASES && (blockIdx.x == 0 && blockIdx.y == 0);
     [[maybe_unused]] uint64_t t_start = 0, t_load_total = 0, t_qkt_total = 0, t_sv_total = 0, t_store = 0;
@@ -656,9 +655,8 @@ void mla_fused_attn_kernel(
     // ---- Step 2: Iterate over KV in subtiles of 128 positions ----
     const int kv_row_base = __builtin_amdgcn_readfirstlane(batch_idx * N);
 
-    for (int kv_pos = kv_start_global; kv_pos < kv_end_global; kv_pos += KV_SUBTILE) {
-        const int subtile_end = min(kv_pos + KV_SUBTILE, kv_end_global);
-        const int subtile_size = subtile_end - kv_pos;
+    for (int kvp = 0; kvp < KV_PER_SPLIT; kvp += KV_SUBTILE) {
+        const int kv_pos = kv_start_global + kvp;
 
         if constexpr (PROFILE_PHASES) {
             if (is_timer_block && tid == 0)
@@ -667,17 +665,17 @@ void mla_fused_attn_kernel(
 
         // ---- 2a: Load 128 KV positions into LDS ----
         {
-            const int total_bytes = subtile_size * K_HALF;
-            for (int i = tid * 16; i < total_bytes; i += BLOCK_SIZE * 16) {
+            constexpr int TOTAL_BYTES = KV_SUBTILE * K_HALF;
+            for (int i = tid * 16; i < TOTAL_BYTES; i += BLOCK_SIZE * 16) {
                 const int row = i / K_HALF;
                 const int col = i % K_HALF;
-                if (row < subtile_size) {
+                if (row < KV_SUBTILE) {
                     *reinterpret_cast<uint128_vec*>(&kv_lds_data[row][col]) =
                         *reinterpret_cast<const uint128_vec*>(&kv_mxfp4[kv_row_base + kv_pos + row][col]);
                 }
             }
-            const int total_sc = subtile_size * B_SCALE_STRIDE;
-            for (int i = tid; i < total_sc; i += BLOCK_SIZE) {
+            constexpr int TOTAL_SC = KV_SUBTILE * B_SCALE_STRIDE;
+            for (int i = tid; i < TOTAL_SC; i += BLOCK_SIZE) {
                 const int row = i / B_SCALE_STRIDE;
                 const int blk = i % B_SCALE_STRIDE;
                 kv_lds_scale_tile[row][blk] =
@@ -701,7 +699,7 @@ void mla_fused_attn_kernel(
         mla_qkt_mfma<Traits, HEADS, KV_SUBTILE, NUM_BLOCKS,
             A_K_HALF, K_HALF, B_SCALE_STRIDE>(
             q_lds_data, q_lds_scale, kv_lds_data, kv_lds_scale_tile,
-            scores_lds, subtile_size, sm_scale, lane, warp_id);
+            scores_lds, sm_scale, lane, warp_id);
 
         if constexpr (WARPS > 1) {
             __syncthreads();
@@ -719,7 +717,7 @@ void mla_fused_attn_kernel(
         mla_parallel_softmax<Traits, HEADS, KV_SUBTILE, BLOCK_SIZE,
             WARPS, SM_ELEMS_PER_THREAD, CHUNKS_PER_WARP>(
             scores_lds, running_max, running_sum, v_acc,
-            subtile_size, tid, lane, warp_id);
+            tid, lane, warp_id);
 
         if constexpr (PROFILE_PHASES) {
             if (is_timer_block && tid == 0) {
@@ -774,9 +772,9 @@ void mla_fused_attn_kernel(
                         const int k1 = k_base_b + j * 2 + 1;
 
                         uint8_t raw0 = 0, raw1 = 0;
-                        if (k0 < subtile_size)
+                        if (k0 < KV_SUBTILE)
                             raw0 = kv_lds_data[k0][byte_off];
-                        if (k1 < subtile_size)
+                        if (k1 < KV_SUBTILE)
                             raw1 = kv_lds_data[k1][byte_off];
 
                         uint8_t n0 = (raw0 >> nib_shift) & 0x0F;
@@ -921,11 +919,11 @@ constexpr int get_fused_kv_split() {
     else if constexpr (BATCH_SIZE == 64 && N == 1024) return 4; // 256 blocks, 256 positions/split
     else if constexpr (BATCH_SIZE == 64 && N == 8192) return 8; // 512 blocks, 1024 positions/split
     else if constexpr (BATCH_SIZE == 256 && N == 1024) return 2;// 512 blocks, 512 positions/split
-    else if constexpr (BATCH_SIZE == 256 && N == 8192) return 4;// 1024 blocks, 2048 positions/split
+    else if constexpr (BATCH_SIZE == 256 && N == 8192) return 16;// 1024 blocks, 512 positions/split
     else return 4;
 }
 
-template <int BATCH_SIZE, int N, int STRIDE, int BS = 256, bool USE_32x32 = false>
+template <int BATCH_SIZE, int N, int STRIDE, int BS, int KV_SUBTILE, bool USE_32x32>
 torch::Tensor mla_fused_pipeline_impl(
     torch::Tensor Q_bf16,
     torch::Tensor KV_data,
@@ -994,7 +992,7 @@ torch::Tensor mla_fused_pipeline_impl(
     {
         dim3 grid(BATCH_SIZE, KV_SPLITS);
         dim3 block(BS);
-        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, USE_32x32, (BATCH_SIZE == 256 && N == 8192)>
+        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, KV_SUBTILE, USE_32x32, (BATCH_SIZE == 256 && N == 8192)>
             <<<grid, block>>>(
             reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
             reinterpret_cast<const uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
@@ -1058,36 +1056,36 @@ torch::Tensor mla_mxfp4_pipeline(
     assert(B_SCALE_STRIDE == 18 || B_SCALE_STRIDE == 24);
     assert(kv_seq_len == 1024 || kv_seq_len == 8192);
 
-#define MLA_FUSED(BS_VAL, N, STR, BLOCK, USE32) \
+#define MLA_FUSED(BS_VAL, N, STR, BLOCK, KV_SUBTILE, USE32) \
     if (batch_size == BS_VAL && kv_seq_len == N && B_SCALE_STRIDE == STR) \
-        return mla_fused_pipeline_impl<BS_VAL, N, STR, BLOCK, USE32>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
+        return mla_fused_pipeline_impl<BS_VAL, N, STR, BLOCK, KV_SUBTILE, USE32>(Q_bf16, KV_data, KV_scale, sm_scale, profile)
 
     // Tuned dispatch: (batch_size, kv_seq_len, stride, block_size, use_32x32)
     // Tuned per-config dispatch (winners from BSxMFMA sweep, all 16x16x128)
     // bs=4, kv=1024: BS=256 wins (41.8µs)
-    MLA_FUSED(4, 1024, 18, 256, false);
-    MLA_FUSED(4, 1024, 24, 256, false);
+    MLA_FUSED(4, 1024, 18, 256, 64, false);
+    MLA_FUSED(4, 1024, 24, 256, 64, false);
     // bs=4, kv=8192: BS=512 wins (45.3µs, -14% vs BS=256)
-    MLA_FUSED(4, 8192, 18, 512, false);
-    MLA_FUSED(4, 8192, 24, 512, false);
+    MLA_FUSED(4, 8192, 18, 512, 128, false);
+    MLA_FUSED(4, 8192, 24, 512, 128, false);
     // bs=32, kv=1024: BS=512 wins (40.0µs, -16% vs BS=256)
-    MLA_FUSED(32, 1024, 18, 512, false);
-    MLA_FUSED(32, 1024, 24, 512, false);
+    MLA_FUSED(32, 1024, 18, 512, 128, false);
+    MLA_FUSED(32, 1024, 24, 512, 128, false);
     // bs=32, kv=8192: BS=256 wins (154µs)
-    MLA_FUSED(32, 8192, 18, 256, false);
-    MLA_FUSED(32, 8192, 24, 256, false);
+    MLA_FUSED(32, 8192, 18, 256, 128, false);//122
+    MLA_FUSED(32, 8192, 24, 256, 128, false);//
     // bs=64, kv=1024: BS=256 wins (74.0µs)
-    MLA_FUSED(64, 1024, 18, 256, false);
-    MLA_FUSED(64, 1024, 24, 256, false);
+    MLA_FUSED(64, 1024, 18, 256, 128, false);
+    MLA_FUSED(64, 1024, 24, 256, 128, false);
     // bs=64, kv=8192: BS=128 wins (217µs, -21% vs BS=256)
-    MLA_FUSED(64, 8192, 18, 128, false);
-    MLA_FUSED(64, 8192, 24, 128, false);
+    MLA_FUSED(64, 8192, 18, 128, 128, false);//297
+    MLA_FUSED(64, 8192, 24, 128, 128, false);//
     // bs=256, kv=1024: BS=256 wins (154µs)
-    MLA_FUSED(256, 1024, 18, 256, false);
-    MLA_FUSED(256, 1024, 24, 256, false);
+    MLA_FUSED(256, 1024, 18, 256, 128, false);
+    MLA_FUSED(256, 1024, 24, 256, 128, false);
     // bs=256, kv=8192: BS=128 wins (362µs, -63% vs BS=256)
-    MLA_FUSED(256, 8192, 18, 128, false);
-    MLA_FUSED(256, 8192, 24, 128, false);
+    MLA_FUSED(256, 8192, 18, 128, 128, false);//1191
+    MLA_FUSED(256, 8192, 24, 128, 128, false);//
     TORCH_CHECK(false, "Unsupported batch_size: ", batch_size);
 }
 
