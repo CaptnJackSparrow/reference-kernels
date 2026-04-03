@@ -332,8 +332,12 @@ struct MfmaTraits {
                 int row = (i % 4) + 4 * half + 8 * (i / 4);
                 int gm = tile_m + row;
                 int gn = tile_n + col;
-                if (gm < M && gn < N)
+                if constexpr (M % IM != 0 || N % IN != 0) {
+                    if (gm < M && gn < N)
+                        C[gm][gn] = acc[i];
+                } else {
                     C[gm][gn] = acc[i];
+                }
             }
         } else {
             int col = lane % 16;
@@ -342,8 +346,12 @@ struct MfmaTraits {
                 int row = i + 4 * quad;
                 int gm = tile_m + row;
                 int gn = tile_n + col;
-                if (gm < M && gn < N)
+                if constexpr (M % IM != 0 || N % IN != 0) {
+                    if (gm < M && gn < N)
+                        C[gm][gn] = acc[i];
+                } else {
                     C[gm][gn] = acc[i];
+                }
             }
         }
     }
@@ -787,13 +795,11 @@ __global__ void mfma_fp4_gemm_coop_simple(
             tile_m, tile_n, 0, lane,
             a_cur, a_sc_cur, b_cur, b_sc_cur);
 
-        for (int ki = 0; ki < K_ITERS; ki++) {
-            if (ki + 1 < K_ITERS) {
-                load_ab_global<M, N, K_HALF, NUM_BLOCKS, IM, IN, IK>(
-                    A_data, B_data, A_scale, B_scale,
-                    tile_m, tile_n, (ki + 1) * BPC, lane,
-                    a_nxt, a_sc_nxt, b_nxt, b_sc_nxt);
-            }
+        for (int ki = 0; ki < K_ITERS - 1; ki++) {
+            load_ab_global<M, N, K_HALF, NUM_BLOCKS, IM, IN, IK>(
+                A_data, B_data, A_scale, B_scale,
+                tile_m, tile_n, (ki + 1) * BPC, lane,
+                a_nxt, a_sc_nxt, b_nxt, b_sc_nxt);
 
             acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
 
@@ -804,6 +810,8 @@ __global__ void mfma_fp4_gemm_coop_simple(
             a_sc_cur = a_sc_nxt;
             b_sc_cur = b_sc_nxt;
         }
+
+        acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
     }
 
     Traits::template store<M, N>(C, acc, tile_m, tile_n, lane);
@@ -851,8 +859,7 @@ __device__ __forceinline__ void load_a_global_to_reg(
         int blk = c % OK_BLOCKS;
         int g_m = outer_m + row;
         int g_col = k_half_base + blk * 16;
-        uint128_vec val = {0, 0, 0, 0};
-        val = *reinterpret_cast<const uint128_vec*>(&A_data[g_m][g_col]);
+        uint128_vec val = *reinterpret_cast<const uint128_vec*>(&A_data[g_m][g_col]);
         *reinterpret_cast<uint128_vec*>(&data_regs[di * 4]) = val;
     }
 
@@ -862,8 +869,7 @@ __device__ __forceinline__ void load_a_global_to_reg(
         int col = s % OK_BLOCKS;
         int g_m = outer_m + row;
         int g_blk = blk_base + col;
-        uint8_t val = 127;
-        val = A_scale[g_m][g_blk];
+        uint8_t val = A_scale[g_m][g_blk];
         scale_regs[si] = val;
     }
 }
@@ -1024,16 +1030,17 @@ __device__ __forceinline__ void store_c_from_smem_f32(
     constexpr int PER_THREAD = (TOTAL + BLOCK_SIZE - 1) / BLOCK_SIZE;
     for (int i = 0; i < PER_THREAD; i++) {
         int idx = tid + i * BLOCK_SIZE;
-        if (idx < TOTAL) {
-            int local_m = idx / OUTER_N;
-            int local_n = idx % OUTER_N;
-            int gm = outer_m + local_m;
-            int gn = outer_n + local_n;
-            if constexpr (K_SPLITS == 1) {
-                C[gm][gn] = smem_c[local_m][local_n];
-            } else {
-                unsafeAtomicAdd(&C[gm][gn], smem_c[local_m][local_n]);
-            }
+        if constexpr (TOTAL % BLOCK_SIZE != 0) {
+            if (idx >= TOTAL) break;
+        }
+        int local_m = idx / OUTER_N;
+        int local_n = idx % OUTER_N;
+        int gm = outer_m + local_m;
+        int gn = outer_n + local_n;
+        if constexpr (K_SPLITS == 1) {
+            C[gm][gn] = smem_c[local_m][local_n];
+        } else {
+            unsafeAtomicAdd(&C[gm][gn], smem_c[local_m][local_n]);
         }
     }
 }
@@ -1344,7 +1351,13 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
     const int split_id = __builtin_amdgcn_readfirstlane(blockIdx.z);
 
     const int ki_start = split_id * ITERS_PER_SPLIT;
-    const int ki_end = min(ki_start + ITERS_PER_SPLIT, K_ITERS);
+    const int ki_end = [](int s) {
+        if constexpr (K_ITERS % K_SPLITS == 0) {
+            return s + ITERS_PER_SPLIT;
+        } else {
+            return min(s + ITERS_PER_SPLIT, K_ITERS);
+        }
+    }(ki_start);
 
     auto acc = Traits::zero_acc();
 
@@ -1434,7 +1447,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
     const int split_id = __builtin_amdgcn_readfirstlane(blockIdx.z);
 
     const int ki_start = split_id * ITERS_PER_SPLIT;
-    const int ki_end = min(ki_start + ITERS_PER_SPLIT, K_ITERS);
+    const int ki_end = [](int s) {
+        if constexpr (K_ITERS % K_SPLITS == 0) {
+            return s + ITERS_PER_SPLIT;
+        } else {
+            return min(s + ITERS_PER_SPLIT, K_ITERS);
+        }
+    }(ki_start);
 
     auto acc = Traits::zero_acc();
 
@@ -1562,7 +1581,13 @@ __device__ __forceinline__ void tiled_splitk_fused_compute(
 
     const int ok_start = __builtin_amdgcn_readfirstlane(split_id * ITERS_PER_SPLIT);
     const int ok_end = __builtin_amdgcn_readfirstlane(
-        min(ok_start + ITERS_PER_SPLIT, TOTAL_OK_ITERS));
+        []([[maybe_unused]] int s) {
+            if constexpr (TOTAL_OK_ITERS % K_SPLITS == 0) {
+                return s + ITERS_PER_SPLIT;
+            } else {
+                return min(s + ITERS_PER_SPLIT, TOTAL_OK_ITERS);
+            }
+        }(ok_start));
     const int num_iters = ok_end - ok_start;
 
     __shared__ uint8_t smem_a_data[BUFFERS][OUTER_M][OK_HALF];
