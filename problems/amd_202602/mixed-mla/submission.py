@@ -627,10 +627,6 @@ void mla_fused_attn_kernel(
     // ---- LDS layout ----
     __shared__ uint8_t q_lds_data[HEADS][A_K_HALF];
     __shared__ uint8_t q_lds_scale[NUM_BLOCKS * HEADS];
-    constexpr int KV_BUFS = DOUBLE_BUFFER ? 2 : 1;
-    __shared__ uint8_t kv_lds_data[KV_BUFS][KV_SUBTILE][K_HALF];
-    __shared__ uint8_t kv_lds_scale_tile[KV_BUFS][KV_SUBTILE][B_SCALE_STRIDE];
-    __shared__ float   scores_lds[HEADS][KV_SUBTILE];
 
     // ---- Per-warp MFMA V accumulators + online softmax state ----
     acc_t v_acc[CHUNKS_PER_WARP];
@@ -685,6 +681,11 @@ void mla_fused_attn_kernel(
     // ---- Step 2: Iterate over KV in subtiles ----
     const int kv_row_base = __builtin_amdgcn_readfirstlane(batch_idx * N);
     constexpr int NUM_SUBTILES = KV_PER_SPLIT / KV_SUBTILE;
+    constexpr bool EFFECTIVE_DB = DOUBLE_BUFFER && (NUM_SUBTILES > 1);
+    constexpr int KV_BUFS = EFFECTIVE_DB ? 2 : 1;
+    __shared__ uint8_t kv_lds_data[KV_BUFS][KV_SUBTILE][K_HALF];
+    __shared__ uint8_t kv_lds_scale_tile[KV_BUFS][KV_SUBTILE][B_SCALE_STRIDE];
+    __shared__ float   scores_lds[HEADS][KV_SUBTILE];
 
     if constexpr (PROFILE_PHASES) {
         if (is_timer_block && tid == 0)
@@ -714,23 +715,23 @@ void mla_fused_attn_kernel(
         }
 
         // ---- Prefetch next subtile (overlaps with compute on current for double-buffer) ----
-        if (DOUBLE_BUFFER || kv_pos > kv_start_global) {
-            int kv_row = kv_row_base + kv_pos;
-            if constexpr (DOUBLE_BUFFER) {
+        if (EFFECTIVE_DB || kv_pos > kv_start_global) {
+              int kv_row = kv_row_base + kv_pos;
+              if constexpr (EFFECTIVE_DB) {
                 // look-ahead to next tile
                 kv_row += KV_SUBTILE;
             }
 
             // Double-buffer: skip if no next subtile to prefetch
             // Single-buffer: always load (iter 0 skip is handled by outer guard)
-            if (!DOUBLE_BUFFER || kv_pos + KV_SUBTILE < kv_end_pos) {
+            if (!EFFECTIVE_DB || kv_pos + KV_SUBTILE < kv_end_pos) {
                 const int nxt = (cur + 1) % KV_BUFS;
                 mla_load_kv_tile<KV_SUBTILE, K_HALF, B_SCALE_STRIDE, BLOCK_SIZE>(
                     kv_lds_data[nxt], kv_lds_scale_tile[nxt],
                     kv_mxfp4, kv_scale, kv_row, tid);
             }
 
-            if constexpr (!DOUBLE_BUFFER && WARPS > 1) {
+            if constexpr (!EFFECTIVE_DB && WARPS > 1) {
                 __syncthreads();
             }
         }
@@ -1036,7 +1037,7 @@ torch::Tensor mla_fused_pipeline_impl(
     {
         dim3 grid(BATCH_SIZE, KV_SPLITS);
         dim3 block(BS);
-        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, KV_SUBTILE, USE_32x32, (BATCH_SIZE == 256 && N == 8192), DOUBLE_BUFFER>
+        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, KV_SUBTILE, USE_32x32, false, DOUBLE_BUFFER>
             <<<grid, block>>>(
             reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
             reinterpret_cast<const uint8_t(*)[A_K_HALF]>(q_data_buf.data_ptr()),
@@ -1151,9 +1152,9 @@ torch::Tensor mla_mxfp4_pipeline(
     // bs=4, kv=8192: no-DB, BS=512, KV=128 → 39.4µs (Trial 1)
     MLA_FUSED(4, 8192, 18, 512, 32, false);
     MLA_FUSED(4, 8192, 24, 512, 32, false);
-    // bs=32, kv=1024: no-DB (DB causes leaderboard failures with certain seeds), BS=512, KV=128
-    MLA_FUSED(32, 1024, 18, 512, 128, false);
-    MLA_FUSED(32, 1024, 24, 512, 128, false);
+    // bs=32, kv=1024: DB=true requested but EFFECTIVE_DB=false (NUM_SUBTILES=1), BS=512, KV=128
+    MLA_FUSED(32, 1024, 18, 512, 128, false, true);
+    MLA_FUSED(32, 1024, 24, 512, 128, false, true);
     // bs=32, kv=8192: no-DB, BS=256, KV=128 → 189µs (both trials same)
     MLA_FUSED(32, 8192, 18, 256, 48, false);
     MLA_FUSED(32, 8192, 24, 256, 48, false);
@@ -1579,7 +1580,7 @@ def custom_kernel_mxfp4_qkt(data):
     kv_seq_len = config["kv_seq_len"]
     v_head_dim = config["v_head_dim"]
     sm_scale = config["sm_scale"]
-    PROFILE = True
+    PROFILE = False
 
     kv_buffer_mxfp4, kv_scale_mxfp4 = kv_data["mxfp4"]
     total_q = q.shape[0]
