@@ -1,8 +1,7 @@
 "**MI355X on GitHub ✅ success**
-> Workflow [23724027731](<https://github.com/gpu-mode/kernelbot/actions/runs/23724027731>) completed
+> Workflow [24007379206](<https://github.com/gpu-mode/kernelbot/actions/runs/24007379206>) completed
 > Downloading artifacts... done
-> ✅ Compilation successful
-> ❌ Benchmarking failed
+> ✅ Benchmarking successful
 
 Running on:
 * GPU: `AMD Instinct MI355X`
@@ -11,97 +10,53 @@ Running on:
 * Runtime: `ROCm`
 * Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
 * Torch: `2.10.0+rocm7.1`
-* Hostname: `arc-runner-set-h82gb-runner-h9hlw`
+* Hostname: `arc-runner-set-hbp2z-runner-cvpc8`
 
 
 ## Benchmarks:
 ```
-❌ bs: 16; seed: 9371; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
+bs: 16; seed: 9371; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 21.8 ± 0.02 ms
+ ⚡ 21.5 ms 🐌 23.0 ms
 
-Number of mismatched elements: 100072\
-ERROR at (0, 0): 0.66796875 -0.0927734375\
-ERROR at (0, 1): -0.82421875 -0.455078125\
-ERROR at (0, 2): 1.1953125 0.2158203125\
-ERROR at (0, 3): -0.640625 0.0908203125\
-ERROR at (0, 5): -1.15625 -0.1220703125\
-... and 100067 more mismatched elements.
+bs: 128; seed: 2291; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 44.7 ± 0.04 ms
+ ⚡ 44.3 ms 🐌 47.1 ms
 
-❌ bs: 128; seed: 2291; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
+bs: 512; seed: 81934; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 42.6 ± 0.04 ms
+ ⚡ 42.3 ms 🐌 43.5 ms
 
-Number of mismatched elements: 800487\
-ERROR at (0, 0): 0.041259765625 -0.02294921875\
-ERROR at (0, 1): -0.953125 -1.2578125\
-ERROR at (0, 2): 0.359375 0.435546875\
-ERROR at (0, 3): 0.1943359375 0.30078125\
-ERROR at (0, 4): -0.45703125 -0.04052734375\
-... and 800482 more mismatched elements.
+bs: 16; seed: 2291; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 5.95 ± 0.006 ms
+ ⚡ 5.79 ms 🐌 6.64 ms
 
-❌ bs: 512; seed: 81934; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
+bs: 128; seed: 81934; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 5.51 ± 0.006 ms
+ ⚡ 5.43 ms 🐌 6.10 ms
 
-Number of mismatched elements: 3200771\
-ERROR at (0, 0): -0.69140625 -0.044189453125\
-ERROR at (0, 1): -0.1572265625 -0.515625\
-ERROR at (0, 2): 0.63671875 0.40625\
-ERROR at (0, 3): 0.80859375 0.03857421875\
-ERROR at (0, 4): -0.212890625 0.06591796875\
-... and 3200766 more mismatched elements.
+bs: 512; seed: 81934; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 5.66 ± 0.007 ms
+ ⚡ 5.50 ms 🐌 8.77 ms
 
-❌ bs: 16; seed: 2291; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
-
-Number of mismatched elements: 102941\
-ERROR at (0, 0): -0.294921875 0.212890625\
-ERROR at (0, 1): 1.171875 0.1943359375\
-ERROR at (0, 2): 1.1328125 0.44921875\
-ERROR at (0, 3): 0.2451171875 -0.416015625\
-ERROR at (0, 4): 0.27734375 0.0546875\
-... and 102936 more mismatched elements.
-
-❌ bs: 128; seed: 81934; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
-
-Number of mismatched elements: 822573\
-ERROR at (0, 0): -0.0634765625 0.126953125\
-ERROR at (0, 1): -0.52734375 -0.62109375\
-ERROR at (0, 2): -1.21875 -0.26171875\
-ERROR at (0, 3): 1.0703125 0.390625\
-ERROR at (0, 4): 1.3203125 0.70703125\
-... and 822568 more mismatched elements.
-
-❌ bs: 512; seed: 81934; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
-
-Number of mismatched elements: 3291399\
-ERROR at (0, 0): -1.234375 -0.546875\
-ERROR at (0, 1): -0.055908203125 0.494140625\
-ERROR at (0, 2): 0.73046875 0.58203125\
-ERROR at (0, 3): 0.08837890625 -0.10986328125\
-ERROR at (0, 4): -0.24609375 -0.0322265625\
-... and 3291394 more mismatched elements.
-
-❌ bs: 512; seed: 81934; dexpert: 2048; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
-
-Number of mismatched elements: 3300906\
-ERROR at (0, 0): -0.12109375 0.00830078125\
-ERROR at (0, 1): -0.55078125 -0.23046875\
-ERROR at (0, 2): 0.390625 0.111328125\
-ERROR at (0, 3): -1.0703125 -0.890625\
-ERROR at (0, 4): -1.1328125 -0.326171875\
-... and 3300901 more mismatched elements.
+bs: 512; seed: 81934; dexpert: 2048; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 7.44 ± 0.007 ms
+ ⚡ 7.37 ms 🐌 7.87 ms
 ```
 
 ## Program stderr:
 ```
-[aiter] start build [module_aiter_enum] under /home/runner/aiter/aiter/jit/build/module_aiter_enum
-[aiter] \u001b[32mfinish build [module_aiter_enum], cost 7.8s \u001b[0m
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 \u001b[92mSuccessfully preprocessed all matching files.\u001b[0m
 [aiter] merge tuned file under model_configs/ and configs/ /home/runner/aiter/aiter/configs/tuned_fmoe.csv:/home/runner/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_fmoe_qwen3_235b.csv:/home/runner/aiter/aiter/configs/model_configs/dsv3_fp4_tuned_fmoe.csv
 [aiter] [fused_moe] using 2stage (kernelName1='moe_ck2stages_gemm1_64x32x32x128_1x1_MulABScaleShuffled_v3_Nswizzle0_Quant3_MulRoutedWeight0_silu_FP4X2_FP4X2_B16', kernelName2='moe_ck2stages_gemm2_64x32x32x128_1x1_MulABScaleExpertWeightShuffled_v1_Nswizzle0_Quant3_MulRoutedWeight1_FP4X2_FP4X2_B16') for (256, 16, 7168, 256, 257, 9, 'ActivationType.Silu', 'torch.bfloat16', 'torch.float4_e2m1fn_x2', 'torch.float4_e2m1fn_x2', 'QuantType.per_1x32', True, False) 
 [aiter] start build [module_moe_sorting] under /home/runner/aiter/aiter/jit/build/module_moe_sorting
-[aiter] \u001b[32mfinish build [module_moe_sorting], cost 25.8s \u001b[0m
+[aiter] \u001b[32mfinish build [module_moe_sorting], cost 25.5s \u001b[0m
 [aiter] import [module_moe_sorting] under /home/runner/aiter/aiter/jit/module_moe_sorting.so
 [aiter] type hints mismatch, override to --> moe_sorting_fwd(topk_ids: torch.Tensor, topk_weights: torch.Tensor, sorted_token_ids: torch.Tensor, sorted_weights: torch.Tensor, sorted_expert_ids: torch.Tensor, num_valid_ids: torch.Tensor, moe_buf: torch.Tensor, num_experts: int | typing.SupportsIndex, unit_size: int | typing.SupportsIndex, local_expert_mask: Optional[torch.Tensor] = None, num_local_tokens: Optional[torch.Tensor] = None, dispatch_policy: int | typing.SupportsIndex = 0) -> None
 [aiter] start build [module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2_] under /home/runner/aiter/aiter/jit/build/module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2_
-[aiter] \u001b[32mfinish build [module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2_], cost 157.8s \u001b[0m
+[aiter] \u001b[32mfinish build [module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2_], cost 105.5s \u001b[0m
 [aiter] import [module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2_] under /home/runner/aiter/aiter/jit/module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2_.so
 [aiter] type hints mismatch, override to --> ck_moe_stage1(hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, sorted_token_ids: torch.Tensor, sorted_expert_ids: torch.Tensor, num_valid_ids: torch.Tensor, out: torch.Tensor, topk: int | typing.SupportsIndex, kernelName: str = None, w1_scale: Optional[torch.Tensor] = None, a1_scale: Optional[torch.Tensor] = None, block_m: int | Optional[typing.SupportsIndex] = 32, sorted_weights: Optional[torch.Tensor] = None, quant_type: int | typing.SupportsIndex = 0, activation: int | typing.SupportsIndex = 0, splitk: int | Optional[typing.SupportsIndex] = 1, non_temporal_load: bool = False, dst_type: Optional[str] = None, is_shuffled: bool = True) -> None
 [aiter] type hints mismatch, override to --> ck_moe_stage2(inter_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, sorted_token_ids: torch.Tensor, sorted_expert_ids: torch.Tensor, num_valid_ids: torch.Tensor, out: torch.Tensor, topk: int | typing.SupportsIndex, kernelName: str = None, w2_scale: Optional[torch.Tensor] = None, a2_scale: Optional[torch.Tensor] = None, block_m: int | Optional[typing.SupportsIndex] = 32, sorted_weights: Optional[torch.Tensor] = None, quant_type: int | typing.SupportsIndex = 0, activation: int | typing.SupportsIndex = 0, splitk: int | Optional[typing.SupportsIndex] = 1, non_temporal_load: bool = False, dst_type: Optional[str] = None, is_shuffled: bool = True) -> None
@@ -118,13 +73,13 @@ ERROR at (0, 4): -1.1328125 -0.326171875\
 
 ## Program stdout:
 ```
-/home/runner/.cache/torch_extensions/py312_cpu/moe_e175e619e147/main.cpp -> /home/runner/.cache/torch_extensions/py312_cpu/moe_e175e619e147/main.cpp [skipped, no changes]
-/home/runner/.cache/torch_extensions/py312_cpu/moe_e175e619e147/cuda.cu -> /home/runner/.cache/torch_extensions/py312_cpu/moe_e175e619e147/hip.hip [ok]
+/home/runner/.cache/torch_extensions/py312_cpu/moe_hip_v5/main.cpp -> /home/runner/.cache/torch_extensions/py312_cpu/moe_hip_v5/main.cpp [skipped, no changes]
+/home/runner/.cache/torch_extensions/py312_cpu/moe_hip_v5/cuda.cu -> /home/runner/.cache/torch_extensions/py312_cpu/moe_hip_v5/hip.hip [ok]
 Total number of unsupported CUDA function calls: 0
 
 
-Total number of replaced kernel launches: 0
-[1/3] clang++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=moe_e175e619e147 -DTORCH_API_INCLUDE_EXTENSION_H -I/opt/rocm/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/THH -isystem /opt/rocm/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -O3 -c /home/runner/.cache/torch_extensions/py312_cpu/moe_e175e619e147/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC
-[2/3] /opt/rocm/bin/hipcc  -DWITH_HIP -DTORCH_EXTENSION_NAME=moe_e175e619e147 -DTORCH_API_INCLUDE_EXTENSION_H -I/opt/rocm/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/THH -isystem /opt/rocm/include -isystem /usr/include/python3.12 -O3 -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC -DCUDA_HAS_FP16=1 -D__HIP_NO_HALF_OPERATORS__=1 -D__HIP_NO_HALF_CONVERSIONS__=1 -DHIP_ENABLE_WARP_SYNC_BUILTINS=1 -std=c++17 --offload-arch=gfx950 -fno-gpu-rdc -O3 --offload-arch=gfx950 -c /home/runner/.cache/torch_extensions/py312_cpu/moe_e175e619e147/hip.hip -o hip.cuda.o 
-[3/3] clang++ main.o hip.cuda.o -shared -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_hip -ltorch_cpu -ltorch_hip -ltorch -ltorch_python -L/opt/rocm/lib -lamdhip64 -o moe_e175e619e147.so
-[moe] compiled in 17.9s```"
+Total number of replaced kernel launches: 3
+[1/3] clang++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=moe_hip_v5 -DTORCH_API_INCLUDE_EXTENSION_H -I/opt/rocm/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/THH -isystem /opt/rocm/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -O3 -c /home/runner/.cache/torch_extensions/py312_cpu/moe_hip_v5/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC
+[2/3] /opt/rocm/bin/hipcc  -DWITH_HIP -DTORCH_EXTENSION_NAME=moe_hip_v5 -DTORCH_API_INCLUDE_EXTENSION_H -I/opt/rocm/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/THH -isystem /opt/rocm/include -isystem /usr/include/python3.12 -O3 -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC -DCUDA_HAS_FP16=1 -D__HIP_NO_HALF_OPERATORS__=1 -D__HIP_NO_HALF_CONVERSIONS__=1 -DHIP_ENABLE_WARP_SYNC_BUILTINS=1 -std=c++17 --offload-arch=gfx950 -fno-gpu-rdc -O3 -ffast-math -munsafe-fp-atomics --offload-arch=gfx950 -c /home/runner/.cache/torch_extensions/py312_cpu/moe_hip_v5/hip.hip -o hip.cuda.o 
+[3/3] clang++ hip.cuda.o main.o -shared -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_hip -ltorch_cpu -ltorch_hip -ltorch -ltorch_python -L/opt/rocm/lib -lamdhip64 -o moe_hip_v5.so
+[moe] HIP compiled in 17.8s```"

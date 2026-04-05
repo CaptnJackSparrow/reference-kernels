@@ -15,6 +15,7 @@ MXFP4_HIP_SOURCE = b'''
 #include <cmath>
 
 constexpr int FMT_FP4 = 4;
+constexpr int WARP_SIZE = 64;
 
 typedef float __attribute__((ext_vector_type(16))) float16_t;
 typedef float __attribute__((ext_vector_type(4))) float4_t;
@@ -33,7 +34,7 @@ __device__ __forceinline__ int sh_scale_off(int row, int col) {
     int t0 = __builtin_amdgcn_ubfe(row, 4, 1);      // bit 4 -> (row%32)/16
     int t1 = __builtin_amdgcn_ubfe(col, 2, 1) << 1; // bit 2 -> (col%8)/4 * 2
     int t2 = __builtin_amdgcn_ubfe(row, 0, 4) << 2; // bits 0-3 -> (row%16) * 4
-    int t3 = __builtin_amdgcn_ubfe(col, 0, 2) << 6; // bits 0-1 -> (col%4) * 64
+    int t3 = __builtin_amdgcn_ubfe(col, 0, 2) << 6; // bits 0-1 -> (col%4) * WARP_SIZE
 
     // (col/8) * 256
     int t4 = (col >> 3) << 8;
@@ -45,22 +46,12 @@ __device__ __forceinline__ int sh_scale_off(int row, int col) {
     return t0 + t1 + t2 + t3 + t4 + t5;
 }
 
-template <int M, int K, int OUTER_M, int OUTER_K, int BLOCK_SIZE>
-struct QuantAPerThread {
-    static constexpr int OK_BLOCKS = OUTER_K / 32;
-    static constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
-    static constexpr int BLOCKS_PER_THREAD = (TOTAL_BLOCKS + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    // 4 uint32 (16 packed bytes) + 1 scale per block
-    static constexpr int DATA_REGS = BLOCKS_PER_THREAD * 4;
-    static constexpr int SCALE_REGS = BLOCKS_PER_THREAD;
-};
-
 // =====================================================================
 // Reusable FP4 quantization: 32 floats -> 16 packed bytes + E8M0 scale
 // =====================================================================
-
-struct QuantBlock {
-    uint32_t data[4];  // 16 packed bytes (32 FP4 values)
+template <int VALS_PER_THREAD>
+struct QuantResult {
+    uint8_t data[VALS_PER_THREAD / 2 > 0 ? VALS_PER_THREAD / 2 : 1];
     uint8_t e8m0;
 };
 
@@ -173,7 +164,7 @@ __device__ __forceinline__ uint32_t pack_fp4_to_u32(uint8_t p0, uint8_t p1, uint
 
 // Quantize 32 BF16 values to packed FP4 + E8M0 scale using BF16 hw intrinsic.
 // amax computed in BF16 - no FP32 intermediate.
-__device__ __forceinline__ QuantBlock quantize_fp4_block_bf16(const hip_bfloat16* src) {
+__device__ __forceinline__ QuantResult<32> quantize_fp4_block_bf16(const hip_bfloat16* src) {
     // Find amax across 32 BF16 values in BF16 precision
     uint16_t amax_bits = 0;
     for (int i = 0; i < 32; i++) {
@@ -194,72 +185,261 @@ __device__ __forceinline__ QuantBlock quantize_fp4_block_bf16(const hip_bfloat16
         pack[j] = pack_fp4_to_u32(p0, p1, p2, p3);
     }
 
-    QuantBlock result;
+    QuantResult<32> result;
     *reinterpret_cast<uint128_vec*>(&result.data) = *reinterpret_cast<uint128_vec*>(&pack);
     result.e8m0 = sc.e8m0;
     return result;
 }
 
-template <int M, int K, int OUTER_M, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void quantize_a_to_reg(
+// Warp-parallel quantization: returns quantized values in registers.
+// Caller is responsible for writing to memory.
+// =====================================================================
+template <int K, int VALS_PER_THREAD>
+__device__ __forceinline__ QuantResult<VALS_PER_THREAD> quantize_block_parallel(
     const hip_bfloat16 A[][K],
-    int outer_m, int tid,
-    uint32_t* data_regs, uint8_t* scale_regs,
-    int k_offset
+    int row, int blk, int lane_in_group = 0, int tid = 0
 ) {
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+    static_assert(VALS_PER_THREAD >= 1 && VALS_PER_THREAD <= 32, "VALS_PER_THREAD must be 1..32");
+    static_assert(32 % VALS_PER_THREAD == 0, "32 must be divisible by VALS_PER_THREAD");
 
-    for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
-        int row = b / OK_BLOCKS;
-        int blk = b % OK_BLOCKS;
-        int g_m = outer_m + row;
-        int g_k = k_offset + blk * 32;
-
-        QuantBlock qb = quantize_fp4_block_bf16(&A[g_m][g_k]);
-        *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) = *reinterpret_cast<uint128_vec*>(&qb.data);
-        scale_regs[bi] = qb.e8m0;
+    // Full-block case: delegate to the serial quantizer (single thread handles all 32 values)
+    if constexpr (VALS_PER_THREAD == 32) {
+        return quantize_fp4_block_bf16(&A[row][blk * 32]);
     }
-}
 
-template <int OUTER_M, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void store_quant_a_to_lds(
-    uint8_t smem_data[][OUTER_K / 2], uint8_t smem_scale[][OUTER_K / 32],
-    int tid,
-    const uint32_t* data_regs, const uint8_t* scale_regs
-) {
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+    constexpr int THREADS_PER_GROUP = 32 / VALS_PER_THREAD;
+    QuantResult<VALS_PER_THREAD> result;
 
-    for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
-        int row = b / OK_BLOCKS;
-        int blk = b % OK_BLOCKS;
-
-        *reinterpret_cast<uint128_vec*>(&smem_data[row][blk * 16]) = *reinterpret_cast<const uint128_vec*>(&data_regs[bi * 4]);
-        smem_scale[row][blk] = scale_regs[bi];
+    // Each thread loads VALS_PER_THREAD BF16 values (keep both BF16 and FP32 for max)
+    hip_bfloat16 bvals[VALS_PER_THREAD];
+    int base_k = blk * 32 + lane_in_group * VALS_PER_THREAD;
+    for (int v = 0; v < VALS_PER_THREAD; v++) {
+        bvals[v] = A[row][base_k + v];
     }
+
+    // Find local max across this thread's values in BF16 (uint16 abs comparison)
+    uint16_t local_max_bits = *reinterpret_cast<const uint16_t*>(&bvals[0]) & 0x7FFF;
+    for (int v = 1; v < VALS_PER_THREAD; v++) {
+        uint16_t bits = *reinterpret_cast<const uint16_t*>(&bvals[v]) & 0x7FFF;
+        local_max_bits = (bits > local_max_bits) ? bits : local_max_bits;
+    }
+    hip_bfloat16 local_max_bf16 = *reinterpret_cast<const hip_bfloat16*>(&local_max_bits);
+
+    // Reduce max across all threads in the group directly in BF16
+    hip_bfloat16 amax_bf16;
+    if constexpr (THREADS_PER_GROUP == 1) {
+        amax_bf16 = local_max_bf16;
+    } else {
+        int group_in_warp = (tid / THREADS_PER_GROUP);
+        unsigned long long group_mask = 0;
+        for (int i = 0; i < THREADS_PER_GROUP; i++)
+            group_mask |= (1ull << (group_in_warp * THREADS_PER_GROUP + i));
+        amax_bf16 = __reduce_max_sync(group_mask, local_max_bf16);
+    }
+
+    E8M0Scale sc = compute_e8m0_scale(amax_bf16);
+    result.e8m0 = sc.e8m0;
+
+    // Quantize to FP4 using BF16 hw intrinsic
+    if constexpr (VALS_PER_THREAD == 1) {
+        if ((lane_in_group & 1) == 0) {
+            result.data[0] = quantize_fp4_pair_hw_bf16(bvals[0], bvals[0], sc.quant_scale);
+        }
+    } else {
+        for (int v = 0; v < VALS_PER_THREAD; v += 2) {
+            result.data[v / 2] = quantize_fp4_pair_hw_bf16(bvals[v], bvals[v + 1], sc.quant_scale);
+        }
+    }
+
+    return result;
 }
 
-// Wrapper for drop-in replacement
-template <int M, int K, int OUTER_M, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void quantize_a_to_lds(
-    const hip_bfloat16 A[][K],
-    uint8_t smem_data[][OUTER_K / 2], uint8_t smem_scale[][OUTER_K / 32],
-    int outer_m, int tid
-) {
-    using Q = QuantAPerThread<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>;
-    uint32_t data_regs[Q::DATA_REGS];
-    uint8_t  scale_regs[Q::SCALE_REGS];
+template <int K, int OUTER_M, int OUTER_K, int WARPS_M, int WARPS_N>
+struct QuantAPerThread {
+    static_assert(OUTER_M % WARPS_M == 0);
+    static constexpr int TOTAL_ELEMS = OUTER_M * OUTER_K;
+    static constexpr int BLOCK_SIZE = WARP_SIZE * WARPS_M * WARPS_N;
+    static_assert(TOTAL_ELEMS % BLOCK_SIZE == 0);
+    static constexpr int ELEMS_PER_THREAD = 32;
+    static constexpr int OK_BLOCKS = OUTER_K / 32;
+    static constexpr int K_HALF = K / 2;
+    static constexpr int NUM_BLOCKS = K / 32;
+    static constexpr int SUBTILE_M = OUTER_M / WARPS_M;
+    static constexpr int MX_BLOCKS_PER_SUBTILE = OK_BLOCKS / WARPS_N;
+    static constexpr int THREADS_PER_GROUP = ELEMS_PER_THREAD >= 32 ? 1 : 32 / ELEMS_PER_THREAD;
+    static constexpr int GROUPS_PER_WARP = WARP_SIZE / THREADS_PER_GROUP;
+    static constexpr int BLOCKS_PER_THREAD = SUBTILE_M * ((MX_BLOCKS_PER_SUBTILE + GROUPS_PER_WARP - 1) / GROUPS_PER_WARP);
+    static_assert(OK_BLOCKS % WARPS_N == 0);
 
-    quantize_a_to_reg<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>(
-        A, outer_m, tid, data_regs, scale_regs, 0);
+    using data_type = uint8_t[BLOCKS_PER_THREAD * (ELEMS_PER_THREAD / 2)];
+    using scale_type = uint8_t[BLOCKS_PER_THREAD];
 
-    store_quant_a_to_lds<OUTER_M, OUTER_K, BLOCK_SIZE>(
-        smem_data, smem_scale, tid, data_regs, scale_regs);
-}
+    static __device__ __forceinline__ void quantize_a_to_reg(
+        const hip_bfloat16 A[][K],
+        int tid, int outer_m, int k_offset,
+        data_type data_regs, scale_type scale_regs
+    ) {
+        constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+
+        for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+            int g_m = outer_m + row;
+            int g_k = k_offset + blk * 32;
+
+            auto qb = quantize_fp4_block_bf16(&A[g_m][g_k]);
+            *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) = *reinterpret_cast<uint128_vec*>(&qb.data);
+            scale_regs[bi] = qb.e8m0;
+        }
+    }
+    static __device__ __forceinline__ void store_quant_a_to_lds(
+        uint8_t smem_data[][OUTER_K / 2], uint8_t smem_scale[][OUTER_K / 32],
+        int tid, const data_type data_regs, const scale_type scale_regs
+    ) {
+        constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+
+        for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+
+            *reinterpret_cast<uint128_vec*>(&smem_data[row][blk * 16]) = *reinterpret_cast<const uint128_vec*>(&data_regs[bi * 4]);
+            smem_scale[row][blk] = scale_regs[bi];
+        }
+    }
+
+    static __device__ __forceinline__ void store_a_reg_to_lds(
+        uint8_t smem_data[][OUTER_K / 2], uint8_t* smem_scale,
+        int tid, const uint32_t* data_regs, const uint8_t* scale_regs
+    ) {
+        constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+
+        for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+            *reinterpret_cast<uint128_vec*>(&smem_data[row][blk * 16]) =
+                *reinterpret_cast<const uint128_vec*>(&data_regs[bi * 4]);
+            smem_scale[b] = scale_regs[bi];
+        }
+    }
+
+    static __device__ __forceinline__ void quantize_a_to_lds(
+        const hip_bfloat16 A[][K],
+        uint8_t smem_data[][OUTER_K / 2], uint8_t smem_scale[][OUTER_K / 32],
+        int outer_m, int tid
+    ) {
+        data_type data_regs;
+        scale_type scale_regs;
+        quantize_a_to_reg(
+            A, tid, outer_m, 0, data_regs, scale_regs);
+        store_quant_a_to_lds(
+            smem_data, smem_scale, tid, data_regs, scale_regs);
+    }
+
+    static __device__ __forceinline__ void load_a_global_to_reg(
+        const uint8_t A_data[][K_HALF],
+        const uint8_t A_scale[][NUM_BLOCKS],
+        int outer_m, int k_half_base, int blk_base, int tid,
+        uint32_t* data_regs, uint8_t* scale_regs
+    ) {
+        constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+
+        for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+            int g_m = outer_m + row;
+            *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) =
+                *reinterpret_cast<const uint128_vec*>(&A_data[g_m][k_half_base + blk * 16]);
+            scale_regs[bi] = A_scale[g_m][blk_base + blk];
+        }
+    }
+
+    static __device__ __forceinline__ void load_a_to_lds(
+        const uint8_t A_data[][K_HALF],
+        const uint8_t A_scale[][NUM_BLOCKS],
+        uint8_t smem_data[][OUTER_K / 2], uint8_t* smem_scale,
+        int outer_m, int k_half_base, int blk_base, int tid
+    ) {
+        constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+
+        for (int b = tid; b < TOTAL_BLOCKS; b += BLOCK_SIZE) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+            int g_m = outer_m + row;
+            *reinterpret_cast<uint128_vec*>(&smem_data[row][blk * 16]) =
+                *reinterpret_cast<const uint128_vec*>(&A_data[g_m][k_half_base + blk * 16]);
+            smem_scale[b] = A_scale[g_m][blk_base + blk];
+        }
+    }
+};
+
+template <int K, int OUTER_N, int OUTER_K, int WARPS_M, int WARPS_N>
+struct LoadBPerThread {
+    static constexpr int BLOCK_SIZE = WARP_SIZE * WARPS_M * WARPS_N;
+    static constexpr int OK_BLOCKS = OUTER_K / 32;
+    static constexpr int K_HALF = K / 2;
+    static constexpr int NUM_BLOCKS = K / 32;
+
+    static __device__ __forceinline__ void store_b_reg_to_lds(
+        uint8_t smem_data[][OUTER_N * 16], uint8_t smem_scale[][OUTER_N],
+        int tid,
+        const uint32_t* data_regs, const uint8_t* scale_regs
+    ) {
+        constexpr int B_TOTAL_BLOCKS = OUTER_N * OK_BLOCKS;
+
+        for (int b = tid, bi = 0; b < B_TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+            *reinterpret_cast<uint128_vec*>(&smem_data[blk][row * 16]) =
+                *reinterpret_cast<const uint128_vec*>(&data_regs[bi * 4]);
+            smem_scale[blk][row] = scale_regs[bi];
+        }
+    }
+
+    static __device__ __forceinline__ void load_b_global_to_reg(
+        const uint8_t B_data[][K_HALF],
+        const uint8_t* __restrict__ B_scale,
+        int outer_n, int k_half_base, int blk_base, int tid,
+        uint32_t* data_regs, uint8_t* scale_regs
+    ) {
+        constexpr int B_TOTAL_BLOCKS = OUTER_N * OK_BLOCKS;
+
+        for (int b = tid, bi = 0; b < B_TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+            int g_n = outer_n + row;
+            *reinterpret_cast<uint128_vec*>(&data_regs[bi * 4]) =
+                *reinterpret_cast<const uint128_vec*>(&B_data[g_n][k_half_base + blk * 16]);
+            scale_regs[bi] = B_scale[sh_scale_off<NUM_BLOCKS>(g_n, blk_base + blk)];
+        }
+    }
+
+    static __device__ __forceinline__ void load_b_to_lds(
+        const uint8_t B_data[][K_HALF],
+        const uint8_t* __restrict__ B_scale,
+        uint8_t smem_data[][OUTER_N * 16], uint8_t smem_scale[][OUTER_N],
+        int outer_n, int k_half_base, int blk_base, int tid
+    ) {
+        constexpr int B_TOTAL_BLOCKS = OUTER_N * OK_BLOCKS;
+
+        for (int b = tid; b < B_TOTAL_BLOCKS; b += BLOCK_SIZE) {
+            int row = b / OK_BLOCKS;
+            int blk = b % OK_BLOCKS;
+            int g_n = outer_n + row;
+            *reinterpret_cast<uint128_vec*>(&smem_data[blk][row * 16]) =
+                *reinterpret_cast<const uint128_vec*>(&B_data[g_n][k_half_base + blk * 16]);
+            smem_scale[blk][row] = B_scale[sh_scale_off<NUM_BLOCKS>(g_n, blk_base + blk)];
+        }
+    }
+};
 
 __device__ __forceinline__ int32_t broadcast_scale(uint8_t e8m0) {
     return (int32_t)e8m0 * 0x01010101;
+}
+
+// LDS-only barrier: waits for LDS/GDS/scalar ops (lgkmcnt) but NOT global memory (vmcnt).
+// Avoids unnecessary stalls when no global loads are in flight.
+__device__ __forceinline__ void lds_barrier() {
+    asm volatile("s_waitcnt lgkmcnt(0)\\n s_barrier" ::: "memory");
 }
 
 template <int IM, int K_HALF_STRIDE, int REGS = (IM == 32) ? 4 : 8>
@@ -474,77 +654,6 @@ __device__ __forceinline__ void load_ab_global(
     b_s = load_b_with_scale<K_HALF, NUM_BLOCKS, IM, IN, IK>(B_data, B_scale, tile_n, blk0, lane, b_r);
 }
 
-// =====================================================================
-// Result of warp-parallel quantization: packed FP4 bytes + E8M0 scale in registers.
-template <int VALS_PER_THREAD>
-struct QuantResult {
-    uint8_t packed_bytes[VALS_PER_THREAD / 2 > 0 ? VALS_PER_THREAD / 2 : 1];
-    uint8_t e8m0;
-    int num_bytes;  // actual valid packed bytes this thread holds
-};
-
-// Warp-parallel quantization: returns quantized values in registers.
-// Caller is responsible for writing to memory.
-// =====================================================================
-template <int M, int K, int VALS_PER_THREAD>
-__device__ __forceinline__ QuantResult<VALS_PER_THREAD> quantize_block_parallel(
-    const hip_bfloat16 A[][K],
-    int row, int blk, int lane_in_group, int tid
-) {
-    static_assert(VALS_PER_THREAD >= 1 && VALS_PER_THREAD <= 32, "VALS_PER_THREAD must be 1..32");
-    static_assert(32 % VALS_PER_THREAD == 0, "32 must be divisible by VALS_PER_THREAD");
-
-    constexpr int THREADS_PER_GROUP = 32 / VALS_PER_THREAD;
-    QuantResult<VALS_PER_THREAD> result;
-
-    // Each thread loads VALS_PER_THREAD BF16 values (keep both BF16 and FP32 for max)
-    hip_bfloat16 bvals[VALS_PER_THREAD];
-    int base_k = blk * 32 + lane_in_group * VALS_PER_THREAD;
-    for (int v = 0; v < VALS_PER_THREAD; v++) {
-        bvals[v] = A[row][base_k + v];
-    }
-
-    // Find local max across this thread's values in BF16 (uint16 abs comparison)
-    uint16_t local_max_bits = *reinterpret_cast<const uint16_t*>(&bvals[0]) & 0x7FFF;
-    for (int v = 1; v < VALS_PER_THREAD; v++) {
-        uint16_t bits = *reinterpret_cast<const uint16_t*>(&bvals[v]) & 0x7FFF;
-        local_max_bits = (bits > local_max_bits) ? bits : local_max_bits;
-    }
-    hip_bfloat16 local_max_bf16 = *reinterpret_cast<const hip_bfloat16*>(&local_max_bits);
-
-    // Reduce max across all threads in the group directly in BF16
-    hip_bfloat16 amax_bf16;
-    if constexpr (THREADS_PER_GROUP == 1) {
-        amax_bf16 = local_max_bf16;
-    } else {
-        int group_in_warp = (tid / THREADS_PER_GROUP);
-        unsigned long long group_mask = 0;
-        for (int i = 0; i < THREADS_PER_GROUP; i++)
-            group_mask |= (1ull << (group_in_warp * THREADS_PER_GROUP + i));
-        amax_bf16 = __reduce_max_sync(group_mask, local_max_bf16);
-    }
-
-    E8M0Scale sc = compute_e8m0_scale(amax_bf16);
-    result.e8m0 = sc.e8m0;
-
-    // Quantize to FP4 using BF16 hw intrinsic
-    if constexpr (VALS_PER_THREAD == 1) {
-        if ((lane_in_group & 1) == 0) {
-            result.packed_bytes[0] = quantize_fp4_pair_hw_bf16(bvals[0], bvals[0], sc.quant_scale);
-            result.num_bytes = 1;
-        } else {
-            result.num_bytes = 0;
-        }
-    } else {
-        result.num_bytes = VALS_PER_THREAD / 2;
-        for (int v = 0; v < VALS_PER_THREAD; v += 2) {
-            result.packed_bytes[v / 2] = quantize_fp4_pair_hw_bf16(bvals[v], bvals[v + 1], sc.quant_scale);
-        }
-    }
-
-    return result;
-}
-
 // Warp-parallel quantization kernel: calls quantize_block_parallel
 // and writes results to global memory.
 // =====================================================================
@@ -566,20 +675,20 @@ __global__ void quant_a_kernel_warp_parallel(
     int row = group_id / NUM_BLOCKS;
     int blk = group_id % NUM_BLOCKS;
 
-    auto qr = quantize_block_parallel<M, K, VALS_PER_THREAD>(
+    auto qr = quantize_block_parallel<K, VALS_PER_THREAD>(
         A, row, blk, lane_in_group, tid);
 
     // Write packed FP4 bytes to global memory
     if constexpr (VALS_PER_THREAD == 1) {
         if ((lane_in_group & 1) == 0) {
             int byte_idx = lane_in_group / 2;
-            out_data[row][blk * 16 + byte_idx] = qr.packed_bytes[0];
+            out_data[row][blk * 16 + byte_idx] = qr.data[0];
         }
     } else {
         for (int b = 0; b < VALS_PER_THREAD / 2; b++) {
             int elem_idx = lane_in_group * VALS_PER_THREAD + b * 2;
             int byte_idx = elem_idx / 2;
-            out_data[row][blk * 16 + byte_idx] = qr.packed_bytes[b];
+            out_data[row][blk * 16 + byte_idx] = qr.data[b];
         }
     }
 
@@ -594,7 +703,7 @@ __global__ void quant_a_kernel_warp_parallel(
 template <int M, int N, int K, int NUM_BLOCKS,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1, int K_HALF = K / 2>
-__global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_simple(
+__global__ void __launch_bounds__(WARPS_M * WARPS_N * WARP_SIZE) mfma_fp4_gemm_simple(
     const uint8_t A_data[][K_HALF],
     const uint8_t B_data[][K_HALF],
     const uint8_t A_scale[][NUM_BLOCKS],
@@ -654,7 +763,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_simple(
 template <int M, int N, int K, int NUM_BLOCKS,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1,
-          int BLOCK_SIZE = WARPS_M * WARPS_N * 64, int K_HALF = K / 2>
+          int BLOCK_SIZE = WARPS_M * WARPS_N * WARP_SIZE, int K_HALF = K / 2>
 __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_simple_fused(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][K_HALF],
@@ -688,7 +797,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_simple_fused(
         {
             int a_row = tile_m + (lane % IM);
             int a_blk = 0 + (lane / IM);
-            QuantBlock qb = quantize_fp4_block_bf16(&A_bf16[a_row][a_blk * 32]);
+            auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
             *reinterpret_cast<uint128_vec*>(&a_cur[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
             a_sc_cur = broadcast_scale(qb.e8m0);
         }
@@ -699,7 +808,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_simple_fused(
         for (int ki = 0; ki < K_ITERS - 1; ki++) {
             int a_row = tile_m + (lane % IM);
             int a_blk = (ki + 1) * BPC + (lane / IM);
-            QuantBlock qb = quantize_fp4_block_bf16(&A_bf16[a_row][a_blk * 32]);
+            auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
             *reinterpret_cast<uint128_vec*>(&a_nxt[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
             a_sc_nxt = broadcast_scale(qb.e8m0);
             b_sc_nxt = load_b_with_scale<K_HALF, NUM_BLOCKS, IM, IN, IK>(B_data, B_scale, tile_n, (ki + 1) * BPC, lane, b_nxt);
@@ -732,7 +841,7 @@ template <int M, int N, int K, int NUM_BLOCKS,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1, int K_HALF = K / 2>
 __global__ void mfma_fp4_gemm_coop_simple(
-    const hip_bfloat16 (*__restrict__ A_bf16)[K],
+    const hip_bfloat16 A_bf16[][K],
     uint8_t A_data[][K_HALF],
     uint8_t A_scale[][NUM_BLOCKS],
     const uint8_t B_data[][K_HALF],
@@ -744,7 +853,7 @@ __global__ void mfma_fp4_gemm_coop_simple(
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
     constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
     constexpr int TOTAL_QUANT = M * NUM_BLOCKS;
-    constexpr int BLOCK_SIZE = WARPS_M * WARPS_N * 64;
+    constexpr int BLOCK_SIZE = WARPS_M * WARPS_N * WARP_SIZE;
 
     const int tid = threadIdx.x;
 
@@ -763,7 +872,7 @@ __global__ void mfma_fp4_gemm_coop_simple(
             int row = my_chunk / NUM_BLOCKS;
             int blk = my_chunk % NUM_BLOCKS;
 
-            QuantBlock qb = quantize_fp4_block_bf16(&A_bf16[row * K + blk * 32]);
+            auto qb = quantize_block_parallel<K, 32>(A_bf16, row, blk);
 
             *reinterpret_cast<uint128_vec*>(&A_data[row][blk * 16]) =
                 *reinterpret_cast<uint128_vec*>(&qb.data);
@@ -838,195 +947,15 @@ struct LdsLayout {
     static constexpr int OCCUPANCY= LIMIT / TOTAL;
 };
 
-// ---------- Part 1: Load A from global memory into registers ----------
-template <int M, int K_HALF, int NUM_BLOCKS,
-          int OUTER_M, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void load_a_global_to_reg(
-    const uint8_t A_data[][K_HALF],
-    const uint8_t A_scale[][NUM_BLOCKS],
-    int outer_m, int k_half_base, int blk_base, int tid,
-    uint32_t* data_regs, uint8_t* scale_regs
-) {
-    constexpr int OK_HALF = OUTER_K / 2;
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    // Now iterate over 16-byte chunks (4 uint32 = one MX block's packed data)
-    constexpr int DATA_CHUNKS = OUTER_M * OK_BLOCKS;  // one 16-byte chunk per block
-    constexpr int SCALE_ELEMS = OUTER_M * OK_BLOCKS;
-
-    int di = 0;
-    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
-        int row = c / OK_BLOCKS;
-        int blk = c % OK_BLOCKS;
-        int g_m = outer_m + row;
-        int g_col = k_half_base + blk * 16;
-        uint128_vec val = *reinterpret_cast<const uint128_vec*>(&A_data[g_m][g_col]);
-        *reinterpret_cast<uint128_vec*>(&data_regs[di * 4]) = val;
-    }
-
-    int si = 0;
-    for (int s = tid; s < SCALE_ELEMS; s += BLOCK_SIZE, si++) {
-        int row = s / OK_BLOCKS;
-        int col = s % OK_BLOCKS;
-        int g_m = outer_m + row;
-        int g_blk = blk_base + col;
-        uint8_t val = A_scale[g_m][g_blk];
-        scale_regs[si] = val;
-    }
-}
-
-// ---------- Part 2: Store A from registers into LDS ----------
-template <int OUTER_M, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void store_a_reg_to_lds(
-    uint8_t smem_data[][OUTER_K / 2], uint8_t* smem_scale,
-    int tid,
-    const uint32_t* data_regs, const uint8_t* scale_regs
-) {
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_CHUNKS = OUTER_M * OK_BLOCKS;
-    constexpr int SCALE_ELEMS = OUTER_M * OK_BLOCKS;
-
-    int di = 0;
-    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
-        int row = c / OK_BLOCKS;
-        int blk = c % OK_BLOCKS;
-        *reinterpret_cast<uint128_vec*>(&smem_data[row][blk * 16]) =
-            *reinterpret_cast<const uint128_vec*>(&data_regs[di * 4]);
-    }
-
-    int si = 0;
-    for (int s = tid; s < SCALE_ELEMS; s += BLOCK_SIZE, si++) {
-        smem_scale[s] = scale_regs[si];
-    }
-}
-
-// ---------- Wrapper for A ----------
-template <int M, int K_HALF, int NUM_BLOCKS,
-          int OUTER_M, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void load_a_to_lds(
-    const uint8_t A_data[][K_HALF],
-    const uint8_t A_scale[][NUM_BLOCKS],
-    uint8_t smem_data[][OUTER_K / 2], uint8_t* smem_scale,
-    int outer_m, int k_half_base, int blk_base, int tid
-) {
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_CHUNKS = OUTER_M * OK_BLOCKS;
-
-    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE) {
-        int row = c / OK_BLOCKS;
-        int blk = c % OK_BLOCKS;
-        int g_m = outer_m + row;
-        int g_col = k_half_base + blk * 16;
-        *reinterpret_cast<uint128_vec*>(&smem_data[row][blk * 16]) =
-            *reinterpret_cast<const uint128_vec*>(&A_data[g_m][g_col]);
-    }
-
-    for (int s = tid; s < OUTER_M * OK_BLOCKS; s += BLOCK_SIZE) {
-        int row = s / OK_BLOCKS;
-        int col = s % OK_BLOCKS;
-        int g_m = outer_m + row;
-        int g_blk = blk_base + col;
-        smem_scale[s] = A_scale[g_m][g_blk];
-    }
-}
-
-// ---------- Load B from global memory into registers ----------
-template <int N, int K_HALF, int NUM_BLOCKS,
-          int OUTER_N, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void load_b_global_to_reg(
-    const uint8_t B_data[][K_HALF],
-    const uint8_t* __restrict__ B_scale,
-    int outer_n, int k_half_base, int blk_base, int tid,
-    uint32_t* data_regs, uint8_t* scale_regs
-) {
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_CHUNKS = OUTER_N * OK_BLOCKS;
-    constexpr int SCALE_ELEMS = OUTER_N * OK_BLOCKS;
-
-    int di = 0;
-    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
-        int row = c / OK_BLOCKS;
-        int blk = c % OK_BLOCKS;
-        int g_n = outer_n + row;
-        int g_col = k_half_base + blk * 16;
-        *reinterpret_cast<uint128_vec*>(&data_regs[di * 4]) =
-            *reinterpret_cast<const uint128_vec*>(&B_data[g_n][g_col]);
-    }
-
-    int si = 0;
-    for (int s = tid; s < SCALE_ELEMS; s += BLOCK_SIZE, si++) {
-        int row = s / OK_BLOCKS;
-        int col = s % OK_BLOCKS;
-        int g_n = outer_n + row;
-        int g_blk = blk_base + col;
-        scale_regs[si] = B_scale[sh_scale_off<NUM_BLOCKS>(g_n, g_blk)];
-    }
-}
-
-// ---------- Store B from registers into LDS ----------
-template <int OUTER_N, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void store_b_reg_to_lds(
-    uint8_t smem_data[][OUTER_N * 16], uint8_t smem_scale[][OUTER_N],
-    int tid,
-    const uint32_t* data_regs, const uint8_t* scale_regs
-) {
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_CHUNKS = OUTER_N * OK_BLOCKS;
-    constexpr int SCALE_ELEMS = OUTER_N * OK_BLOCKS;
-
-    int di = 0;
-    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE, di++) {
-        int row = c / OK_BLOCKS;
-        int blk = c % OK_BLOCKS;
-        *reinterpret_cast<uint128_vec*>(&smem_data[blk][row * 16]) =
-            *reinterpret_cast<const uint128_vec*>(&data_regs[di * 4]);
-    }
-
-    int si = 0;
-    for (int s = tid; s < SCALE_ELEMS; s += BLOCK_SIZE, si++) {
-        int row = s / OK_BLOCKS;
-        int col = s % OK_BLOCKS;
-        smem_scale[col][row] = scale_regs[si];
-    }
-}
-
-// ---------- Wrapper for B ----------
-template <int N, int K_HALF, int NUM_BLOCKS,
-          int OUTER_N, int OUTER_K, int BLOCK_SIZE>
-__device__ __forceinline__ void load_b_to_lds(
-    const uint8_t B_data[][K_HALF],
-    const uint8_t* __restrict__ B_scale,
-    uint8_t smem_data[][OUTER_N * 16], uint8_t smem_scale[][OUTER_N],
-    int outer_n, int k_half_base, int blk_base, int tid
-) {
-    constexpr int OK_BLOCKS = OUTER_K / 32;
-    constexpr int DATA_CHUNKS = OUTER_N * OK_BLOCKS;
-
-    for (int c = tid; c < DATA_CHUNKS; c += BLOCK_SIZE) {
-        int row = c / OK_BLOCKS;
-        int blk = c % OK_BLOCKS;
-        int g_n = outer_n + row;
-        int g_col = k_half_base + blk * 16;
-        *reinterpret_cast<uint128_vec*>(&smem_data[blk][row * 16]) =
-            *reinterpret_cast<const uint128_vec*>(&B_data[g_n][g_col]);
-    }
-
-    for (int s = tid; s < OUTER_N * OK_BLOCKS; s += BLOCK_SIZE) {
-        int row = s / OK_BLOCKS;
-        int col = s % OK_BLOCKS;
-        int g_n = outer_n + row;
-        int g_blk = blk_base + col;
-        smem_scale[col][row] = B_scale[sh_scale_off<NUM_BLOCKS>(g_n, g_blk)];
-    }
-}
-
 // Store C from shared memory to workspace (float output for split-K)
-template <int M, int N, int OUTER_M, int OUTER_N, int BLOCK_SIZE, int K_SPLITS = 1>
+template <int M, int N, int OUTER_M, int OUTER_N, int WARPS_M, int WARPS_N, int K_SPLITS = 1>
 __device__ __forceinline__ void store_c_from_smem_f32(
     const float smem_c[][OUTER_N],
     float C[][N],
     int outer_m, int outer_n, int tid
 ) {
     constexpr int TOTAL = OUTER_M * OUTER_N;
+    constexpr int BLOCK_SIZE = WARPS_M * WARPS_N * WARP_SIZE;
     constexpr int PER_THREAD = (TOTAL + BLOCK_SIZE - 1) / BLOCK_SIZE;
     for (int i = 0; i < PER_THREAD; i++) {
         int idx = tid + i * BLOCK_SIZE;
@@ -1176,7 +1105,7 @@ template <int WARPS, int M, int N, int K, int NUM_BLOCKS,
           bool USE_C_SHARED = (WARP_TILES_M * WARP_TILES_N > 1),
           typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
 __global__ void
-__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
+__launch_bounds__(WARPS * WARP_SIZE, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
 mfma_fp4_gemm_tiled(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t A_data[][K_HALF],
@@ -1217,6 +1146,8 @@ mfma_fp4_gemm_tiled(
     __shared__ uint8_t smem_b_scale[BUFFERS][OK_BLOCKS][OUTER_N];
     extern __shared__ float smem_c_raw[];
     auto (*smem_c_data)[OUTER_N] = reinterpret_cast<float(*)[OUTER_N]>(smem_c_raw);
+    using QA = QuantAPerThread<K, OUTER_M, OUTER_K, WARPS_M, WARPS_N>;
+    using QB = LoadBPerThread<K, OUTER_N, OUTER_K, WARPS_M, WARPS_N>;
 
     typename Traits::acc_t reg_acc;
     if constexpr (!USE_C_SHARED) {
@@ -1226,35 +1157,32 @@ mfma_fp4_gemm_tiled(
             reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
     }
 
-    // Load the first tile
+    // Load first tile
     if constexpr (FUSE_A_QUANT) {
-        quantize_a_to_lds<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>(
-            A_bf16, smem_a_data[0], smem_a_scale[0], outer_m, tid);
+        QA::quantize_a_to_lds(A_bf16, smem_a_data[0], smem_a_scale[0], outer_m, tid);
     } else {
-        load_a_to_lds<M, K_HALF, NUM_BLOCKS, OUTER_M, OUTER_K, BLOCK_SIZE>(
+        QA::load_a_to_lds(
             A_data, A_scale,
             smem_a_data[0], reinterpret_cast<uint8_t*>(smem_a_scale[0]),
             outer_m, 0, 0, tid);
     }
 
-    load_b_to_lds<N, K_HALF, NUM_BLOCKS, OUTER_N, OUTER_K, BLOCK_SIZE>(
+    QB::load_b_to_lds(
         B_data, B_scale,
         smem_b_data[0], smem_b_scale[0],
         outer_n, 0, 0, tid);
 
     for (int ok = 0; ok < OUTER_K_ITERS - 1; ok++) {
         if constexpr (WARPS > 1) {
-            __syncthreads();
+            lds_barrier();
         }
 
         uint32_t a_data_regs[A_CHUNKS_PER_THREAD * 4];
         uint8_t  a_scale_regs[A_SCALE_PER_THREAD];
         uint32_t b_data_regs[B_DATA_PER_THREAD];
         uint8_t  b_scale_regs[B_SCALE_PER_THREAD];
-
-        using Q = QuantAPerThread<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>;
-        uint32_t data_regs[Q::DATA_REGS];
-        uint8_t  scale_regs[Q::SCALE_REGS];
+        typename QA::data_type data_regs;
+        typename QA::scale_type scale_regs;
 
         auto next_ok = ok + 1;
         const auto buf = ok % BUFFERS;
@@ -1263,16 +1191,15 @@ mfma_fp4_gemm_tiled(
         if constexpr (FUSE_A_QUANT) {
             // Quantize next A tile directly into next buffer
             // (only works cleanly with BUFFERS==2; for BUFFERS==1 need register staging)
-            quantize_a_to_reg<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>(
-                A_bf16, outer_m, tid, data_regs, scale_regs, next_ok * OUTER_K);
+            QA::quantize_a_to_reg(A_bf16, tid, outer_m, next_ok * OUTER_K, data_regs, scale_regs);
         } else {
-            load_a_global_to_reg<M, K_HALF, NUM_BLOCKS, OUTER_M, OUTER_K, BLOCK_SIZE>(
+            QA::load_a_global_to_reg(
                 A_data, A_scale,
                 outer_m, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
                 a_data_regs, a_scale_regs);
         }
 
-        load_b_global_to_reg<N, K_HALF, NUM_BLOCKS, OUTER_N, OUTER_K, BLOCK_SIZE>(
+        QB::load_b_global_to_reg(
             B_data, B_scale,
             outer_n, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
             b_data_regs, b_scale_regs);
@@ -1283,26 +1210,27 @@ mfma_fp4_gemm_tiled(
             warp_m, warp_n, lane, smem_c_data, reg_acc);
 
         if constexpr (BUFFERS == 1 && WARPS > 1) {
-            __syncthreads();
+            lds_barrier();
         }
 
+        // Store prefetched data to LDS
         if constexpr (FUSE_A_QUANT) {
-            store_quant_a_to_lds<OUTER_M, OUTER_K, BLOCK_SIZE>(
+            QA::store_quant_a_to_lds(
                 smem_a_data[next_buf], smem_a_scale[next_buf],
                 tid, data_regs, scale_regs);
         } else {
-            store_a_reg_to_lds<OUTER_M, OUTER_K, BLOCK_SIZE>(
+            QA::store_a_reg_to_lds(
                 smem_a_data[next_buf], reinterpret_cast<uint8_t*>(smem_a_scale[next_buf]),
                 tid, a_data_regs, a_scale_regs);
         }
 
-        store_b_reg_to_lds<OUTER_N, OUTER_K, BLOCK_SIZE>(
+        QB::store_b_reg_to_lds(
             smem_b_data[next_buf], smem_b_scale[next_buf],
             tid, b_data_regs, b_scale_regs);
     }
 
     if constexpr (WARPS > 1) {
-        __syncthreads();
+        lds_barrier();
     }
 
     constexpr auto buf = (OUTER_K_ITERS - 1) % BUFFERS;
@@ -1316,9 +1244,9 @@ mfma_fp4_gemm_tiled(
             outer_m + warp_m * IM, outer_n + warp_n * IN, lane);
     } else {
         if constexpr (WARPS > 1) {
-            __syncthreads();
+            lds_barrier();
         }
-        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE>(
+        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, WARPS_M, WARPS_N>(
             smem_c_data, C, outer_m, outer_n, tid);
     }
 }
@@ -1330,7 +1258,7 @@ mfma_fp4_gemm_tiled(
 template <int M, int N, int K, int NUM_BLOCKS,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1, int K_SPLITS = 1, int K_HALF = K / 2>
-__global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
+__global__ void __launch_bounds__(WARPS_M * WARPS_N * WARP_SIZE) mfma_fp4_gemm_splitk(
     const uint8_t A_data[][K_HALF],
     const uint8_t B_data[][K_HALF],
     const uint8_t A_scale[][NUM_BLOCKS],
@@ -1426,7 +1354,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 64) mfma_fp4_gemm_splitk(
 template <int M, int N, int K, int NUM_BLOCKS,
           int IM, int IN, int IK,
           int WARPS_M = 1, int WARPS_N = 1, int K_SPLITS = 1,
-          int BLOCK_SIZE = WARPS_M * WARPS_N * 64, int K_HALF = K / 2>
+          int BLOCK_SIZE = WARPS_M * WARPS_N * WARP_SIZE, int K_HALF = K / 2>
 __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][N],
@@ -1470,7 +1398,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
     {
         int a_row = tile_m + (lane % IM);
         int a_blk = ki_start * BPC + (lane / IM);
-        QuantBlock qb = quantize_fp4_block_bf16(&A_bf16[a_row * K + a_blk * 32]);
+        auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
         *reinterpret_cast<uint128_vec*>(&a_cur[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
         a_sc_cur = broadcast_scale(qb.e8m0);
     }
@@ -1484,7 +1412,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
         {
             int a_row = tile_m + (lane % IM);
             int a_blk = (ki + 1) * BPC + (lane / IM);
-            QuantBlock qb = quantize_fp4_block_bf16(&A_bf16[a_row * K + a_blk * 32]);
+            auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
             *reinterpret_cast<uint128_vec*>(&a_nxt[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
             a_sc_nxt = broadcast_scale(qb.e8m0);
         }
@@ -1544,7 +1472,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
 //   1         -> direct write to workspace slice (reduce variant)
 // =====================================================================
 
-template <int WARPS, int M, int N, int K,
+template <int WARPS_M, int WARPS_N, int M, int N, int K,
           int OUTER_M, int OUTER_N, int OUTER_K,
           int IM, int IN, int IK,
           int WARP_TILES_M, int WARP_TILES_N,
@@ -1559,16 +1487,13 @@ __device__ __forceinline__ void tiled_splitk_fused_compute(
     const uint8_t* __restrict__ B_scale,
     float C[][N]
 ) {
-    constexpr int WARPS_M = OUTER_M / (IM * WARP_TILES_M);
-    constexpr int WARPS_N = OUTER_N / (IN * WARP_TILES_N);
-    static_assert(WARPS == WARPS_M * WARPS_N);
-
     using Traits = MfmaTraits<IM, IN, IK>;
     constexpr int OK_BLOCKS = OUTER_K / 32;
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int TOTAL_OK_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
     constexpr int ITERS_PER_SPLIT = (TOTAL_OK_ITERS + K_SPLITS - 1) / K_SPLITS;
-    constexpr int BLOCK_SIZE = WARPS * 64;
+    constexpr int WARPS = WARPS_M * WARPS_N;
+    constexpr int BLOCK_SIZE = WARPS * WARP_SIZE;
 
     const int outer_m = __builtin_amdgcn_readfirstlane(blockIdx.x * OUTER_M);
     const int outer_n = __builtin_amdgcn_readfirstlane(blockIdx.y * OUTER_N);
@@ -1605,43 +1530,41 @@ __device__ __forceinline__ void tiled_splitk_fused_compute(
             reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
     }
 
-    using Q = QuantAPerThread<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>;
+    using QA = QuantAPerThread<K, OUTER_M, OUTER_K, WARPS_M, WARPS_N>;
+    using QB = LoadBPerThread<K, OUTER_N, OUTER_K, WARPS_M, WARPS_N>;
     constexpr int B_DATA_PER_THREAD = ((OUTER_N * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
     constexpr int B_SCALE_PER_THREAD = ((OUTER_N * OK_BLOCKS) + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
+    typename QA::data_type a_regs;
+    typename QA::scale_type a_sc_regs;
+
     // Load first tile: quantize A from BF16, load pre-quantized B
     {
-        uint32_t a_regs[Q::DATA_REGS];
-        uint8_t a_sc_regs[Q::SCALE_REGS];
-        quantize_a_to_reg<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>(
-            A_bf16, outer_m, tid, a_regs, a_sc_regs, ok_start * OUTER_K);
-        store_quant_a_to_lds<OUTER_M, OUTER_K, BLOCK_SIZE>(
+        QA::quantize_a_to_reg(A_bf16, tid, outer_m, ok_start * OUTER_K, a_regs, a_sc_regs);
+        QA::store_quant_a_to_lds(
             smem_a_data[0], smem_a_scale[0], tid, a_regs, a_sc_regs);
     }
 
-    load_b_to_lds<N, K_HALF, NUM_BLOCKS, OUTER_N, OUTER_K, BLOCK_SIZE>(
+    QB::load_b_to_lds(
         B_data, B_scale,
         smem_b_data[0], smem_b_scale[0],
         outer_n, ok_start * OK_HALF, ok_start * OK_BLOCKS, tid);
 
     // Main K loop with prefetching
     for (int iter = 0; iter < num_iters - 1; iter++) {
-        if constexpr (WARPS > 1) __syncthreads();
+        if constexpr (WARPS > 1) lds_barrier();
 
         int next_ok = ok_start + iter + 1;
         const int buf = iter % BUFFERS;
         const int next_buf = (iter + 1) % BUFFERS;
 
         // Prefetch next A: quantize from BF16 into registers
-        uint32_t a_regs[Q::DATA_REGS];
-        uint8_t a_sc_regs[Q::SCALE_REGS];
-        quantize_a_to_reg<M, K, OUTER_M, OUTER_K, BLOCK_SIZE>(
-            A_bf16, outer_m, tid, a_regs, a_sc_regs, next_ok * OUTER_K);
+        QA::quantize_a_to_reg(A_bf16, tid, outer_m, next_ok * OUTER_K, a_regs, a_sc_regs);
 
         // Prefetch next B into registers
         uint32_t b_data_regs[B_DATA_PER_THREAD * 4];
         uint8_t b_scale_regs[B_SCALE_PER_THREAD];
-        load_b_global_to_reg<N, K_HALF, NUM_BLOCKS, OUTER_N, OUTER_K, BLOCK_SIZE>(
+        QB::load_b_global_to_reg(
             B_data, B_scale,
             outer_n, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
             b_data_regs, b_scale_regs);
@@ -1652,20 +1575,20 @@ __device__ __forceinline__ void tiled_splitk_fused_compute(
             smem_b_data[buf], smem_b_scale[buf],
             warp_m, warp_n, lane, smem_c_data, reg_acc);
 
-        if constexpr (BUFFERS == 1 && WARPS > 1) __syncthreads();
+        if constexpr (BUFFERS == 1 && WARPS > 1) lds_barrier();
 
         // Store prefetched data to LDS
-        store_quant_a_to_lds<OUTER_M, OUTER_K, BLOCK_SIZE>(
+        QA::store_quant_a_to_lds(
             smem_a_data[next_buf], smem_a_scale[next_buf],
             tid, a_regs, a_sc_regs);
 
-        store_b_reg_to_lds<OUTER_N, OUTER_K, BLOCK_SIZE>(
+        QB::store_b_reg_to_lds(
             smem_b_data[next_buf], smem_b_scale[next_buf],
             tid, b_data_regs, b_scale_regs);
     }
 
     // Process last tile
-    if constexpr (WARPS > 1) __syncthreads();
+    if constexpr (WARPS > 1) lds_barrier();
 
     {
         const int last_buf = (num_iters - 1) % BUFFERS;
@@ -1680,13 +1603,13 @@ __device__ __forceinline__ void tiled_splitk_fused_compute(
         Traits::template store_f32<N, STORE_K_SPLITS>(C, reg_acc,
             outer_m + warp_m * IM, outer_n + warp_n * IN, lane);
     } else {
-        if constexpr (WARPS > 1) __syncthreads();
-        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE, STORE_K_SPLITS>(
+        if constexpr (WARPS > 1) lds_barrier();
+        store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, WARPS_M, WARPS_N, STORE_K_SPLITS>(
             smem_c_data, C, outer_m, outer_n, tid);
     }
 }
 
-template <int WARPS, int M, int N, int K,
+template <int WARPS_M, int WARPS_N, int M, int N, int K,
           int OUTER_M, int OUTER_N, int OUTER_K,
           int IM, int IN, int IK,
           int WARP_TILES_M = 1, int WARP_TILES_N = 1,
@@ -1696,28 +1619,28 @@ template <int WARPS, int M, int N, int K,
           bool USE_C_SHARED = (WARP_TILES_M * WARP_TILES_N > 1),
           typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
 __global__ void
-__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
+__launch_bounds__(WARPS_M * WARPS_N * WARP_SIZE, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
 mfma_fp4_gemm_tiled_splitk_fused(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][K_HALF],
     const uint8_t* __restrict__ B_scale,
     float C[][N]
 ) {
-    tiled_splitk_fused_compute<WARPS, M, N, K, OUTER_M, OUTER_N, OUTER_K,
+    tiled_splitk_fused_compute<WARPS_M, WARPS_N, M, N, K, OUTER_M, OUTER_N, OUTER_K,
                                IM, IN, IK, WARP_TILES_M, WARP_TILES_N,
                                K_SPLITS, BUFFERS, K_SPLITS>(
         A_bf16, B_data, B_scale, C);
 }
 
 // Reduce-based variant: writes to per-split workspace slices, no atomicAdd
-template <int WARPS, int M, int N, int K,
+template <int WARPS_M, int WARPS_N, int M, int N, int K,
           int OUTER_M, int OUTER_N, int OUTER_K,
           int IM, int IN, int IK,
           int WARP_TILES_M, int WARP_TILES_N,
           int K_SPLITS = 1, int BUFFERS = 1, int OCCUPANCY = -1,
           bool USE_C_SHARED = (WARP_TILES_M * WARP_TILES_N > 1),
           typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
-__global__ void __launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
+__global__ void __launch_bounds__(WARPS_M * WARPS_N * WARP_SIZE, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
 mfma_fp4_gemm_tiled_splitk_fused_reduce(
     const hip_bfloat16 A_bf16[][K],
     const uint8_t B_data[][K / 2],
@@ -1725,7 +1648,7 @@ mfma_fp4_gemm_tiled_splitk_fused_reduce(
     float workspace[][M][N]
 ) {
     const int split_id = __builtin_amdgcn_readfirstlane(blockIdx.z);
-    tiled_splitk_fused_compute<WARPS, M, N, K, OUTER_M, OUTER_N, OUTER_K,
+    tiled_splitk_fused_compute<WARPS_M, WARPS_N, M, N, K, OUTER_M, OUTER_N, OUTER_K,
                                IM, IN, IK, WARP_TILES_M, WARP_TILES_N,
                                K_SPLITS, BUFFERS, 1>(
         A_bf16, B_data, B_scale, workspace[split_id]);
@@ -1742,7 +1665,7 @@ template <int WARPS, int M, int N, int K,
           bool USE_C_SHARED = true,
           typename Lds = LdsLayout<OUTER_M, OUTER_N, OUTER_K, USE_C_SHARED>>
 __global__ void
-__launch_bounds__(WARPS * 64, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
+__launch_bounds__(WARPS * WARP_SIZE, OCCUPANCY == -1 ? Lds::OCCUPANCY / BUFFERS : OCCUPANCY)
 mfma_fp4_gemm_tiled_splitk_coop(
     const hip_bfloat16 A_bf16[][K],
     uint8_t A_data[][K_HALF],
@@ -1761,7 +1684,7 @@ mfma_fp4_gemm_tiled_splitk_coop(
     constexpr int OK_HALF = OUTER_K / 2;
     constexpr int TOTAL_OK_ITERS = (NUM_BLOCKS + OK_BLOCKS - 1) / OK_BLOCKS;
     constexpr int ITERS_PER_SPLIT = (TOTAL_OK_ITERS + K_SPLITS - 1) / K_SPLITS;
-    constexpr int BLOCK_SIZE = WARPS * 64;
+    constexpr int BLOCK_SIZE = WARPS * WARP_SIZE;
     constexpr int TOTAL_QUANT = M * NUM_BLOCKS;
     constexpr int BLKS_PER_SPLIT = ITERS_PER_SPLIT * OK_BLOCKS;
     constexpr int CHUNKS_PER_SPLIT = M * BLKS_PER_SPLIT;
@@ -1809,7 +1732,7 @@ mfma_fp4_gemm_tiled_splitk_coop(
         } else {
             __shared__ int s_bs;
             if (tid == 0) s_bs = batch_start;
-            __syncthreads();
+            lds_barrier();
             batch_start = s_bs;
         }
 
@@ -1821,7 +1744,7 @@ mfma_fp4_gemm_tiled_splitk_coop(
             int blk = my_chunk / M;
             int row = my_chunk % M;
 
-            QuantBlock qb = quantize_fp4_block_bf16(&A_bf16[row * K + blk * 32]);
+            auto qb = quantize_block_parallel<K, 32>(A_bf16, row, blk);
 
             int data_off = row * K_HALF + blk * 16;
             *reinterpret_cast<uint128_vec*>(&A_data[data_off]) =
@@ -1863,20 +1786,23 @@ mfma_fp4_gemm_tiled_splitk_coop(
     for (int i = tid; i < Lds::C_DATA_FLOATS; i += BLOCK_SIZE)
         reinterpret_cast<float*>(smem_c_data)[i] = 0.0f;
 
+    using QA = QuantAPerThread<K, OUTER_M, OUTER_K, WARPS_M, WARPS_N>;
+    using QB = LoadBPerThread<K, OUTER_N, OUTER_K, WARPS_M, WARPS_N>;
+
     // Load first tile from pre-quantized global memory
-    load_a_to_lds<M, K_HALF, NUM_BLOCKS, OUTER_M, OUTER_K, BLOCK_SIZE>(
+    QA::load_a_to_lds(
         A_data, A_scale,
         smem_a_data[0], reinterpret_cast<uint8_t*>(smem_a_scale[0]),
         outer_m, ok_start * OK_HALF, ok_start * OK_BLOCKS, tid);
 
-    load_b_to_lds<N, K_HALF, NUM_BLOCKS, OUTER_N, OUTER_K, BLOCK_SIZE>(
+    QB::load_b_to_lds(
         B_data, B_scale,
         smem_b_data[0], smem_b_scale[0],
         outer_n, ok_start * OK_HALF, ok_start * OK_BLOCKS, tid);
 
     // Main K loop with prefetching
     for (int iter = 0; iter < num_iters - 1; iter++) {
-        if constexpr (WARPS > 1) __syncthreads();
+        if constexpr (WARPS > 1) lds_barrier();
 
         int next_ok = ok_start + iter + 1;
         const int buf = iter % BUFFERS;
@@ -1885,15 +1811,15 @@ mfma_fp4_gemm_tiled_splitk_coop(
         // Prefetch next A from global (already quantized)
         uint32_t a_data_regs[A_CHUNKS_PER_THREAD * 4];
         uint8_t a_scale_regs[A_SCALE_PER_THREAD];
-        load_a_global_to_reg<M, K_HALF, NUM_BLOCKS, OUTER_M, OUTER_K, BLOCK_SIZE>(
+        QA::load_a_global_to_reg(
             A_data, A_scale,
             outer_m, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
             a_data_regs, a_scale_regs);
 
         // Prefetch next B
-        uint32_t b_data_regs[B_DATA_PER_THREAD * 4];
+        uint32_t b_data_regs[B_DATA_PER_THREAD];
         uint8_t b_scale_regs[B_SCALE_PER_THREAD];
-        load_b_global_to_reg<N, K_HALF, NUM_BLOCKS, OUTER_N, OUTER_K, BLOCK_SIZE>(
+        QB::load_b_global_to_reg(
             B_data, B_scale,
             outer_n, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
             b_data_regs, b_scale_regs);
@@ -1904,19 +1830,19 @@ mfma_fp4_gemm_tiled_splitk_coop(
             smem_b_data[buf], smem_b_scale[buf],
             warp_m, warp_n, lane, smem_c_data);
 
-        if constexpr (BUFFERS == 1 && WARPS > 1) __syncthreads();
+        if constexpr (BUFFERS == 1 && WARPS > 1) lds_barrier();
 
-        store_a_reg_to_lds<OUTER_M, OUTER_K, BLOCK_SIZE>(
+        QA::store_a_reg_to_lds(
             smem_a_data[next_buf], reinterpret_cast<uint8_t*>(smem_a_scale[next_buf]),
             tid, a_data_regs, a_scale_regs);
 
-        store_b_reg_to_lds<OUTER_N, OUTER_K, BLOCK_SIZE>(
+        QB::store_b_reg_to_lds(
             smem_b_data[next_buf], smem_b_scale[next_buf],
             tid, b_data_regs, b_scale_regs);
     }
 
     // Last tile
-    if constexpr (WARPS > 1) __syncthreads();
+    if constexpr (WARPS > 1) lds_barrier();
     {
         const int last_buf = (num_iters - 1) % BUFFERS;
         inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
@@ -1926,10 +1852,10 @@ mfma_fp4_gemm_tiled_splitk_coop(
     }
 
     if constexpr (WARPS > 1) {
-        __syncthreads();
+        lds_barrier();
     }
 
-    store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, BLOCK_SIZE, K_SPLITS>(
+    store_c_from_smem_f32<M, N, OUTER_M, OUTER_N, WARPS_M, WARPS_N, K_SPLITS>(
         smem_c_data, C, outer_m, outer_n, tid);
 
     if constexpr (PROFILE_PHASES) {
@@ -1995,7 +1921,7 @@ void launch_simple(torch::Tensor A_bf16,
     // Launch warp-parallel quant kernel
     constexpr int QUANT_VPT = 2;  // values per thread
     constexpr int q_total = M * NUM_BLOCKS;
-    constexpr int q_block = 64;
+    constexpr int q_block = WARP_SIZE;
     constexpr int q_threads_per_group = 32 / QUANT_VPT;
     constexpr int q_groups_per_block = q_block / q_threads_per_group;
     constexpr int q_grid = (q_total + q_groups_per_block - 1) / q_groups_per_block;
@@ -2011,7 +1937,7 @@ void launch_simple(torch::Tensor A_bf16,
     constexpr int BLOCK_N = IN * WARPS_N;
     dim3 grid((M + BLOCK_M - 1) / BLOCK_M,
               (N + BLOCK_N - 1) / BLOCK_N);
-    dim3 block(64 * WARPS_M * WARPS_N);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
     mfma_fp4_gemm_simple<M,N,K,NUM_BLOCKS,IM,IN,IK,WARPS_M,WARPS_N>
         <<<grid, block>>>(
         reinterpret_cast<const uint8_t(*)[K_HALF]>(A_data_buf.data_ptr()),
@@ -2065,7 +1991,7 @@ void launch_simple_fused(torch::Tensor A_bf16,
     constexpr int BLOCK_N = IN * WARPS_N;
     dim3 grid((M + BLOCK_M - 1) / BLOCK_M,
               (N + BLOCK_N - 1) / BLOCK_N);
-    dim3 block(64 * WARPS_M * WARPS_N);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
     mfma_fp4_gemm_simple_fused<M,N,K,NUM_BLOCKS,IM,IN,IK,WARPS_M,WARPS_N>
         <<<grid, block>>>(
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
@@ -2127,9 +2053,9 @@ void launch_coop_simple(torch::Tensor A_bf16,
     constexpr int BLOCK_N = IN * WARPS_N;
     dim3 grid((M + BLOCK_M - 1) / BLOCK_M,
               (N + BLOCK_N - 1) / BLOCK_N);
-    dim3 block(64 * WARPS_M * WARPS_N);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
 
-    auto A_bf16_ptr = reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr());
+    auto A_bf16_ptr = reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr());
     auto A_data_ptr = reinterpret_cast<uint8_t(*)[K_HALF]>(A_data_buf.data_ptr());
     auto A_scale_ptr = reinterpret_cast<uint8_t*>(A_scale_buf.data_ptr());
     auto B_data_ptr = reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr());
@@ -2193,7 +2119,7 @@ void launch_tiled(torch::Tensor A_bf16,
     // Launch warp-parallel quant kernel
     constexpr int QUANT_VPT = 2;  // values per thread
     constexpr int q_total = M * NUM_BLOCKS;
-    constexpr int q_block = 64;
+    constexpr int q_block = WARP_SIZE;
     constexpr int q_threads_per_group = 32 / QUANT_VPT;
     constexpr int q_groups_per_block = q_block / q_threads_per_group;
     constexpr int q_grid = (q_total + q_groups_per_block - 1) / q_groups_per_block;
@@ -2205,10 +2131,12 @@ void launch_tiled(torch::Tensor A_bf16,
 
     if (do_profile) (void)hipEventRecord(e1);
 
-    constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+    constexpr int WARPS_M = OM / (IM * WTM);
+    constexpr int WARPS_N = ON / (IN * WTN);
+    constexpr int WARPS = WARPS_M * WARPS_N;
     constexpr size_t smem_c_bytes = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
-    dim3 block(WARPS * 64);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
     mfma_fp4_gemm_tiled<WARPS,M,N,K,NUM_BLOCKS,OM,ON,OK,IM,IN,IK,WTM,WTN,false,BUFFERS,OCCUPANCY>
         <<<grid, block, smem_c_bytes>>>(
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()), // unused
@@ -2244,10 +2172,12 @@ template <int M, int N, int K,
           int NUM_BLOCKS = K / 32>
 void launch_tiled_fused(torch::Tensor A_bf16, torch::Tensor B,
                         torch::Tensor Bs, torch::Tensor C) {
-    constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+    constexpr int WARPS_M = OM / (IM * WTM);
+    constexpr int WARPS_N = ON / (IN * WTN);
+    constexpr int WARPS = WARPS_M * WARPS_N;
     constexpr size_t smem_c_size = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON);
-    dim3 block(WARPS * 64);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
     mfma_fp4_gemm_tiled<WARPS,M,N,K,NUM_BLOCKS,OM,ON,OK,IM,IN,IK,WTM,WTN,true,BUFFERS,OCCUPANCY>
         <<<grid, block, smem_c_size>>>(
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
@@ -2294,7 +2224,7 @@ void launch_splitk(torch::Tensor A_bf16,
     // Launch warp-parallel quant kernel
     constexpr int QUANT_VPT = 2;  // values per thread
     constexpr int q_total = M * NUM_BLOCKS;
-    constexpr int q_block = 64;
+    constexpr int q_block = WARP_SIZE;
     constexpr int q_threads_per_group = 32 / QUANT_VPT;
     constexpr int q_groups_per_block = q_block / q_threads_per_group;
     constexpr int q_grid = (q_total + q_groups_per_block - 1) / q_groups_per_block;
@@ -2310,7 +2240,7 @@ void launch_splitk(torch::Tensor A_bf16,
     dim3 grid((M + IM * WARPS_M - 1) / (IM * WARPS_M),
               (N + IN * WARPS_N - 1) / (IN * WARPS_N),
               K_SPLITS);
-    dim3 block(64 * WARPS_M * WARPS_N);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
     mfma_fp4_gemm_splitk<M,N,K,NUM_BLOCKS,IM,IN,IK,WARPS_M,WARPS_N,K_SPLITS>
         <<<grid, block>>>(
         reinterpret_cast<const uint8_t(*)[K_HALF]>(A_data_buf.data_ptr()),
@@ -2370,7 +2300,7 @@ void launch_splitk_fused(torch::Tensor A_bf16,
     dim3 grid((M + IM * WARPS_M - 1) / (IM * WARPS_M),
               (N + IN * WARPS_N - 1) / (IN * WARPS_N),
               K_SPLITS);
-    dim3 block(64 * WARPS_M * WARPS_N);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
     mfma_fp4_gemm_splitk_fused<M,N,K,NUM_BLOCKS,IM,IN,IK,WARPS_M,WARPS_N,K_SPLITS>
         <<<grid, block>>>(
         reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr()),
@@ -2404,7 +2334,8 @@ template <int M, int N, int K,
 void launch_tiled_splitk_fused(torch::Tensor A_bf16,
                                 torch::Tensor B_data, torch::Tensor B_scale,
                                 torch::Tensor C, bool profile) {
-    constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+    constexpr int WARPS_M = OM / (IM * WTM);
+    constexpr int WARPS_N = ON / (IN * WTN);
 
     static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
     auto& stats = perf_map[M][N][K];
@@ -2422,9 +2353,9 @@ void launch_tiled_splitk_fused(torch::Tensor A_bf16,
     }
 
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON, K_SPLITS);
-    dim3 block(WARPS * 64);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
     constexpr size_t smem_c_size = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
-    mfma_fp4_gemm_tiled_splitk_fused<WARPS,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>
+    mfma_fp4_gemm_tiled_splitk_fused<WARPS_M, WARPS_N,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>
         <<<grid, block, smem_c_size>>>(
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
@@ -2468,7 +2399,8 @@ void launch_tiled_splitk_fused_reduce(torch::Tensor A_bf16,
         local_gen = g_generation;
     }
 
-    constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+    constexpr int WARPS_M = OM / (IM * WTM);
+    constexpr int WARPS_N = ON / (IN * WTN);
 
     static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
     auto& stats = perf_map[M][N][K];
@@ -2482,9 +2414,9 @@ void launch_tiled_splitk_fused_reduce(torch::Tensor A_bf16,
     }
 
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON, K_SPLITS);
-    dim3 block(WARPS * 64);
+    dim3 block(64 * WARPS_M * WARPS_N);
     constexpr size_t smem_c_size = (WTM * WTN > 1) ? OM * ON * sizeof(float) : 0;
-    mfma_fp4_gemm_tiled_splitk_fused_reduce<WARPS,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>
+    mfma_fp4_gemm_tiled_splitk_fused_reduce<WARPS_M,WARPS_N,M,N,K,OM,ON,OK,IM,IN,IK,WTM,WTN,K_SPLITS,BUFFERS,OCCUPANCY>
         <<<grid, block, smem_c_size>>>(
         reinterpret_cast<const hip_bfloat16(*)[K]>(A_bf16.data_ptr()),
         reinterpret_cast<const uint8_t(*)[K_HALF]>(B_data.data_ptr()),
@@ -2547,7 +2479,9 @@ void launch_tiled_splitk_coop(torch::Tensor A_bf16,
     quant_ctr_buf.zero_();
     split_ready_buf.zero_();
 
-    constexpr int WARPS = (OM/(IM*WTM)) * (ON/(IN*WTN));
+    constexpr int WARPS_M = OM / (IM * WTM);
+    constexpr int WARPS_N = ON / (IN * WTN);
+    constexpr int WARPS = WARPS_M * WARPS_N;
 
     static std::unordered_map<int, std::unordered_map<int, std::unordered_map<int, PerfStats>>> perf_map;
     auto& stats = perf_map[M][N][K];
@@ -2567,7 +2501,7 @@ void launch_tiled_splitk_coop(torch::Tensor A_bf16,
     int* quant_counter = reinterpret_cast<int*>(quant_ctr_buf.data_ptr());
 
     dim3 grid((M+OM-1)/OM, (N+ON-1)/ON, K_SPLITS);
-    dim3 block(WARPS * 64);
+    dim3 block(WARP_SIZE * WARPS_M * WARPS_N);
 
     // Use cooperative kernel launch for grid-wide sync
     auto A_bf16_ptr = reinterpret_cast<const hip_bfloat16*>(A_bf16.data_ptr());
@@ -2655,7 +2589,7 @@ void mfma_gemm(
     //SF16(32, 4096, 512, 1, 1) //--> 8.88 BEST
     //ITER2: SF32(32, 4096, 512, 1, 1) --> 14.5
     //ITER3: T(32, 4096, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.0
-    SF16(32, 4096, 512, 1, 1) //--> 8.29 BEST
+    SF16(32, 4096, 512, 1, 1) //RUN4: revert (RUN3: WTM=2 --> 9.20, same)
     //RE-TUNE3: SF16(32, 4096, 512, 1, 2) --> 8.39
     //RE-TUNE2: SF32(32, 4096, 512, 1, 1) --> 13.6
     //ITER6: SF16(32, 4096, 512, 2, 1) --> 8.74
@@ -2666,7 +2600,7 @@ void mfma_gemm(
     //S32(32, 2880, 512, 1, 1) //--> 11.9
     //ITER1: T(32, 2880, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.1
     //SF16(32, 2880, 512, 1, 1) //--> 8.74 NEW BEST
-    SF16(32, 2880, 512, 1, 1) //--> 8.18 BEST
+    SF16(32, 2880, 512, 1, 1) //RUN4: revert (RUN3: WTM=2 --> 9.11, same)
     //RE-TUNE3: SF16(32, 2880, 512, 1, 2) --> 8.34
     //RE-TUNE2: SF32(32, 2880, 512, 1, 1) --> 13.5
     //ITER5: SF16(32, 2880, 512, 2, 1) --> 8.55
@@ -2715,7 +2649,15 @@ void mfma_gemm(
     //ITER13: F2(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1, 1) --> 24.2
     //ITER14: TSK(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 4, 1, -1) --> 21.5
     //RE-TUNE1: S32(256, 3072, 1536, 1, 1) --> 19.2
-    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //--> 16.3 BEST
+    //R1a: T(256, 3072, 1536, 128, 128, 128, 32, 32, 64, 1, 1, 2) --> INCORRECT
+    //R1b: T(256, 3072, 1536, 64, 64, 256, 32, 32, 64, 1, 1, 2) --> 26.9
+    //R1c: T(256, 3072, 1536, 128, 64, 128, 32, 32, 64, 2, 1, 2) --> 32.4
+    //R1d: T(256, 3072, 1536, 64, 128, 128, 32, 32, 64, 1, 2, 2) --> 35.3
+    //R1e: T(256, 3072, 1536, 64, 64, 128, 16, 16, 128, 1, 1, 2) --> INCORRECT
+    //RUN1-was: T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //--> 16.3 BEST
+    //RUN1: TSKR(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 2, 1, -1) --> 22.3 (worse)
+    //RUN2: T(256, 3072, 1536, 32, 64, 128, 32, 32, 64, 1, 1, 1) --> 33.2 (terrible)
+    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //RUN3: revert to best
     //RE-TUNE3: TSK(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1, 1, -1) --> 23.6
     //RE-TUNE2: T(256, 3072, 1536, 64, 64, 256, 32, 32, 64, 1, 1, 1) --> 34.4
 
@@ -2760,7 +2702,16 @@ void mfma_gemm(
     //RE-TUNE2: TSK(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 4, 1, -1) --> 22.7
     //TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 4, 1, -1) //--> 22.7 BEST
     //RE-TUNE3: TSK(64, 7168, 2048, 64, 64, 128, 16, 16, 128, 2, 2, 4, 1, -1) --> 22.6
-    T(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 2)
+    //R2a: T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 2) --> 19.7 NEW BEST
+    //R2b: T(64, 7168, 2048, 32, 128, 128, 16, 16, 128, 1, 4, 2) --> 40.2
+    //R2e: T(64, 7168, 2048, 32, 64, 128, 32, 32, 64, 1, 2, 2) --> 58.1
+    //RUN1-was: T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 2) //R2a BEST 19.7
+    //RUN1: T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 1) --> 18.1 NEW BEST (single buf!)
+    //RUN2: TSKR(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 2, 1, -1) --> 22.3 (worse)
+    //RUN3: T(64, 7168, 2048, 64, 64, 64, 32, 32, 64, 1, 1, 1) --> INCORRECT (OK=64 broken)
+    //RUN5: T(64, 7168, 2048, 64, 64, 256, 32, 32, 64, 1, 1, 1) --> 37.4 (terrible, too much LDS)
+    //RUN6: T(64, 7168, 2048, 64, 32, 128, 32, 32, 64, 1, 1, 1) --> 31.7 (ON=32 bad, no B reuse)
+    T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 1) //FINAL: best config (18.1µs avg)
     //ITER10: try TSK(32,64,128, 1,2, 3, 2, -1) split-K=3
     //TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 3, 2, -1) //ITER10 TBD
     //T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 2, 1, 1) --> 70.0
@@ -2780,7 +2731,13 @@ void mfma_gemm(
     //SPLITK-SWEEP: k=4 --> 17.3, k=2 --> 71.6, k=21 --> INCORRECT (not divisor of 28)
     //TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) //--> 14.9 NEW BEST
     //TSKR-SWEEP: k=14 --> 18.9
-    TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, 1) //--> 14.9 BEST
+    //RUN1-was: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 14, 1, 1) //R3a: K_SPLITS=14
+    //RUN1: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) --> 13.9 NEW BEST
+    //RUN2: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 2, -1) --> 13.8 (~same)
+    //RUN3: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) --> 14.0 (confirmed)
+    //RUN4: TSKF doesn't exist as macro --> COMPILE FAIL
+    TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) //RUN5: revert to best
+    //TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, 1) //--> 14.9 BEST
     //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, -1) --> 16.0
     //ITER9: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 56, 1, -1) --> INCORRECT
     //TSK(16, 2112, 7168, 16, 64, 128, 16, 16, 128, 1, 1, 28, 2, -1) --> 16.3
