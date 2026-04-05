@@ -1,12 +1,8 @@
 """
 MLA (Multi-head Latent Attention) decode kernel - optimized implementation.
 
-Implements multiple optimization strategies:
-1. FP8 Q + FP8 KV using aiter's a8w8 persistent MLA kernel (baseline)
-2. MXFP4 KV with dequantization + aiter MLA kernel (2x bandwidth savings)
-3. MXFP4 Q + MXFP4 KV using gemm_a4w4 for QK^T (4x bandwidth savings)
-4. Dynamic num_kv_splits tuning based on workload
-5. Custom HIP kernel for fused MXFP4 attention (JIT compiled)
+Custom HIP kernel for fused MXFP4 attention (JIT compiled on gfx950).
+MXFP4 Q + MXFP4 KV using MFMA FP4 intrinsics for QK^T (4x bandwidth savings).
 
 DeepSeek R1 forward_absorb MLA config:
   total_num_heads  = 128    (query heads before TP split)
@@ -25,9 +21,6 @@ KV buffer format (forward_absorb):
 
 import torch
 from task import input_t, output_t
-from aiter.mla import mla_decode_fwd
-from aiter import QuantType, dtypes as aiter_dtypes
-from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
 
 # ---------------------------------------------------------------------------
 # Embedded HIP Kernel for MXFP4 MLA Decode (using hip-python)
@@ -275,8 +268,6 @@ __device__ __forceinline__ void mla_parallel_softmax(
             float w = __expf(scores[sm_h][ki] - nm);
             scores[sm_h][ki] = w;
             local_sum += w;
-        } else if (ki < KV_SUBTILE) {
-            scores[sm_h][ki] = 0.0f;
         }
     }
     // Warp-level sum reduction
@@ -462,31 +453,6 @@ __device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
     *reinterpret_cast<uint128_vec*>(&result.data) = *reinterpret_cast<uint128_vec*>(&pack);
     result.e8m0 = sc.e8m0;
     return result;
-}
-
-template <int M, int K, int K_HALF, int NUM_BLOCKS, int BATCH_SIZE, int BLOCK_SIZE>
-__global__ __launch_bounds__(BLOCK_SIZE)
-void mla_quant_q_batched_kernel(
-    const hip_bfloat16 Q[][K],
-    uint8_t out_data[][NUM_BLOCKS * 16],
-    uint8_t* __restrict__ out_scale
-) {
-    constexpr int A_K_HALF = NUM_BLOCKS * 16;
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int per_batch = M * NUM_BLOCKS;
-    int batch_idx = gid / per_batch;
-    int local_id = gid % per_batch;
-    if (batch_idx >= BATCH_SIZE) return;
-
-    int row = local_id / NUM_BLOCKS;
-    int blk = local_id % NUM_BLOCKS;
-    if (row >= M) return;
-
-    QuantBlock qb = quantize_fp4_block_bf16(&Q[batch_idx * M + row][blk * 32]);
-
-    *reinterpret_cast<uint128_vec*>(&out_data[batch_idx * M + row][blk * 16]) =
-        *reinterpret_cast<uint128_vec*>(&qb.data);
-    out_scale[batch_idx * NUM_BLOCKS * M + row + blk * M] = qb.e8m0;
 }
 
 // =====================================================================
@@ -690,8 +656,7 @@ __device__ __forceinline__ void mla_mfma_attn_v(
 
 template <int N, int BLOCK_SIZE, int B_SCALE_STRIDE, int KV_SPLITS,
           int K_HALF, int NUM_BLOCKS, int A_K_HALF,
-          int KV_SUBTILE, bool USE_32x32 = false, bool PROFILE_PHASES = false,
-          bool DOUBLE_BUFFER = false>
+          int KV_SUBTILE, bool USE_32x32 = false, bool PROFILE_PHASES = false>
 __global__ __launch_bounds__(BLOCK_SIZE)
 void mla_fused_attn_kernel(
     const hip_bfloat16* __restrict__ Q_bf16,
@@ -986,7 +951,7 @@ constexpr int getLen() {
     return 1536;
 }
 
-template <int BATCH_SIZE, int N, int STRIDE, int BS, int KV_SPLITS, int KV_SUBTILE, bool USE_32x32, bool DOUBLE_BUFFER = false>
+template <int BATCH_SIZE, int N, int STRIDE, int BS, int KV_SPLITS, int KV_SUBTILE, bool USE_32x32>
 torch::Tensor mla_fused_pipeline_impl(
     torch::Tensor Q_bf16,
     torch::Tensor KV_data,
@@ -1040,7 +1005,7 @@ torch::Tensor mla_fused_pipeline_impl(
         dim3 grid(BATCH_SIZE, KV_SPLITS);
         dim3 block(BS);
         constexpr bool KERNEL_TIMER = false;
-        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, KV_SUBTILE, USE_32x32, KERNEL_TIMER, DOUBLE_BUFFER>
+        mla_fused_attn_kernel<N, BS, STRIDE, KV_SPLITS, K_HALF, NUM_BLOCKS, A_K_HALF, KV_SUBTILE, USE_32x32, KERNEL_TIMER>
             <<<grid, block>>>(
             reinterpret_cast<const hip_bfloat16*>(Q_bf16.data_ptr()),
             reinterpret_cast<const uint8_t(*)[K_HALF]>(KV_data.data_ptr()),
@@ -1101,11 +1066,11 @@ torch::Tensor mla_mxfp4_pipeline(
     assert(B_SCALE_STRIDE == 18 || B_SCALE_STRIDE == 24);
     assert(kv_seq_len == 1024 || kv_seq_len == 8192);
 
-#define MLA_FUSED(BS_VAL, N, STR, BLOCK, KV_SUBTILE, USE32, ...) \
+#define MLA_FUSED(BS_VAL, N, STR, BLOCK, KV_SUBTILE, USE32) \
     if (batch_size == BS_VAL && kv_seq_len == N && B_SCALE_STRIDE == STR) { \
         constexpr int EFFECTIVE_LEN = getLen<BS_VAL, N>(); \
         constexpr int KV_SPLITS = get_fused_kv_split<BS_VAL, N>(); \
-        return mla_fused_pipeline_impl<BS_VAL, EFFECTIVE_LEN, STR, BLOCK, KV_SPLITS, KV_SUBTILE, USE32, ##__VA_ARGS__>(Q_bf16, KV_data, KV_scale, sm_scale, profile); \
+        return mla_fused_pipeline_impl<BS_VAL, EFFECTIVE_LEN, STR, BLOCK, KV_SPLITS, KV_SUBTILE, USE32>(Q_bf16, KV_data, KV_scale, sm_scale, profile); \
     }
 
     // Tuned dispatch: MLA_FUSED(batch_size, kv_len, stride, block_size, kv_subtile, use_32x32, double_buffer)
@@ -1147,20 +1112,20 @@ torch::Tensor mla_mxfp4_pipeline(
     //
     // === CURRENT WINNERS (Trial 4) ===
     // bs=4, kv=1024: DB=true, BS=256, KV=64 → 35.9µs (Trial 1)
-    MLA_FUSED(4, 1024, 18, 256, 64, false, true);
-    MLA_FUSED(4, 1024, 24, 256, 64, false, true);
+    MLA_FUSED(4, 1024, 18, 256, 64, false);
+    MLA_FUSED(4, 1024, 24, 256, 64, false);
     // bs=4, kv=8192: no-DB, BS=512, KV=128 → 39.4µs (Trial 1)
     MLA_FUSED(4, 8192, 18, 512, 32, false);
     MLA_FUSED(4, 8192, 24, 512, 32, false);
-    // bs=32, kv=1024: DB=true requested but EFFECTIVE_DB=false (NUM_SUBTILES=1), BS=512, KV=128
-    MLA_FUSED(32, 1024, 18, 512, 128, false, true);
-    MLA_FUSED(32, 1024, 24, 512, 128, false, true);
+    // bs=32, kv=1024: BS=512, KV=128
+    MLA_FUSED(32, 1024, 18, 512, 128, false);
+    MLA_FUSED(32, 1024, 24, 512, 128, false);
     // bs=32, kv=8192: no-DB, BS=256, KV=128 → 189µs (both trials same)
     MLA_FUSED(32, 8192, 18, 256, 48, false);
     MLA_FUSED(32, 8192, 24, 256, 48, false);
-    // bs=64, kv=1024: DB=true, BS=256, KV=128 → 60.2µs (Trial 1)
-    MLA_FUSED(64, 1024, 18, 256, 128, false, true);
-    MLA_FUSED(64, 1024, 24, 256, 128, false, true);
+    // bs=64, kv=1024: BS=256, KV=128 → 60.2µs (Trial 1)
+    MLA_FUSED(64, 1024, 18, 256, 128, false);
+    MLA_FUSED(64, 1024, 24, 256, 128, false);
     // bs=64, kv=8192: no-DB, BS=128, KV=128 → 306µs (Trial 1 best)
     MLA_FUSED(64, 8192, 18, 256, 48, false);
     MLA_FUSED(64, 8192, 24, 256, 48, false);
@@ -1245,317 +1210,18 @@ def _try_compile_hip_kernel():
         return True
     return False
 
-KV_LORA_RANK = 512
-QK_ROPE_HEAD_DIM = 64
-QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
-SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
-
-PAGE_SIZE = 1
-
-FP8_DTYPE = aiter_dtypes.fp8
-# ---------------------------------------------------------------------------
-# Dynamic num_kv_splits tuning
-# ---------------------------------------------------------------------------
-
-def get_optimal_num_kv_splits(batch_size: int, kv_seq_len: int) -> int:
-    """
-    Heuristic for optimal num_kv_splits based on batch size and KV sequence length.
-
-    Trade-offs:
-    - More splits = better parallelism for long sequences
-    - Fewer splits = less reduction overhead for short sequences / small batches
-
-    Performance observations:
-    - batch_size=4: bf16 is fastest (81-90us), minimize splits aggressively
-    - For small batches, minimize splits to reduce reduction overhead
-    """
-    if batch_size <= 4:
-        # Very small batches: minimize reduction overhead aggressively
-        # Target: get bf16 from 86.9us to 81us
-        if kv_seq_len <= 1024:
-            return 2  # Minimal splits - reduction overhead dominates
-        elif kv_seq_len <= 2048:
-            return 4
-        elif kv_seq_len <= 4096:
-            return 4
-        else:
-            return 8  # More parallelism for very long sequences
-    elif batch_size <= 16:
-        if kv_seq_len <= 1024:
-            return 8
-        elif kv_seq_len <= 4096:
-            return 16
-        else:
-            return 24
-    elif batch_size <= 32:
-        if kv_seq_len <= 1024:
-            return 16
-        else:
-            return 24
-    elif batch_size <= 64:
-        if kv_seq_len <= 1024:
-            return 24
-        else:
-            return 32
-    else:
-        # Large batches benefit from more parallelism
-        if kv_seq_len <= 2048:
-            return 32
-        else:
-            return 48
-
-
-# ---------------------------------------------------------------------------
-# FP8 quantization helper (per-tensor, sglang style)
-# ---------------------------------------------------------------------------
-
-def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dynamic per-tensor FP8 quantization. Returns (fp8_tensor, scale)."""
-    finfo = torch.finfo(FP8_DTYPE)
-    amax = tensor.abs().amax().clamp(min=1e-12)
-    scale = amax / finfo.max
-    fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
-    return fp8_tensor, scale.to(torch.float32).reshape(1)
-
-# ---------------------------------------------------------------------------
-# Persistent mode metadata helpers
-# ---------------------------------------------------------------------------
-
-def _make_mla_decode_metadata(
-    batch_size: int,
-    max_q_len: int,
-    nhead: int,
-    nhead_kv: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_last_page_len: torch.Tensor,
-    num_kv_splits: int,
-):
-    """Allocate and populate work buffers for persistent mla_decode_fwd."""
-    info = get_mla_metadata_info_v1(
-        batch_size, max_q_len, nhead, q_dtype, kv_dtype,
-        is_sparse=False, fast_mode=False,
-        num_kv_splits=num_kv_splits, intra_batch_mode=True,
-    )
-    work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
-    (work_metadata, work_indptr, work_info_set,
-     reduce_indptr, reduce_final_map, reduce_partial_map) = work
-
-    get_mla_metadata_v1(
-        qo_indptr, kv_indptr, kv_last_page_len,
-        nhead // nhead_kv,
-        nhead_kv,
-        True,
-        work_metadata, work_info_set, work_indptr,
-        reduce_indptr, reduce_final_map, reduce_partial_map,
-        page_size=PAGE_SIZE,
-        kv_granularity=max(PAGE_SIZE, 16),
-        max_seqlen_qo=max_q_len,
-        uni_seqlen_qo=max_q_len,
-        fast_mode=False,
-        max_split_per_batch=num_kv_splits,
-        intra_batch_mode=True,
-        dtype_q=q_dtype,
-        dtype_kv=kv_dtype,
-    )
-
-    return {
-        "work_meta_data": work_metadata,
-        "work_indptr": work_indptr,
-        "work_info_set": work_info_set,
-        "reduce_indptr": reduce_indptr,
-        "reduce_final_map": reduce_final_map,
-        "reduce_partial_map": reduce_partial_map,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Aiter MLA decode kernel wrapper with dynamic splits
-# ---------------------------------------------------------------------------
-
-def _aiter_mla_decode(
-    q: torch.Tensor,
-    kv_buffer: torch.Tensor,
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    config: dict,
-    q_scale: torch.Tensor | None = None,
-    kv_scale: torch.Tensor | None = None,
-    num_kv_splits: int | None = None,
-) -> torch.Tensor:
-    """
-    MLA decode attention using aiter persistent-mode kernel.
-
-    Supports:
-      - fp8 Q + fp8 KV (a8w8) - fastest on MI355X
-      - bf16 Q + bf16 KV (a16w16) - highest precision
-      - bf16 Q + fp8 KV (a16w8) - mixed precision
-    """
-    batch_size = config["batch_size"]
-    nq = config["num_heads"]
-    nkv = config["num_kv_heads"]
-    dq = config["qk_head_dim"]
-    dv = config["v_head_dim"]
-    q_seq_len = config["q_seq_len"]
-    kv_seq_len = config["kv_seq_len"]
-
-    if num_kv_splits is None:
-        num_kv_splits = get_optimal_num_kv_splits(batch_size, kv_seq_len)
-
-    total_kv_len = int(kv_indptr[-1].item())
-    kv_indices = torch.arange(total_kv_len, dtype=torch.int32, device="cuda")
-
-    kv_buffer_4d = kv_buffer.view(kv_buffer.shape[0], PAGE_SIZE, nkv, kv_buffer.shape[-1])
-
-    max_q_len = q_seq_len
-    kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-
-    meta = _make_mla_decode_metadata(
-        batch_size, max_q_len, nq, nkv,
-        q.dtype, kv_buffer.dtype,
-        qo_indptr, kv_indptr, kv_last_page_len,
-        num_kv_splits=num_kv_splits,
-    )
-
-    o = torch.empty((q.shape[0], nq, dv), dtype=torch.bfloat16, device="cuda")
-    mla_decode_fwd(
-        q.view(-1, nq, dq),
-        kv_buffer_4d,
-        o,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        max_q_len,
-        page_size=PAGE_SIZE,
-        nhead_kv=nkv,
-        sm_scale=SM_SCALE,
-        logit_cap=0.0,
-        num_kv_splits=num_kv_splits,
-        q_scale=q_scale,
-        kv_scale=kv_scale,
-        intra_batch_mode=True,
-        **meta,
-    )
-    return o
-
-
-# ---------------------------------------------------------------------------
-# Ultra-fast path for small batches - bypasses aiter overhead
-# ---------------------------------------------------------------------------
-
-@torch.compile(mode="max-autotune", fullgraph=True)
-def _fast_mla_attention_compiled(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    batch_size: int,
-    nq: int,
-    q_seq_len: int,
-    kv_seq_len: int,
-    dv: int,
-) -> torch.Tensor:
-    """
-    Compiled fast attention for small batches.
-    Fuses all operations into a single kernel.
-    """
-    total_q = batch_size * q_seq_len
-
-    # Reshape for batched attention
-    q_batched = q.view(batch_size, q_seq_len, nq, -1).transpose(1, 2)
-    k_batched = k.view(batch_size, kv_seq_len, 1, -1).transpose(1, 2)
-    v_batched = v.view(batch_size, kv_seq_len, 1, dv).transpose(1, 2)
-
-    # Expand for MQA
-    k_batched = k_batched.expand(batch_size, nq, kv_seq_len, -1)
-    v_batched = v_batched.expand(batch_size, nq, kv_seq_len, dv)
-
-    # SDPA handles everything efficiently
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q_batched, k_batched, v_batched,
-        scale=SM_SCALE,
-        is_causal=False,
-    )
-
-    return out.transpose(1, 2).reshape(total_q, nq, dv)
-
-
-def _fast_mla_attention(
-    q: torch.Tensor,
-    kv_buffer: torch.Tensor,
-    config: dict,
-) -> torch.Tensor:
-    """
-    Fast MLA attention that bypasses aiter kernel overhead.
-    Uses torch SDPA which is highly optimized and has lower launch overhead.
-    """
-    batch_size = config["batch_size"]
-    nq = config["num_heads"]
-    dv = config["v_head_dim"]
-    q_seq_len = config["q_seq_len"]
-    kv_seq_len = config["kv_seq_len"]
-
-    # KV buffer: (total_kv, 1, 576)
-    k = kv_buffer  # Full 576 dims for keys
-    v = kv_buffer[:, :, :dv]  # First 512 dims for values
-
-    out = _fast_mla_attention_compiled(
-        q.to(torch.float32),
-        k.to(torch.float32),
-        v.to(torch.float32),
-        batch_size, nq, q_seq_len, kv_seq_len, dv
-    )
-
-    return out.to(torch.bfloat16)
-
 
 # Attempt compilation at module load (disabled by default)
 # Uncomment the line below to enable JIT compilation of HIP kernel
 HAS_HIP_KERNEL = _try_compile_hip_kernel()
 
 # ---------------------------------------------------------------------------
-# Dispatcher: select kernel based on QKV_DTYPE
+# Dispatcher
 # ---------------------------------------------------------------------------
 def custom_kernel(data: input_t) -> output_t:
-    """
-    Hybrid dispatch: MXFP4 HIP pipeline for bandwidth-bound cases (small batches),
-    aiter a8w8 for compute-bound cases (large batches).
-
-    MXFP4 pipeline wins via 4x bandwidth savings when memory-bound:
-      bs=4,  kv=1k:  32us (MXFP4) vs ~118us (a8w8) -> 3.7x faster
-      bs=4,  kv=8k:  70us (MXFP4) vs ~113us (a8w8) -> 1.6x faster
-      bs=32, kv=1k:  50us (MXFP4) vs  ??us (a8w8)
-
-    aiter a8w8 ASM kernel wins when compute-bound (large batch x long KV):
-      bs=64,  kv=8k: 359us (MXFP4) vs ~171us (a8w8) -> a8w8 2.1x faster
-      bs=256, kv=8k: 1362us (MXFP4) vs ~349us (a8w8) -> a8w8 3.9x faster
-    """
+    """Dispatch to fused MXFP4 HIP pipeline."""
     return custom_kernel_mxfp4_qkt(data)
 
-
-# ---------------------------------------------------------------------------
-# FP8 Q + FP8 KV - using aiter's a8w8 persistent MLA kernel
-# ---------------------------------------------------------------------------
-
-def custom_kernel_fp8(data: input_t) -> output_t:
-    q, kv_data, qo_indptr, kv_indptr, config = data
-    batch_size = config["batch_size"]
-    kv_seq_len = config["kv_seq_len"]
-
-    # Only use fast SDPA for small batches AND short KV
-    if batch_size <= 4 and kv_seq_len <= 1024:
-        kv_buffer_bf16 = kv_data["bf16"]
-        return _fast_mla_attention(q, kv_buffer_bf16, config)
-
-    # Use aiter fp8 for everything else
-    q_fp8, q_scale = quantize_fp8(q)
-    kv_buffer_fp8, kv_scale_fp8 = kv_data["fp8"]
-    return _aiter_mla_decode(
-        q_fp8, kv_buffer_fp8, qo_indptr, kv_indptr, config,
-        q_scale=q_scale, kv_scale=kv_scale_fp8,
-    )
 
 def custom_kernel_mxfp4_qkt(data):
     q, kv_data, qo_indptr, kv_indptr, config = data
