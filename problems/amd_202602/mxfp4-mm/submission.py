@@ -197,7 +197,7 @@ __device__ __forceinline__ QuantResult<32> quantize_fp4_block_bf16(const hip_bfl
 template <int K, int VALS_PER_THREAD>
 __device__ __forceinline__ QuantResult<VALS_PER_THREAD> quantize_block_parallel(
     const hip_bfloat16 A[][K],
-    int row, int blk, int lane_in_group = 0, int tid = 0
+    int row, int blk, int lane_in_group = 0, int tid = 0, int group_stride = 1
 ) {
     static_assert(VALS_PER_THREAD >= 1 && VALS_PER_THREAD <= 32, "VALS_PER_THREAD must be 1..32");
     static_assert(32 % VALS_PER_THREAD == 0, "32 must be divisible by VALS_PER_THREAD");
@@ -230,10 +230,10 @@ __device__ __forceinline__ QuantResult<VALS_PER_THREAD> quantize_block_parallel(
     if constexpr (THREADS_PER_GROUP == 1) {
         amax_bf16 = local_max_bf16;
     } else {
-        int group_in_warp = (tid / THREADS_PER_GROUP);
+        int group_base = tid - lane_in_group * group_stride;
         unsigned long long group_mask = 0;
         for (int i = 0; i < THREADS_PER_GROUP; i++)
-            group_mask |= (1ull << (group_in_warp * THREADS_PER_GROUP + i));
+            group_mask |= (1ull << (group_base + i * group_stride));
         amax_bf16 = __reduce_max_sync(group_mask, local_max_bf16);
     }
 
@@ -434,6 +434,32 @@ struct LoadBPerThread {
 
 __device__ __forceinline__ int32_t broadcast_scale(uint8_t e8m0) {
     return (int32_t)e8m0 * 0x01010101;
+}
+
+// Gather cooperative quantization results into 4 uint32 registers for MFMA.
+// When QUANT_VPT==32, one thread has all 16 bytes - just copy.
+// When QUANT_VPT<32, each thread has QUANT_VPT/2 bytes - gather via __shfl.
+template <int QUANT_VPT, int WORDS_PER_THREAD, int EFFECTIVE_M>
+__device__ __forceinline__ void gather_quant_result(
+    const QuantResult<QUANT_VPT>& qb,
+    uint32_t* __restrict__ dst,
+    int lane_in_quant_group,
+    int lane
+) {
+    if constexpr (QUANT_VPT == 32) {
+        *reinterpret_cast<uint128_vec*>(&dst[0]) = *reinterpret_cast<const uint128_vec*>(&qb.data);
+    } else {
+        uint32_t my_words[WORDS_PER_THREAD > 0 ? WORDS_PER_THREAD : 1];
+        for (int w = 0; w < WORDS_PER_THREAD; w++)
+            memcpy(&my_words[w], &qb.data[w * 4], 4);
+        int base_lane = lane - lane_in_quant_group * EFFECTIVE_M;
+        for (int r = 0; r < 4; r++) {
+            int src_group = r / (WORDS_PER_THREAD > 0 ? WORDS_PER_THREAD : 1);
+            int src_word = r % (WORDS_PER_THREAD > 0 ? WORDS_PER_THREAD : 1);
+            int src_lane = base_lane + src_group * EFFECTIVE_M;
+            dst[r] = __shfl(my_words[src_word], src_lane);
+        }
+    }
 }
 
 // LDS-only barrier: waits for LDS/GDS/scalar ops (lgkmcnt) but NOT global memory (vmcnt).
@@ -774,6 +800,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_simple_fused(
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
     constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
 
+    constexpr int EFFECTIVE_M = (M < IM) ? M : IM;
+    constexpr int THREADS_PER_MX_BLOCK = IM / EFFECTIVE_M;
+    constexpr int QUANT_VPT = 32 / THREADS_PER_MX_BLOCK;
+    static_assert(32 % THREADS_PER_MX_BLOCK == 0, "IM/min(M,IM) must divide 32");
+    constexpr int WORDS_PER_THREAD = QUANT_VPT / 2 / 4;
+    static_assert(QUANT_VPT == 32 || QUANT_VPT >= 8, "QUANT_VPT must be >= 8 or 32");
+
     const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / 64);
     const int lane = threadIdx.x % 64;
     const int warp_m = __builtin_amdgcn_readfirstlane(warp_id / WARPS_N);
@@ -793,24 +826,26 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_simple_fused(
             a_nxt[4] = 0; a_nxt[5] = 0; a_nxt[6] = 0; a_nxt[7] = 0;
         }
 
-        // Quantize A with load_tile-compatible lane mapping: row = lane % IM, k_group = lane / IM
+        // Quantize A with cooperative lane mapping for small M
+        const int a_row_base = tile_m + (lane % EFFECTIVE_M);
+        const int lane_in_quant_group = (lane % IM) / EFFECTIVE_M;
         {
-            int a_row = tile_m + (lane % IM);
             int a_blk = 0 + (lane / IM);
-            auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
-            *reinterpret_cast<uint128_vec*>(&a_cur[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
+            auto qb = quantize_block_parallel<K, QUANT_VPT>(A_bf16, a_row_base, a_blk, lane_in_quant_group, lane, EFFECTIVE_M);
             a_sc_cur = broadcast_scale(qb.e8m0);
+            gather_quant_result<QUANT_VPT, WORDS_PER_THREAD, EFFECTIVE_M>(qb, a_cur, lane_in_quant_group, lane);
         }
         {
             b_sc_cur = load_b_with_scale<K_HALF, NUM_BLOCKS, IM, IN, IK>(B_data, B_scale, tile_n, 0, lane, b_cur);
         }
 
         for (int ki = 0; ki < K_ITERS - 1; ki++) {
-            int a_row = tile_m + (lane % IM);
             int a_blk = (ki + 1) * BPC + (lane / IM);
-            auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
-            *reinterpret_cast<uint128_vec*>(&a_nxt[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
-            a_sc_nxt = broadcast_scale(qb.e8m0);
+            {
+                auto qb = quantize_block_parallel<K, QUANT_VPT>(A_bf16, a_row_base, a_blk, lane_in_quant_group, lane, EFFECTIVE_M);
+                a_sc_nxt = broadcast_scale(qb.e8m0);
+                gather_quant_result<QUANT_VPT, WORDS_PER_THREAD, EFFECTIVE_M>(qb, a_nxt, lane_in_quant_group, lane);
+            }
             b_sc_nxt = load_b_with_scale<K_HALF, NUM_BLOCKS, IM, IN, IK>(B_data, B_scale, tile_n, (ki + 1) * BPC, lane, b_nxt);
 
             acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
@@ -839,8 +874,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_simple_fused(
 
 template <int M, int N, int K, int NUM_BLOCKS,
           int IM, int IN, int IK,
-          int WARPS_M = 1, int WARPS_N = 1, int K_HALF = K / 2>
-__global__ void mfma_fp4_gemm_coop_simple(
+          int WARPS_M = 1, int WARPS_N = 1,
+          int BLOCK_SIZE = WARPS_M * WARPS_N * WARP_SIZE, int K_HALF = K / 2>
+__global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_coop_simple(
     const hip_bfloat16 A_bf16[][K],
     uint8_t A_data[][K_HALF],
     uint8_t A_scale[][NUM_BLOCKS],
@@ -853,11 +889,18 @@ __global__ void mfma_fp4_gemm_coop_simple(
     constexpr int BPC = Traits::BLOCKS_PER_CALL;
     constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
     constexpr int TOTAL_QUANT = M * NUM_BLOCKS;
-    constexpr int BLOCK_SIZE = WARPS_M * WARPS_N * WARP_SIZE;
+
+    constexpr int EFFECTIVE_M = (M < IM) ? M : IM;
+    constexpr int THREADS_PER_MX_BLOCK = IM / EFFECTIVE_M;
+    constexpr int QUANT_VPT = 32 / THREADS_PER_MX_BLOCK;
+    static_assert(32 % THREADS_PER_MX_BLOCK == 0, "IM/min(M,IM) must divide 32");
+    constexpr int WORDS_PER_THREAD = QUANT_VPT / 2 / 4;
+    static_assert(QUANT_VPT == 32 || QUANT_VPT >= 8, "QUANT_VPT must be >= 8 or 32");
+    constexpr int TOTAL_QUANT_THREADS = TOTAL_QUANT * THREADS_PER_MX_BLOCK;
 
     const int tid = threadIdx.x;
 
-    // Phase 1: Cooperative A quantization (work-stealing)
+    // Phase 1: Cooperative A quantization (work-stealing) with cooperative VPT
     int batch_start;
     while (true) {
         if (tid == 0) {
@@ -865,18 +908,42 @@ __global__ void mfma_fp4_gemm_coop_simple(
         }
         batch_start = __builtin_amdgcn_readfirstlane(batch_start);
 
-        if (batch_start >= TOTAL_QUANT) break;
+        if (batch_start >= TOTAL_QUANT_THREADS) break;
 
         int my_chunk = batch_start + tid;
-        if (my_chunk < TOTAL_QUANT) {
-            int row = my_chunk / NUM_BLOCKS;
-            int blk = my_chunk % NUM_BLOCKS;
+        if (my_chunk < TOTAL_QUANT_THREADS) {
+            int group_id = my_chunk / THREADS_PER_MX_BLOCK;
+            int lane_in_group = my_chunk % THREADS_PER_MX_BLOCK;
+            int row = group_id / NUM_BLOCKS;
+            int blk = group_id % NUM_BLOCKS;
+            int warp_lane = tid % 64;
 
-            auto qb = quantize_block_parallel<K, 32>(A_bf16, row, blk);
+            auto qb = quantize_block_parallel<K, QUANT_VPT>(
+                A_bf16, row, blk, lane_in_group, warp_lane, 1);
 
-            *reinterpret_cast<uint128_vec*>(&A_data[row][blk * 16]) =
-                *reinterpret_cast<uint128_vec*>(&qb.data);
-            A_scale[row][blk] = qb.e8m0;
+            if constexpr (QUANT_VPT == 32) {
+                *reinterpret_cast<uint128_vec*>(&A_data[row][blk * 16]) =
+                    *reinterpret_cast<uint128_vec*>(&qb.data);
+            } else {
+                uint32_t my_words[WORDS_PER_THREAD > 0 ? WORDS_PER_THREAD : 1];
+                for (int w = 0; w < WORDS_PER_THREAD; w++)
+                    memcpy(&my_words[w], &qb.data[w * 4], 4);
+                int base_lane = warp_lane - lane_in_group;
+                uint32_t gathered[4];
+                for (int r = 0; r < 4; r++) {
+                    int src_group = r / (WORDS_PER_THREAD > 0 ? WORDS_PER_THREAD : 1);
+                    int src_word = r % (WORDS_PER_THREAD > 0 ? WORDS_PER_THREAD : 1);
+                    int src_lane = base_lane + src_group;
+                    gathered[r] = __shfl(my_words[src_word], src_lane);
+                }
+                if (lane_in_group == 0) {
+                    *reinterpret_cast<uint128_vec*>(&A_data[row][blk * 16]) =
+                        *reinterpret_cast<uint128_vec*>(&gathered);
+                }
+            }
+            if (lane_in_group == 0) {
+                A_scale[row][blk] = qb.e8m0;
+            }
         }
     }
 
@@ -884,7 +951,7 @@ __global__ void mfma_fp4_gemm_coop_simple(
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
     grid.sync();
 
-    // Phase 3: Standard simple GEMM on pre-quantized A
+    // Phase 3: Fused simple GEMM - quantize A on-the-fly from A_bf16
     const int warp_id = __builtin_amdgcn_readfirstlane(tid / 64);
     const int lane = tid % 64;
     const int warp_m = __builtin_amdgcn_readfirstlane(warp_id / WARPS_N);
@@ -899,16 +966,31 @@ __global__ void mfma_fp4_gemm_coop_simple(
         uint32_t a_nxt[Traits::REGS], b_nxt[Traits::REGS];
         int32_t a_sc_cur, b_sc_cur, a_sc_nxt, b_sc_nxt;
 
-        load_ab_global<M, N, K_HALF, NUM_BLOCKS, IM, IN, IK>(
-            A_data, B_data, A_scale, B_scale,
-            tile_m, tile_n, 0, lane,
-            a_cur, a_sc_cur, b_cur, b_sc_cur);
+        if constexpr (Traits::REGS == 8) {
+            a_cur[4] = 0; a_cur[5] = 0; a_cur[6] = 0; a_cur[7] = 0;
+            a_nxt[4] = 0; a_nxt[5] = 0; a_nxt[6] = 0; a_nxt[7] = 0;
+        }
+
+        const int a_row_base = tile_m + (lane % EFFECTIVE_M);
+        const int lane_in_quant_group = (lane % IM) / EFFECTIVE_M;
+        {
+            int a_blk = 0 + (lane / IM);
+            auto qb = quantize_block_parallel<K, QUANT_VPT>(A_bf16, a_row_base, a_blk, lane_in_quant_group, lane, EFFECTIVE_M);
+            a_sc_cur = broadcast_scale(qb.e8m0);
+            gather_quant_result<QUANT_VPT, WORDS_PER_THREAD, EFFECTIVE_M>(qb, a_cur, lane_in_quant_group, lane);
+        }
+        {
+            b_sc_cur = load_b_with_scale<K_HALF, NUM_BLOCKS, IM, IN, IK>(B_data, B_scale, tile_n, 0, lane, b_cur);
+        }
 
         for (int ki = 0; ki < K_ITERS - 1; ki++) {
-            load_ab_global<M, N, K_HALF, NUM_BLOCKS, IM, IN, IK>(
-                A_data, B_data, A_scale, B_scale,
-                tile_m, tile_n, (ki + 1) * BPC, lane,
-                a_nxt, a_sc_nxt, b_nxt, b_sc_nxt);
+            int a_blk = (ki + 1) * BPC + (lane / IM);
+            {
+                auto qb = quantize_block_parallel<K, QUANT_VPT>(A_bf16, a_row_base, a_blk, lane_in_quant_group, lane, EFFECTIVE_M);
+                a_sc_nxt = broadcast_scale(qb.e8m0);
+                gather_quant_result<QUANT_VPT, WORDS_PER_THREAD, EFFECTIVE_M>(qb, a_nxt, lane_in_quant_group, lane);
+            }
+            b_sc_nxt = load_b_with_scale<K_HALF, NUM_BLOCKS, IM, IN, IK>(B_data, B_scale, tile_n, (ki + 1) * BPC, lane, b_nxt);
 
             acc = Traits::mfma(a_cur, a_sc_cur, b_cur, b_sc_cur, acc);
 
@@ -1366,6 +1448,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
     constexpr int K_ITERS = (NUM_BLOCKS + BPC - 1) / BPC;
     constexpr int ITERS_PER_SPLIT = (K_ITERS + K_SPLITS - 1) / K_SPLITS;
 
+    constexpr int EFFECTIVE_M = (M < IM) ? M : IM;
+    constexpr int THREADS_PER_MX_BLOCK = IM / EFFECTIVE_M;
+    constexpr int QUANT_VPT = 32 / THREADS_PER_MX_BLOCK;
+    static_assert(32 % THREADS_PER_MX_BLOCK == 0, "IM/min(M,IM) must divide 32");
+    constexpr int WORDS_PER_THREAD = QUANT_VPT / 2 / 4;
+    static_assert(QUANT_VPT == 32 || QUANT_VPT >= 8, "QUANT_VPT must be >= 8 or 32");
+
     const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / 64);
     const int lane = threadIdx.x % 64;
     const int warp_m = __builtin_amdgcn_readfirstlane(warp_id / WARPS_N);
@@ -1394,13 +1483,14 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
         a_nxt[4] = 0; a_nxt[5] = 0; a_nxt[6] = 0; a_nxt[7] = 0;
     }
 
-    // First tile: quantize A on-the-fly, load B normally
+    // First tile: quantize A on-the-fly with cooperative VPT, load B normally
+    const int a_row_base = tile_m + (lane % EFFECTIVE_M);
+    const int lane_in_quant_group = (lane % IM) / EFFECTIVE_M;
     {
-        int a_row = tile_m + (lane % IM);
         int a_blk = ki_start * BPC + (lane / IM);
-        auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
-        *reinterpret_cast<uint128_vec*>(&a_cur[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
+        auto qb = quantize_block_parallel<K, QUANT_VPT>(A_bf16, a_row_base, a_blk, lane_in_quant_group, lane, EFFECTIVE_M);
         a_sc_cur = broadcast_scale(qb.e8m0);
+        gather_quant_result<QUANT_VPT, WORDS_PER_THREAD, EFFECTIVE_M>(qb, a_cur, lane_in_quant_group, lane);
     }
     {
         int b_row, b_blk;
@@ -1410,11 +1500,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE) mfma_fp4_gemm_splitk_fused(
 
     for (int ki = ki_start; ki < ki_end - 1; ki++) {
         {
-            int a_row = tile_m + (lane % IM);
             int a_blk = (ki + 1) * BPC + (lane / IM);
-            auto qb = quantize_block_parallel<K, 32>(A_bf16, a_row, a_blk);
-            *reinterpret_cast<uint128_vec*>(&a_nxt[0]) = *reinterpret_cast<uint128_vec*>(&qb.data);
+            auto qb = quantize_block_parallel<K, QUANT_VPT>(A_bf16, a_row_base, a_blk, lane_in_quant_group, lane, EFFECTIVE_M);
             a_sc_nxt = broadcast_scale(qb.e8m0);
+            gather_quant_result<QUANT_VPT, WORDS_PER_THREAD, EFFECTIVE_M>(qb, a_nxt, lane_in_quant_group, lane);
         }
         {
             int b_row, b_blk;
@@ -2582,14 +2671,19 @@ void mfma_gemm(
     //CS32(256, 3072, 1536)
 
     // Tiled
-    T(64,  3072, 1536,  32,32,1536, 32,32,64, 1,1,1)
-    T(256, 2880, 512,  128,128,512, 32,32,64, 1,1,1)
+    //T(64,  3072, 1536,  32,32,1536, 32,32,64, 1,1,1) // non-test shape, removed
+    //T(256, 2880, 512,  128,128,512, 32,32,64, 1,1,1) // non-test shape, removed
 
     // Simple 32x32x64
     //SF16(32, 4096, 512, 1, 1) //--> 8.88 BEST
     //ITER2: SF32(32, 4096, 512, 1, 1) --> 14.5
     //ITER3: T(32, 4096, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.0
-    SF16(32, 4096, 512, 1, 1) //RUN4: revert (RUN3: WTM=2 --> 9.20, same)
+    SF16(32, 4096, 512, 2, 1) //R3-FINAL: BEST (R4-RUN1: SF16(3,1)-->9.80 WORSE)
+    //R2-RUN5: SF16(1,2) WTN=2 --> 9.22 (worse)
+    //RUN9: SF16(32, 4096, 512, 1, 1) --> 9.17 (worse)
+    //RUN8: SF16(32, 4096, 512, 2, 2) --> 9.68 (worse)
+    //RUN7: SF16(32, 4096, 512, 2, 1) WTM=2 --> 9.07 BEST
+    //RUN6: SF16(32, 4096, 512, 1, 2) WTN=2 --> 9.26
     //RE-TUNE3: SF16(32, 4096, 512, 1, 2) --> 8.39
     //RE-TUNE2: SF32(32, 4096, 512, 1, 1) --> 13.6
     //ITER6: SF16(32, 4096, 512, 2, 1) --> 8.74
@@ -2600,7 +2694,10 @@ void mfma_gemm(
     //S32(32, 2880, 512, 1, 1) //--> 11.9
     //ITER1: T(32, 2880, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.1
     //SF16(32, 2880, 512, 1, 1) //--> 8.74 NEW BEST
-    SF16(32, 2880, 512, 1, 1) //RUN4: revert (RUN3: WTM=2 --> 9.11, same)
+    SF16(32, 2880, 512, 2, 1) //R3-FINAL: BEST (R4-RUN1: SF16(1,1)-->9.24 WORSE)
+    //RUN8: S16(32, 2880, 512, 2, 1) --> 9.43 (worse)
+    //RUN7: SF16(32, 2880, 512, 2, 1) WTM=2 --> 8.99 BEST
+    //RUN6: SF16(32, 2880, 512, 1, 2) WTN=2 --> 9.20
     //RE-TUNE3: SF16(32, 2880, 512, 1, 2) --> 8.34
     //RE-TUNE2: SF32(32, 2880, 512, 1, 1) --> 13.5
     //ITER5: SF16(32, 2880, 512, 2, 1) --> 8.55
@@ -2657,12 +2754,26 @@ void mfma_gemm(
     //RUN1-was: T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //--> 16.3 BEST
     //RUN1: TSKR(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 2, 1, -1) --> 22.3 (worse)
     //RUN2: T(256, 3072, 1536, 32, 64, 128, 32, 32, 64, 1, 1, 1) --> 33.2 (terrible)
-    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //RUN3: revert to best
+    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //R4-FINAL: BEST (R4: TSKR split-K=3-->22.0; T BUFS=2-->17.6; T OK=256-->29.6)
+    //R2-RUN4: T(ON=96) --> COMPILE FAIL (non-pow2)
+    //R2-RUN3: T(OK=256) --> 29.8 TERRIBLE
+    //RUN17: T(64x64,BUFS=1) --> 16.0 confirmed
+    //RUN16: T(128x128,WTM=2,WTN=2) --> 55.8 TERRIBLE
+    //RUN12: T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) --> INCORRECT
+    //RUN11: T(256, 3072, 1536, 128, 64, 128, ...) --> INCORRECT
+    //RUN9: T(256, 3072, 1536, 64, 64, 128, ..., 1,1,1) --> 15.9/16.0 BEST
     //RE-TUNE3: TSK(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1, 1, -1) --> 23.6
     //RE-TUNE2: T(256, 3072, 1536, 64, 64, 256, 32, 32, 64, 1, 1, 1) --> 34.4
 
     // Simple 16x16x128
-    SF16(4,  2880, 512, 1, 1) //--> 7.77 BEST
+    S16(4,  2880, 512, 1, 1) //R3-FINAL: BEST (R4-RUN1: S16(1,4)-->10.0 WORSE)
+    //R2-RUN2: SF16(1,1) --> 15.0 TERRIBLE
+    //R2-RUN1: S16(1,1) --> 9.02
+    //RUN15: S16(WTM=2) --> 9.48 (worse)
+    //RUN13: SF16(4,2880,512,1,1) --> 15.0 TERRIBLE
+    //RUN9: S16(4, 2880, 512, 1, 2) WTN=2 --> 9.56 (worse)
+    //RUN8: S16(4, 2880, 512, 2, 1) --> 9.53 (worse)
+    //RUN7: S16(4, 2880, 512, 1, 1) --> 9.24 BEST
     //RE-TUNE3: SF16(4, 2880, 512, 1, 2) --> 8.34
     //RE-TUNE1: SF16(4, 2880, 512, 2, 1) --> 8.11
     //RE-TUNE2: SF32(4, 2880, 512, 1, 1) --> 13.1
@@ -2711,7 +2822,19 @@ void mfma_gemm(
     //RUN3: T(64, 7168, 2048, 64, 64, 64, 32, 32, 64, 1, 1, 1) --> INCORRECT (OK=64 broken)
     //RUN5: T(64, 7168, 2048, 64, 64, 256, 32, 32, 64, 1, 1, 1) --> 37.4 (terrible, too much LDS)
     //RUN6: T(64, 7168, 2048, 64, 32, 128, 32, 32, 64, 1, 1, 1) --> 31.7 (ON=32 bad, no B reuse)
-    T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 1) //FINAL: best config (18.1µs avg)
+    T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 2) //R4-FINAL: BUFS=2 BEST (R4-RUN2/3/4/5: consistently 18.0-18.1 vs BUFS=1 at 18.3)
+    //R2-RUN5: TSKR(split-K=4) --> 20.3 (worse)
+    //R2-RUN4: T(ON=128,WTN=2) --> NOT TESTED (compile fail)
+    //R2-RUN3: T(16x16 MFMA 2x2) --> 20.7 (worse)
+    //R2-RUN2: T(OM=32,WTN=2) --> 64.0 TERRIBLE (1 warp)
+    //R2-RUN1: TSKR(split-K=2) --> 22.4 (worse)
+    //RUN17: T(64x128,ON=128,WTN=2) --> 45.3 TERRIBLE
+    //RUN16: T(32x128,16x16,WTN=4) --> 41.9 TERRIBLE
+    //RUN14: T(64x64,32x32,BUFS=1) --> 18.2 BEST
+    //T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 2) //RUN11: BUFS=2 was 18.1 too
+    //RUN10: T(64, 7168, 2048, ..., WTN=2,BUFS=2) --> 57.5 TERRIBLE
+    //RUN9: T(64, 7168, 2048, ..., BUFS=2,WTN=1) --> 18.1 confirmed
+    //RUN6: T(64, 7168, 2048, ..., BUFS=2) --> 17.9 BEST
     //ITER10: try TSK(32,64,128, 1,2, 3, 2, -1) split-K=3
     //TSK(64, 7168, 2048, 32, 64, 128, 16, 16, 128, 1, 2, 3, 2, -1) //ITER10 TBD
     //T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 2, 1, 1) --> 70.0
@@ -2736,7 +2859,14 @@ void mfma_gemm(
     //RUN2: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 2, -1) --> 13.8 (~same)
     //RUN3: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) --> 14.0 (confirmed)
     //RUN4: TSKF doesn't exist as macro --> COMPILE FAIL
-    TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) //RUN5: revert to best
+    TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, -1) //R4-FINAL: BEST (R4: ON=32,bufs=2-->13.6; K=14-->15.1; K=7-->19.7; OK=512,K=14-->12.7; bufs=2-->12.6)
+    //R2-RUN4: TSKR(K_SPLITS=14) --> NOT TESTED (compile fail)
+    //R2-RUN2: TSKR(K_SPLITS=56) --> INCORRECT
+    //R2-RUN1: TSKR(WTN=2) --> 13.8 (worse)
+    //RUN15: TSKR(K_SPLITS=56) --> INCORRECT
+    //RUN12: TSKR(..., ON=32) --> 12.7 (worse)
+    //RUN11: TSKR(..., ON=64,WTN=1,bufs=1) --> 12.6/12.7 BEST
+    //RUN10: TSKR(..., WTN=1,bufs=2) --> 12.6 (same)
     //TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, 1) //--> 14.9 BEST
     //TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 2, -1) --> 16.0
     //ITER9: TSK(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 56, 1, -1) --> INCORRECT

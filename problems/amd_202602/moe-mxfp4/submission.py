@@ -15,8 +15,7 @@ import torch, os, time, functools, triton
 import triton.language as tl
 import torch.nn.functional as F
 from task import input_t, output_t
-import aiter
-from aiter import QuantType, dtypes, ActivationType
+from aiter import dtypes
 
 _mod = None  # Lazy-compiled HIP module handle
 
@@ -307,10 +306,103 @@ __global__ void moe_gemm_fp4xfp4(
             av, bv, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
     }
     int col = lane % 16, quad = lane / 16;
-    for (int i = 0; i < 4; i++) {
-        int gm = tile_m + i + 4*quad, gn = tile_n + col;
-        if (gm < actual_m && gn < N) C[gm][gn] = acc[i];
+      for (int i = 0; i < 4; i++) {
+          int gm = tile_m + i + 4*quad, gn = tile_n + col;
+          if (gm < actual_m && gn < N) C[gm][gn] = acc[i];
+      }
+  }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Software FP4 quantization (matches Triton _mxfp4_quant_op exactly)
+// Uses FP32-domain scale + software E2M1 conversion (NO hardware intrinsics)
+// ═══════════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__ uint8_t fp32_to_fp4_e2m1(float val) {
+    uint32_t u = __float_as_uint(val);
+    uint32_t s = u & 0x80000000u;
+    uint32_t e = (u >> 23) & 0xFFu;
+    uint32_t m = u & 0x7FFFFFu;
+    if (e < 127u) {
+        uint32_t adj = 126u - e;
+        m = (adj < 24u) ? ((0x400000u | (m >> 1)) >> adj) : 0u;
     }
+    e = (e >= 126u) ? (e - 126u) : 0u;
+    uint32_t e2m1 = min((((e << 2) | (m >> 21)) + 1u) >> 1, 7u);
+    return (uint8_t)((s >> 28) | e2m1);
+}
+
+template <int K>
+__global__ void mxfp4_quant_sw_bf16(const hip_bfloat16* __restrict__ input, uint8_t* __restrict__ out_fp4, uint8_t* __restrict__ out_scale, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int NB = K / 32;
+    if (idx >= M * NB) return;
+    int row = idx / NB, blk = idx % NB;
+    float vals[32]; float mx = 0.f;
+    for (int i = 0; i < 32; i++) { vals[i] = (float)input[row * K + blk * 32 + i]; float a = vals[i] < 0.f ? -vals[i] : vals[i]; mx = (a > mx) ? a : mx; }
+    uint8_t e8m0 = 0; float qs = 0.f;
+    if (mx != 0.f) { uint32_t b = __float_as_uint(mx); b = (b + 0x200000u) & 0xFF800000u; float r = __uint_as_float(b); float l = floorf(log2f(r)) - 2.f; l = fminf(fmaxf(l, -127.f), 127.f); qs = exp2f(-l); e8m0 = (uint8_t)((int)l + 127); }
+    for (int i = 0; i < 16; i++) { uint8_t lo = fp32_to_fp4_e2m1(vals[2*i] * qs); uint8_t hi = fp32_to_fp4_e2m1(vals[2*i+1] * qs); out_fp4[row * (K/2) + blk * 16 + i] = lo | (hi << 4); }
+    out_scale[row * NB + blk] = e8m0;
+}
+
+template <int K>
+__global__ void mxfp4_quant_sw_f32(const float* __restrict__ input, uint8_t* __restrict__ out_fp4, uint8_t* __restrict__ out_scale, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int NB = K / 32;
+    if (idx >= M * NB) return;
+    int row = idx / NB, blk = idx % NB;
+    float vals[32]; float mx = 0.f;
+    for (int i = 0; i < 32; i++) { vals[i] = input[row * K + blk * 32 + i]; float a = vals[i] < 0.f ? -vals[i] : vals[i]; mx = (a > mx) ? a : mx; }
+    uint8_t e8m0 = 0; float qs = 0.f;
+    if (mx != 0.f) { uint32_t b = __float_as_uint(mx); b = (b + 0x200000u) & 0xFF800000u; float r = __uint_as_float(b); float l = floorf(log2f(r)) - 2.f; l = fminf(fmaxf(l, -127.f), 127.f); qs = exp2f(-l); e8m0 = (uint8_t)((int)l + 127); }
+    for (int i = 0; i < 16; i++) { uint8_t lo = fp32_to_fp4_e2m1(vals[2*i] * qs); uint8_t hi = fp32_to_fp4_e2m1(vals[2*i+1] * qs); out_fp4[row * (K/2) + blk * 16 + i] = lo | (hi << 4); }
+    out_scale[row * NB + blk] = e8m0;
+}
+
+template <int N>
+__global__ void swiglu_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int M
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int row = idx / N;
+    int col = idx % N;
+    float gate = input[row * 2 * N + col];
+    float up = input[row * 2 * N + N + col];
+    float silu_gate = gate / (1.f + expf(-gate));
+  output[idx] = silu_gate * up;
+}
+
+__global__ void f32_to_bf16_trim_kernel(
+    const float* __restrict__ input,      // [M, in_cols]
+    hip_bfloat16* __restrict__ output,    // [M, out_cols]
+    int M,
+    int in_cols,
+    int out_cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * out_cols) return;
+    int row = idx / out_cols;
+    int col = idx % out_cols;
+    output[idx] = (hip_bfloat16)input[row * in_cols + col];
+}
+
+__global__ void weighted_scatter_add_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ src,
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ weights,
+    int n_tok,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_tok * N) return;
+    int row = idx / N;
+    int col = idx % N;
+    int out_row = (int)indices[row];
+    atomicAdd(&output[out_row * N + col], weights[row] * src[row * N + col]);
 }
 '''
 
@@ -356,6 +448,118 @@ void launch_quant_f32(torch::Tensor A, torch::Tensor A_fp4, torch::Tensor A_scal
         reinterpret_cast<uint8_t(*)[K/32]>(A_scale.data_ptr()), M);
 }
 
+
+void moe_forward(
+    torch::Tensor hidden_padded,
+    torch::Tensor gate_up_weight,
+    torch::Tensor down_weight,
+    torch::Tensor gate_up_weight_scale,
+    torch::Tensor down_weight_scale,
+    torch::Tensor topk_weights,
+    torch::Tensor topk_ids,
+    torch::Tensor output,
+    int E, int dep, int dhp
+) {
+    auto device = hidden_padded.device();
+    int M = hidden_padded.size(0);
+
+    for (int eid = 0; eid < E; eid++) {
+        auto mask = (topk_ids == eid);
+        if (!mask.any().item<bool>()) continue;
+
+        auto wh = torch::where(mask);
+        auto tok_idx = wh[0];
+        auto k_idx = wh[1];
+        int n = tok_idx.size(0);
+
+        auto w = topk_weights.index({tok_idx, k_idx});
+        auto x = hidden_padded.index({tok_idx}).contiguous();
+
+        // Stage 1: Quant BF16->MXFP4
+        auto a1_fp4 = torch::empty({n, dhp/2}, torch::dtype(torch::kUInt8).device(device));
+        auto a1_sc = torch::empty({n, dhp/32}, torch::dtype(torch::kUInt8).device(device));
+        [&](){
+            int t = n * (dhp/32);
+            auto a_ptr = reinterpret_cast<const hip_bfloat16*>(x.data_ptr());
+            auto fp4_ptr = reinterpret_cast<uint8_t*>(a1_fp4.data_ptr());
+            auto sc_ptr = reinterpret_cast<uint8_t*>(a1_sc.data_ptr());
+#define D(k) if(dhp==k){hipLaunchKernelGGL((mxfp4_quant_sw_bf16<k>),dim3((t+255)/256),dim3(256),0,0,a_ptr,fp4_ptr,sc_ptr,n);return;}
+            D(4096) D(7168) D(1024) D(2048) D(1536) D(256) D(512)
+#undef D
+        }();
+
+        // Stage 1: Gate_up GEMM
+        auto gu_w = gate_up_weight[eid];
+        auto gu_s = gate_up_weight_scale.dim()==3 ? gate_up_weight_scale[eid] : gate_up_weight_scale.slice(0, eid*2*dep, (eid+1)*2*dep);
+        auto C1 = torch::zeros({n, 2*dep}, torch::dtype(torch::kFloat32).device(device));
+        [&](){
+            int N=2*dep, K=dhp;
+            dim3 grid((n+15)/16,(N+15)/16);
+            auto a_fp4 = reinterpret_cast<const uint8_t*>(a1_fp4.data_ptr());
+            auto a_sc = reinterpret_cast<const uint8_t*>(a1_sc.data_ptr());
+            auto b_fp4 = reinterpret_cast<const uint8_t*>(gu_w.view(torch::kUInt8).contiguous().data_ptr());
+            auto b_sc = reinterpret_cast<const uint8_t*>(gu_s.view(torch::kUInt8).contiguous().data_ptr());
+            auto c_ptr = reinterpret_cast<float*>(C1.data_ptr());
+#define D(nn,kk) if(N==nn&&K==kk){hipLaunchKernelGGL((moe_gemm_fp4xfp4<nn,kk>),grid,dim3(64),0,0,reinterpret_cast<const uint8_t(*)[kk/2]>(a_fp4),reinterpret_cast<const uint8_t(*)[kk/32]>(a_sc),reinterpret_cast<const uint8_t(*)[kk/2]>(b_fp4),reinterpret_cast<const uint8_t(*)[kk/32]>(b_sc),reinterpret_cast<float(*)[nn]>(c_ptr),n);return;}
+            D(2048,4096) D(4096,1024) D(4096,7168) D(7168,2048) D(3072,4096) D(4096,1536) D(512,7168) D(7168,256) D(1024,7168) D(7168,512)
+#undef D
+        }();
+
+        // SwiGLU
+        auto inter = torch::empty({n, dep}, torch::dtype(torch::kFloat32).device(device));
+        [&](){
+            int t = n * dep;
+            auto in_ptr = reinterpret_cast<const float*>(C1.data_ptr());
+            auto out_ptr = reinterpret_cast<float*>(inter.data_ptr());
+#define D(nn) if(dep==nn){hipLaunchKernelGGL((swiglu_kernel<nn>),dim3((t+255)/256),dim3(256),0,0,in_ptr,out_ptr,n);return;}
+            D(4096) D(7168) D(1024) D(2048) D(1536) D(256) D(512)
+#undef D
+        }();
+
+        // Stage 2: Cast F32->BF16, Quant BF16->MXFP4
+        auto inter_bf16 = inter.to(torch::kBFloat16).contiguous();
+        auto a2_fp4 = torch::empty({n, dep/2}, torch::dtype(torch::kUInt8).device(device));
+        auto a2_sc = torch::empty({n, dep/32}, torch::dtype(torch::kUInt8).device(device));
+        [&](){
+            int t = n * (dep/32);
+            auto a_ptr = reinterpret_cast<const hip_bfloat16*>(inter_bf16.data_ptr());
+            auto fp4_ptr = reinterpret_cast<uint8_t*>(a2_fp4.data_ptr());
+            auto sc_ptr = reinterpret_cast<uint8_t*>(a2_sc.data_ptr());
+#define D(k) if(dep==k){hipLaunchKernelGGL((mxfp4_quant_sw_bf16<k>),dim3((t+255)/256),dim3(256),0,0,a_ptr,fp4_ptr,sc_ptr,n);return;}
+            D(4096) D(7168) D(1024) D(2048) D(1536) D(256) D(512)
+#undef D
+        }();
+
+        // Stage 2: Down GEMM
+        auto dn_w = down_weight[eid];
+        auto dn_s = down_weight_scale.dim()==3 ? down_weight_scale[eid] : down_weight_scale.slice(0, eid*dhp, (eid+1)*dhp);
+        auto C2 = torch::zeros({n, dhp}, torch::dtype(torch::kFloat32).device(device));
+        [&](){
+            int N=dhp, K=dep;
+            dim3 grid((n+15)/16,(N+15)/16);
+            auto a_fp4 = reinterpret_cast<const uint8_t*>(a2_fp4.data_ptr());
+            auto a_sc = reinterpret_cast<const uint8_t*>(a2_sc.data_ptr());
+            auto b_fp4 = reinterpret_cast<const uint8_t*>(dn_w.view(torch::kUInt8).contiguous().data_ptr());
+            auto b_sc = reinterpret_cast<const uint8_t*>(dn_s.view(torch::kUInt8).contiguous().data_ptr());
+            auto c_ptr = reinterpret_cast<float*>(C2.data_ptr());
+#define D(nn,kk) if(N==nn&&K==kk){hipLaunchKernelGGL((moe_gemm_fp4xfp4<nn,kk>),grid,dim3(64),0,0,reinterpret_cast<const uint8_t(*)[kk/2]>(a_fp4),reinterpret_cast<const uint8_t(*)[kk/32]>(a_sc),reinterpret_cast<const uint8_t(*)[kk/2]>(b_fp4),reinterpret_cast<const uint8_t(*)[kk/32]>(b_sc),reinterpret_cast<float(*)[nn]>(c_ptr),n);return;}
+            D(2048,4096) D(4096,1024) D(4096,7168) D(7168,2048) D(3072,4096) D(4096,1536) D(512,7168) D(7168,256) D(1024,7168) D(7168,512)
+#undef D
+        }();
+
+        // Weighted scatter-add
+        {
+            int t = n * dhp;
+            hipLaunchKernelGGL(weighted_scatter_add_kernel,dim3((t+255)/256),dim3(256),0,0,
+                reinterpret_cast<float*>(output.data_ptr()),
+                reinterpret_cast<const float*>(C2.data_ptr()),
+                reinterpret_cast<const int64_t*>(tok_idx.data_ptr()),
+                reinterpret_cast<const float*>(w.data_ptr()),
+                n, dhp);
+        }
+    }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_mm_fp4xfp4", [](torch::Tensor A_fp4, torch::Tensor A_scale,
                                  torch::Tensor B_fp4, torch::Tensor B_scale,
@@ -377,6 +581,49 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #undef D
         TORCH_CHECK(false, "No quant_f32 template for K=", K);
     });
+    m.def("quant_sw_bf16", [](torch::Tensor A, torch::Tensor A_fp4, torch::Tensor A_scale, int M, int K) {
+        auto a_ptr = reinterpret_cast<const hip_bfloat16*>(A.data_ptr());
+        auto fp4_ptr = reinterpret_cast<uint8_t*>(A_fp4.data_ptr());
+        auto sc_ptr = reinterpret_cast<uint8_t*>(A_scale.data_ptr());
+#define D(k) if(K==k){int t=M*(k/32);hipLaunchKernelGGL((mxfp4_quant_sw_bf16<k>),dim3((t+255)/256),dim3(256),0,0,a_ptr,fp4_ptr,sc_ptr,M);return;}
+        D(4096) D(7168) D(1024) D(2048) D(1536) D(256) D(512)
+#undef D
+        TORCH_CHECK(false, "No quant_sw_bf16 for K=", K);
+    });
+    m.def("quant_sw_f32", [](torch::Tensor A, torch::Tensor A_fp4, torch::Tensor A_scale, int M, int K) {
+        auto a_ptr = reinterpret_cast<const float*>(A.data_ptr());
+        auto fp4_ptr = reinterpret_cast<uint8_t*>(A_fp4.data_ptr());
+        auto sc_ptr = reinterpret_cast<uint8_t*>(A_scale.data_ptr());
+#define D(k) if(K==k){int t=M*(k/32);hipLaunchKernelGGL((mxfp4_quant_sw_f32<k>),dim3((t+255)/256),dim3(256),0,0,a_ptr,fp4_ptr,sc_ptr,M);return;}
+        D(4096) D(7168) D(1024) D(2048) D(1536) D(256) D(512)
+#undef D
+        TORCH_CHECK(false, "No quant_sw_f32 for K=", K);
+    });
+    m.def("swiglu", [](torch::Tensor input, torch::Tensor output, int M, int N) {
+        auto in_ptr = reinterpret_cast<const float*>(input.data_ptr());
+        auto out_ptr = reinterpret_cast<float*>(output.data_ptr());
+#define D(n) if(N==n){int t=M*n;hipLaunchKernelGGL((swiglu_kernel<n>),dim3((t+255)/256),dim3(256),0,0,in_ptr,out_ptr,M);return;}
+        D(4096) D(7168) D(1024) D(2048) D(1536) D(256) D(512)
+#undef D
+      TORCH_CHECK(false, "No swiglu template for N=", N);
+    });
+    m.def("f32_to_bf16_trim", [](torch::Tensor input, torch::Tensor output, int M, int in_cols, int out_cols) {
+        int t = M * out_cols;
+        f32_to_bf16_trim_kernel<<<(t+255)/256, 256>>>(
+            reinterpret_cast<const float*>(input.data_ptr()),
+            reinterpret_cast<hip_bfloat16*>(output.data_ptr()),
+            M, in_cols, out_cols);
+    });
+    m.def("weighted_scatter_add", [](torch::Tensor output, torch::Tensor src, torch::Tensor indices, torch::Tensor weights, int n_tok, int N) {
+        int t = n_tok * N;
+        weighted_scatter_add_kernel<<<(t+255)/256, 256>>>(
+            reinterpret_cast<float*>(output.data_ptr()),
+            reinterpret_cast<const float*>(src.data_ptr()),
+            reinterpret_cast<const int64_t*>(indices.data_ptr()),
+            reinterpret_cast<const float*>(weights.data_ptr()),
+            n_tok, N);
+    });
+    m.def("moe_forward", &moe_forward);
 }
 '''
 
@@ -384,67 +631,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 # Python — Compilation, dequantization, per-expert helpers, MoE forward
 # ═══════════════════════════════════════════════════════════════════════
 
-MXFP4_BLOCK_SIZE = 32
-_FP4_LUT = None
-
-def _init_lut(device):
-    """Initialize FP4 E2M1 lookup table on the given device."""
-    global _FP4_LUT
-    if _FP4_LUT is None or _FP4_LUT.device != device:
-        _FP4_LUT = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-            dtype=torch.float32, device=device)
-
-def _mxfp4_to_f32(packed_fp4):
-    """Unpack fp4x2 packed bytes to float32 via LUT.
-    Each byte has two FP4 values: low nibble = even index, high nibble = odd index.
-    Input:  [..., K//2]  (float4_e2m1fn_x2 or uint8)
-    Output: [..., K]     (float32)
-    """
-    _init_lut(packed_fp4.device)
-    orig_shape = packed_fp4.shape
-    raw = packed_fp4.view(torch.uint8)
-    low = (raw & 0x0F).long()
-    high = ((raw >> 4) & 0x0F).long()
-    result = torch.stack([_FP4_LUT[low], _FP4_LUT[high]], dim=-1)
-    out_shape = list(orig_shape)
-    out_shape[-1] *= 2
-    return result.reshape(out_shape)
-
-def _e8m0_to_f32(scale_bytes):
-    """Convert E8M0 exponent bytes to float32 power-of-2 scales.
-    E8M0: value = 2^(exp - 127) for exp != 0, else 0.
-    Implemented via IEEE 754 bit manipulation: place exponent in bits [30:23].
-    Input:  [...]  (float8_e8m0fnu or uint8)
-    Output: [...]  (float32, same shape)
-    """
-    orig_shape = scale_bytes.shape
-    raw = scale_bytes.view(torch.uint8)
-    exp = raw.to(torch.int32)
-    float_bits = exp << 23
-    float_bits = torch.where(exp == 0, torch.zeros_like(float_bits), float_bits)
-    return float_bits.view(torch.float32).reshape(orig_shape)
-
-def _dequant_weight(weight_fp4, scale_e8m0, K):
-    """Dequantize one expert's MXFP4 weight to float32.
-    Applies per-block (block_size=32) E8M0 scaling:
-      dequant[row, col] = fp4_value[row, col] * e8m0_scale[row, col // 32]
-
-    Args:
-        weight_fp4:  [N, K//2] packed FP4 weight
-        scale_e8m0:  [N, K//32] E8M0 block scales
-        K:           unpacked column count
-    Returns: [N, K] float32
-    """
-    num_blocks = K // MXFP4_BLOCK_SIZE
-    w_f32 = _mxfp4_to_f32(weight_fp4)
-    s_f32 = _e8m0_to_f32(scale_e8m0)
-    N = w_f32.shape[0]
-    s_f32 = s_f32[:N, :num_blocks]
-    w_blocked = w_f32.view(N, num_blocks, MXFP4_BLOCK_SIZE)
-    scaled = w_blocked * s_f32.unsqueeze(-1)
-    return scaled.view(N, K)
 
 def _compile():
     global _mod
@@ -479,375 +665,168 @@ def _escale(scale_tensor, expert_idx, rows_per_expert):
         return scale_tensor[start : start + rows_per_expert]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Inlined from aiter.fused_moe — token sorting and dimension helpers
-# ═══════════════════════════════════════════════════════════════════════
-
-def _moe_sorting_impl(
-    topk_ids,
-    topk_weights,
-    num_experts,
-    model_dim,
-    moebuf_dtype,
-    block_size,
-    expert_mask,
-    num_local_tokens,
-    dispatch_policy,
-    use_opus,
-):
-    device = topk_ids.device
-    M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
-
-    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-
-    aiter.moe_sorting_fwd(
-        topk_ids,
-        topk_weights,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_buf,
-        num_experts,
-        int(block_size),
-        expert_mask,
-        num_local_tokens,
-        dispatch_policy,
-    )
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
-
-
-def moe_sorting(
-    topk_ids,
-    topk_weights,
-    num_experts,
-    model_dim,
-    moebuf_dtype,
-    block_size=32,
-    expert_mask=None,
-    num_local_tokens=None,
-    dispatch_policy=0,
-):
-    return _moe_sorting_impl(
-        topk_ids,
-        topk_weights,
-        num_experts,
-        model_dim,
-        moebuf_dtype,
-        block_size,
-        expert_mask,
-        num_local_tokens,
-        dispatch_policy,
-        use_opus=False,
-    )
-
-
-@functools.lru_cache(maxsize=2048)
-def get_inter_dim(w1_shape, w2_shape):
-    E, _, model_dim = w1_shape
-    E, model_dim, inter_dim = w2_shape
-    int4_war = model_dim // w1_shape[-1]
-    inter_dim *= int4_war
-    return E, model_dim, inter_dim
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Inlined from aiter.ops.triton.quant.fused_mxfp4_quant
-# ═══════════════════════════════════════════════════════════════════════
-
-def fused_dynamic_mxfp4_quant_moe_sort(
-    x,
-    sorted_ids,
-    num_valid_ids,
-    token_num,
-    topk,
-    block_size=32,
-    scaling_mode="even",
-):
-    from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
-        _fused_dynamic_mxfp4_quant_moe_sort_kernel,
-    )
-
-    M, N = x.shape
-    assert (N // 2) % 2 == 0
-
-    MXFP4_QUANT_BLOCK_SIZE = 32
-
-    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
-    scaleN = scaleN_valid
-
-    if M <= 32:
-        BLOCK_SIZE_Mx = 32
-    else:
-        BLOCK_SIZE_Mx = 128
-
-    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
-    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
-
-    N_i = scaleN
-    M_o, N_o = sorted_ids.shape[0], N_i
-    assert (N_i // 2) % 2 == 0
-    assert block_size % BLOCK_SIZE_M == 0
-
-    blockscale_e8m0_sorted = torch.empty(
-        (
-            triton.cdiv(M_o, BLOCK_SIZE_M),
-            triton.cdiv(N_o, BLOCK_SIZE_N),
-            BLOCK_SIZE_N_u32,
-            BLOCK_SIZE_M_u32,
-            4,
-        ),
-        dtype=torch.uint8,
-        device=x.device,
-    )
-
-    num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
-        M_o, BLOCK_SIZE_M
-    ) * triton.cdiv(N_i, BLOCK_SIZE_N)
-    _fused_dynamic_mxfp4_quant_moe_sort_kernel[(num_pid,)](
-        x,
-        x_fp4,
-        sorted_ids,
-        num_valid_ids,
-        blockscale_e8m0_sorted,
-        M,
-        N,
-        scaleN,
-        *x.stride(),
-        *x_fp4.stride(),
-        *blockscale_e8m0_sorted.stride(),
-        token_num,
-        M_o,
-        N_i,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,
-        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
-        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
-        TOPK=topk,
-    )
-
-    return (
-        x_fp4.view(dtypes.fp4x2),
-        blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o),
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Inlined from aiter.utility.fp4_utils — MoE scale sorting kernels
-# ═══════════════════════════════════════════════════════════════════════
 
 @triton.jit
-def _moe_mxfp4_sort_kernel(
-    blockscale_e8m0_ptr,
-    sorted_ids_ptr,
-    num_valid_ids_ptr,
-    blockscale_e8m0_sorted_ptr,
-    stride_blockscale_e8m0_m: tl.int64,
-    stride_blockscale_e8m0_n: tl.int64,
-    stride_o3: tl.int64,
-    stride_o2: tl.int64,
-    stride_o1: tl.int64,
-    stride_o0: tl.int64,
-    token_num,
-    N_i,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    TOPK: tl.constexpr,
+def _dynamic_mxfp4_quant_kernel_asm_layout(
+    x_ptr,
+    x_fp4_ptr,
+    bs_ptr,
+    stride_x_m,
+    stride_x_n,
+    stride_x_fp4_m,
+    stride_x_fp4_n,
+    stride_bs_m,
+    stride_bs_n,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    scaleN: tl.constexpr,
+    scaleM_pad: tl.constexpr,
+    scaleN_pad: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    SCALING_MODE: tl.constexpr,
+    SHUFFLE: tl.constexpr,
 ):
-    pid_m = tl.program_id(0) * 2
-    pid_n = tl.program_id(1) * 2
-    num_valid_ids = tl.load(num_valid_ids_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
-        return
-    out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
-    for m_idx in range(2):
-        m = m_idx * BLOCK_SIZE_M
-        sorted_ids_offs_m = pid_m * BLOCK_SIZE_M + m + tl.arange(0, BLOCK_SIZE_M)
-        sorted_ids_mask = sorted_ids_offs_m < num_valid_ids
-        raw_ids = tl.load(sorted_ids_ptr + sorted_ids_offs_m, mask=sorted_ids_mask, other=token_num)
-        token_ids = raw_ids & 0xFFFFFF
-        if TOPK == 1:
-            blockscale_e8m0_offs_m = token_ids
-        else:
-            blockscale_e8m0_offs_m = token_ids * TOPK + (raw_ids >> 24)
-        row_addrs = blockscale_e8m0_offs_m[:, None] * stride_blockscale_e8m0_m
-        row_mask = (token_ids < token_num)[:, None]
-        for n_idx in range(2):
-            i = m_idx + n_idx * 2
-            col_offs = pid_n * BLOCK_SIZE_N + n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            gather_offs = row_addrs + col_offs[None, :] * stride_blockscale_e8m0_n
-            col_mask = (col_offs < N_i)[None, :]
-            sub = tl.load(blockscale_e8m0_ptr + gather_offs, mask=row_mask & col_mask).to(tl.uint8, bitcast=True)
-            out = out | (sub.to(tl.uint32) << (i * 8))
-    offs_0 = tl.arange(0, BLOCK_SIZE_M)
-    offs_1 = tl.arange(0, BLOCK_SIZE_N)
-    offs = offs_0[:, None] * stride_o0 + offs_1[None, :] * stride_o1 + pid_n // 2 * stride_o2 + pid_m // 2 * stride_o3
-    tl.store(blockscale_e8m0_sorted_ptr + offs, out)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
+    stride_x_m = tl.cast(stride_x_m, tl.int64)
+    stride_x_n = tl.cast(stride_x_n, tl.int64)
+    stride_x_fp4_m = tl.cast(stride_x_fp4_m, tl.int64)
+    stride_x_fp4_n = tl.cast(stride_x_fp4_n, tl.int64)
 
-@triton.jit
-def _moe_mxfp4_sort_kernel_fused_n(
-    blockscale_e8m0_ptr,
-    sorted_ids_ptr,
-    num_valid_ids_ptr,
-    blockscale_e8m0_sorted_ptr,
-    stride_blockscale_e8m0_m: tl.int64,
-    stride_blockscale_e8m0_n: tl.int64,
-    stride_o3: tl.int64,
-    stride_o2: tl.int64,
-    stride_o1: tl.int64,
-    stride_o0: tl.int64,
-    token_num,
-    N_i,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    TOPK: tl.constexpr,
-    N_TILES: tl.constexpr,
-):
-    pid_m = tl.program_id(0) * 2
-    num_valid_ids = tl.load(num_valid_ids_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
-        return
-    offs_m0 = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    raw_0 = tl.load(sorted_ids_ptr + offs_m0, mask=offs_m0 < num_valid_ids, other=token_num)
-    tid_0 = raw_0 & 0xFFFFFF
-    if TOPK == 1:
-        ridx_0 = tid_0
+    x_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE + tl.arange(0, MXFP4_QUANT_BLOCK_SIZE)
+    x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
+    x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+    x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
+
+    # Calculate scale
+    amax = tl.max(tl.abs(x), axis=1, keep_dims=True)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+
+    # Compute quantized x
+    qx = x * quant_scale
+
+    # blockscale_e8m0
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127
+
+    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
+    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
+    #   Zeros: S000 -> +/-0
+    #   Denormal Numbers: S001 -> +/- 0.5
+    #   Normal Numbers:
+    #           S010 -> +/- 1.0
+    #           S011 -> +/- 1.5
+    #           S100 -> +/- 2.0
+    #           S101 -> +/- 3.0
+    #           S110 -> +/- 4.0
+    #           S111 -> +/- 6.0
+    # FP4 format constants
+    EXP_BIAS_FP32: tl.constexpr = 127
+    EXP_BIAS_FP4: tl.constexpr = 1
+    EBITS_F32: tl.constexpr = 8
+    EBITS_FP4: tl.constexpr = 2
+    MBITS_F32: tl.constexpr = 23
+    MBITS_FP4: tl.constexpr = 1
+
+    max_normal: tl.constexpr = 6
+    min_normal: tl.constexpr = 1
+
+    qx = qx.to(tl.uint32, bitcast=True)
+
+    # Extract sign
+    s = qx & 0x80000000
+    # Set everything to positive, will add sign back at the end
+    qx = qx ^ s
+
+    qx_fp32 = qx.to(tl.float32, bitcast=True)
+    saturate_mask = qx_fp32 >= max_normal
+    denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
+    normal_mask = not (saturate_mask | denormal_mask)
+
+    # Denormal numbers
+    denorm_exp: tl.constexpr = (
+        (EXP_BIAS_FP32 - EXP_BIAS_FP4) + (MBITS_F32 - MBITS_FP4) + 1
+    )
+    denorm_mask_int: tl.constexpr = denorm_exp << MBITS_F32
+    denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
+
+    denormal_x = qx_fp32 + denorm_mask_float
+    denormal_x = denormal_x.to(tl.uint32, bitcast=True)
+    denormal_x -= denorm_mask_int
+    denormal_x = denormal_x.to(tl.uint8)
+
+    # Normal numbers
+    normal_x = qx
+    # resulting mantissa is odd
+    mant_odd = (normal_x >> (MBITS_F32 - MBITS_FP4)) & 1
+    # update exponent, rounding bias part 1
+    val_to_add = ((EXP_BIAS_FP4 - EXP_BIAS_FP32) << MBITS_F32) + (1 << 21) - 1
+    normal_x += val_to_add
+    # rounding bias part 2
+    normal_x += mant_odd
+    # take the bits!
+    normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
+    normal_x = normal_x.to(tl.uint8)
+
+    # Merge results
+    e2m1_value = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
+    e2m1_value = tl.where(normal_mask, normal_x, e2m1_value)
+    e2m1_value = tl.where(denormal_mask, denormal_x, e2m1_value)
+
+    # add sign back
+    sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
+    sign_lp = sign_lp.to(tl.uint8)
+    e2m1_value = e2m1_value | sign_lp
+
+    e2m1_value = tl.reshape(e2m1_value, [BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE // 2, 2])
+    evens, odds = tl.split(e2m1_value)
+    out_tensor = evens | (odds << 4)
+
+    out_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    out_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE // 2 + tl.arange(
+        0, MXFP4_QUANT_BLOCK_SIZE // 2
+    )
+    out_offs = (
+        out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
+    )
+    out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
+    tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+
+    bs_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    bs_offs_n = pid_n
+
+    if SHUFFLE:
+        bs_offs_0 = bs_offs_m[:, None] // 32
+        bs_offs_1 = bs_offs_m[:, None] % 32
+        bs_offs_2 = bs_offs_1 % 16
+        bs_offs_1 = bs_offs_1 // 16
+        bs_offs_3 = bs_offs_n[None, :] // 8
+        bs_offs_4 = bs_offs_n[None, :] % 8
+        bs_offs_5 = bs_offs_4 % 4
+        bs_offs_4 = bs_offs_4 // 4
+        bs_offs = (
+            bs_offs_1
+            + bs_offs_4 * 2
+            + bs_offs_2 * 2 * 2
+            + bs_offs_5 * 2 * 2 * 16
+            + bs_offs_3 * 2 * 2 * 16 * 4
+            + bs_offs_0 * 2 * 16 * scaleN
+        )
+        bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+        bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
+        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
     else:
-        ridx_0 = tid_0 * TOPK + (raw_0 >> 24)
-    raddr_0 = ridx_0[:, None] * stride_blockscale_e8m0_m
-    rmask_0 = (tid_0 < token_num)[:, None]
-    offs_m1 = offs_m0 + BLOCK_SIZE_M
-    raw_1 = tl.load(sorted_ids_ptr + offs_m1, mask=offs_m1 < num_valid_ids, other=token_num)
-    tid_1 = raw_1 & 0xFFFFFF
-    if TOPK == 1:
-        ridx_1 = tid_1
-    else:
-        ridx_1 = tid_1 * TOPK + (raw_1 >> 24)
-    raddr_1 = ridx_1[:, None] * stride_blockscale_e8m0_m
-    rmask_1 = (tid_1 < token_num)[:, None]
-    offs_row = tl.arange(0, BLOCK_SIZE_M)
-    offs_col = tl.arange(0, BLOCK_SIZE_N)
-    store_base = pid_m // 2 * stride_o3
-    for n_tile in range(N_TILES):
-        pid_n = n_tile * 2
-        out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
-        for m_idx in range(2):
-            if m_idx == 0:
-                cur_raddr = raddr_0
-                cur_rmask = rmask_0
-            else:
-                cur_raddr = raddr_1
-                cur_rmask = rmask_1
-            for n_idx in range(2):
-                i = m_idx + n_idx * 2
-                col_offs = pid_n * BLOCK_SIZE_N + n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-                gather_offs = cur_raddr + col_offs[None, :] * stride_blockscale_e8m0_n
-                col_mask = (col_offs < N_i)[None, :]
-                sub = tl.load(blockscale_e8m0_ptr + gather_offs, mask=cur_rmask & col_mask).to(tl.uint8, bitcast=True)
-                out = out | (sub.to(tl.uint32) << (i * 8))
-        store_offs = offs_row[:, None] * stride_o0 + offs_col[None, :] * stride_o1 + n_tile * stride_o2 + store_base
-        tl.store(blockscale_e8m0_sorted_ptr + store_offs, out)
-
-
-def moe_mxfp4_sort(blockscale_e8m0, sorted_ids, num_valid_ids, token_num, block_size=32):
-    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
-    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
-    topk = 1
-    if len(blockscale_e8m0.shape) == 3:
-        topk = blockscale_e8m0.shape[1]
-        blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
-    M_i, N_i = blockscale_e8m0.shape
-    M_o, N_o = sorted_ids.shape[0], N_i
-    assert (N_i // 2) % 2 == 0
-    assert block_size % BLOCK_SIZE_M == 0
-    blockscale_e8m0_sorted = torch.empty(
-        (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_o, BLOCK_SIZE_N), BLOCK_SIZE_N_u32, BLOCK_SIZE_M_u32),
-        dtype=torch.uint32, device=blockscale_e8m0.device,
-    )
-    _FUSED_N_THRESHOLD = 2048
-    common_args = (
-        blockscale_e8m0.view(torch.uint8), sorted_ids, num_valid_ids, blockscale_e8m0_sorted,
-        *blockscale_e8m0.stride(), *blockscale_e8m0_sorted.stride(),
-    )
-    common_kwargs = dict(token_num=token_num, N_i=N_i, BLOCK_SIZE_M=BLOCK_SIZE_M // 2, BLOCK_SIZE_N=BLOCK_SIZE_N // 2, TOPK=topk)
-    if token_num > _FUSED_N_THRESHOLD:
-        N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
-        grid = (triton.cdiv(M_o, BLOCK_SIZE_M),)
-        _moe_mxfp4_sort_kernel_fused_n[grid](*common_args, **common_kwargs, N_TILES=N_TILES)
-    else:
-        grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
-        _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
-    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Inlined from aiter.ops.moe_op — CK MoE stage forward wrappers
-# ═══════════════════════════════════════════════════════════════════════
-
-_dtype2str_dict = {
-    torch.float16: "f16",
-    torch.bfloat16: "b16",
-}
-
-
-def ck_moe_stage1_fwd(
-    hidden_states, w1, w2, sorted_token_ids, sorted_expert_ids,
-    num_valid_ids, out, topk, kernelName="",
-    w1_scale=None, a1_scale=None, block_m=32,
-    sorted_weights=None, quant_type=None, activation=None,
-    splitk=1, use_non_temporal_load=False, dst_type=None,
-):
-    if quant_type is None:
-        quant_type = QuantType.No
-    if activation is None:
-        activation = ActivationType.Silu
-    aiter.ck_moe_stage1(
-        hidden_states, w1, w2,
-        sorted_token_ids, sorted_expert_ids, num_valid_ids,
-        out, topk, kernelName,
-        w1_scale, a1_scale, block_m,
-        sorted_weights,
-        quant_type.value, activation.value,
-        int(splitk) if splitk is not None else splitk,
-        use_non_temporal_load,
-        None if dst_type is None else _dtype2str_dict.get(dst_type),
-        is_shuffled=getattr(w1, "is_shuffled", False),
-    )
-    return out
-
-
-def ck_moe_stage2_fwd(
-    inter_states, w1, w2, sorted_token_ids, sorted_expert_ids,
-    num_valid_ids, out, topk, kernelName="",
-    w2_scale=None, a2_scale=None, block_m=32,
-    sorted_weights=None, quant_type=None, activation=None,
-    use_non_temporal_load=False,
-):
-    if quant_type is None:
-        quant_type = QuantType.No
-    if activation is None:
-        activation = ActivationType.Silu
-    aiter.ck_moe_stage2(
-        inter_states, w1, w2,
-        sorted_token_ids, sorted_expert_ids, num_valid_ids,
-        out, topk, kernelName,
-        w2_scale, a2_scale, block_m,
-        sorted_weights,
-        quant_type.value, activation.value,
-        use_non_temporal_load=use_non_temporal_load,
-        is_shuffled=getattr(w2, "is_shuffled", False),
-    )
-    return out
+        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+        bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < N)[None, :]
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 def dynamic_mxfp4_quant(
     x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
@@ -916,21 +895,6 @@ def dynamic_mxfp4_quant(
     return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
 
 
-def _dequant_gemm(A_fp4, A_scale, B_fp4, B_scale, K):
-    """Dequantize FP4 A and B and run torch.mm for correctness validation."""
-    a_f32 = _mxfp4_to_f32(A_fp4)
-    b_f32 = _mxfp4_to_f32(B_fp4)
-    num_blocks = K // 32
-    M_a = a_f32.shape[0]
-    N_b = b_f32.shape[0]
-    as_f32 = _e8m0_to_f32(A_scale)[:M_a, :num_blocks]
-    bs_f32 = _e8m0_to_f32(B_scale)[:N_b, :num_blocks]
-    a_blocked = a_f32.view(M_a, num_blocks, 32)
-    b_blocked = b_f32.view(N_b, num_blocks, 32)
-    a_scaled = (a_blocked * as_f32.unsqueeze(-1)).view(M_a, K)
-    b_scaled = (b_blocked * bs_f32.unsqueeze(-1)).view(N_b, K)
-    return torch.mm(a_scaled, b_scaled.T)
-
 
 def custom_kernel(data: input_t) -> output_t:
     """MoE forward pass using custom HIP MFMA FP4xFP4 kernels."""
@@ -941,16 +905,11 @@ def custom_kernel(data: input_t) -> output_t:
      topk_weights, topk_ids, config) = data
 
     dh = config["d_hidden"]
-    de = config["d_expert"]
-    dhp = config["d_hidden_pad"]
     dep = config["d_expert_pad"]
+    dhp = config["d_hidden_pad"]
     M = config["bs"]
     E = gate_up_weight.shape[0]
-    top_k = topk_ids.shape[1]
     device = hidden_states.device
-
-    USE_HIP_QUANT = False
-    USE_HIP_GEMM = True
 
     if not _compile():
         return torch.zeros(M, dh, dtype=torch.bfloat16, device=device)
@@ -962,75 +921,12 @@ def custom_kernel(data: input_t) -> output_t:
 
     output = torch.zeros(M, dhp, dtype=torch.float32, device=device)
 
-    for expert_id in range(E):
-        mask = (topk_ids == expert_id)
-        if not mask.any():
-            continue
+    _mod.moe_forward(
+        hidden_padded, gate_up_weight, down_weight,
+        gate_up_weight_scale, down_weight_scale,
+        topk_weights, topk_ids, output,
+        E, dep, dhp)
 
-        token_indices, k_indices = torch.where(mask)
-        weights = topk_weights[token_indices, k_indices]
-        x = hidden_padded[token_indices].contiguous()
-        n_tok = x.shape[0]
-
-        # Stage 1: Quantize BF16 activations to MXFP4
-        if USE_HIP_QUANT:
-            a1_fp4 = torch.empty(n_tok, dhp // 2, dtype=torch.uint8, device=device)
-            a1_scale = torch.empty(n_tok, dhp // 32, dtype=torch.uint8, device=device)
-            _mod.quant_bf16(x, a1_fp4, a1_scale, n_tok, dhp)
-        else:
-            a1_fp4_raw, a1_scale_raw = dynamic_mxfp4_quant(x, shuffle=False)
-            a1_fp4 = a1_fp4_raw.view(torch.uint8)
-            a1_scale = a1_scale_raw.view(torch.uint8)[:n_tok, :dhp // 32].contiguous()
-
-        # Stage 1: Gate_up GEMM [n_tok, dhp] x [2*dep, dhp]^T -> [n_tok, 2*dep]
-        gu_w = gate_up_weight[expert_id]
-        gu_s = _escale(gate_up_weight_scale, expert_id, 2 * dep)
-
-        if USE_HIP_GEMM:
-            C1 = torch.zeros(n_tok, 2 * dep, dtype=torch.float32, device=device)
-            _mod.moe_mm_fp4xfp4(
-                a1_fp4, a1_scale,
-                gu_w.view(torch.uint8).contiguous(), gu_s.view(torch.uint8).contiguous(),
-                C1, n_tok, 2 * dep, dhp)
-        else:
-            C1 = _dequant_gemm(
-                a1_fp4, a1_scale,
-                gu_w.view(torch.uint8).contiguous(), gu_s.view(torch.uint8).contiguous(),
-                dhp)
-
-        # SwiGLU activation
-        gate = C1[:, :dep]
-        up = C1[:, dep:]
-        intermediate = F.silu(gate) * up
-
-        # Stage 2: Quantize F32 intermediate to MXFP4
-        if USE_HIP_QUANT:
-            a2_fp4 = torch.empty(n_tok, dep // 2, dtype=torch.uint8, device=device)
-            a2_scale = torch.empty(n_tok, dep // 32, dtype=torch.uint8, device=device)
-            _mod.quant_f32(intermediate.contiguous(), a2_fp4, a2_scale, n_tok, dep)
-        else:
-            quant_func = aiter.get_triton_quant(QuantType.per_1x32)
-            a2_fp4_raw, a2_scale_raw = quant_func(intermediate.to(torch.bfloat16), shuffle=False)
-            a2_fp4 = a2_fp4_raw.view(torch.uint8)
-            a2_scale = a2_scale_raw.view(torch.uint8)[:n_tok, :dep // 32].contiguous()
-
-        # Stage 2: Down GEMM [n_tok, dep] x [dhp, dep]^T -> [n_tok, dhp]
-        dn_w = down_weight[expert_id]
-        dn_s = _escale(down_weight_scale, expert_id, dhp)
-
-        if USE_HIP_GEMM:
-            C2 = torch.zeros(n_tok, dhp, dtype=torch.float32, device=device)
-            _mod.moe_mm_fp4xfp4(
-                a2_fp4, a2_scale,
-                dn_w.view(torch.uint8).contiguous(), dn_s.view(torch.uint8).contiguous(),
-                C2, n_tok, dhp, dep)
-        else:
-            C2 = _dequant_gemm(
-                a2_fp4, a2_scale,
-                dn_w.view(torch.uint8).contiguous(), dn_s.view(torch.uint8).contiguous(),
-                dep)
-
-        # Weighted accumulation
-        output.index_add_(0, token_indices, weights.unsqueeze(1) * C2)
-
-    return output[:, :dh].to(torch.bfloat16)
+    result = torch.empty(M, dh, dtype=torch.bfloat16, device=device)
+    _mod.f32_to_bf16_trim(output, result, M, dhp, dh)
+    return result

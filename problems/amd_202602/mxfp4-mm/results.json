@@ -1,5 +1,5 @@
 "**MI355X on GitHub ✅ success**
-> Workflow [24007313682](<https://github.com/gpu-mode/kernelbot/actions/runs/24007313682>) completed
+> Workflow [24018923142](<https://github.com/gpu-mode/kernelbot/actions/runs/24018923142>) completed
 > Downloading artifacts... done
 > ✅ Compilation successful
 > ✅ Benchmarking successful
@@ -11,45 +11,45 @@ Running on:
 * Runtime: `ROCm`
 * Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
 * Torch: `2.10.0+rocm7.1`
-* Hostname: `arc-runner-set-hbp2z-runner-ks6cg`
+* Hostname: `arc-runner-set-hbp2z-runner-d2d4t`
 
 
 ## Benchmarks:
 ```
 k: 512; m: 4; n: 2880; seed: 4565
- ⏱ 8.99 ± 0.018 µs
- ⚡ 8.32 µs 🐌 13.1 µs
+ ⏱ 9.27 ± 0.017 µs
+ ⚡ 8.88 µs 🐌 14.0 µs
 
 k: 7168; m: 16; n: 2112; seed: 15
- ⏱ 13.8 ± 0.02 µs
- ⚡ 13.0 µs 🐌 18.6 µs
+ ⏱ 12.7 ± 0.02 µs
+ ⚡ 12.1 µs 🐌 17.8 µs
 
 k: 512; m: 32; n: 4096; seed: 457
- ⏱ 9.20 ± 0.018 µs
- ⚡ 8.60 µs 🐌 13.4 µs
+ ⏱ 8.97 ± 0.017 µs
+ ⚡ 8.40 µs 🐌 13.5 µs
 
 k: 512; m: 32; n: 2880; seed: 54
- ⏱ 9.13 ± 0.020 µs
- ⚡ 8.44 µs 🐌 14.0 µs
+ ⏱ 8.92 ± 0.017 µs
+ ⚡ 8.36 µs 🐌 13.5 µs
 
 k: 2048; m: 64; n: 7168; seed: 687
  ⏱ 18.1 ± 0.02 µs
- ⚡ 17.3 µs 🐌 23.6 µs
+ ⚡ 17.3 µs 🐌 23.4 µs
 
 k: 1536; m: 256; n: 3072; seed: 7856
  ⏱ 16.0 ± 0.02 µs
- ⚡ 15.4 µs 🐌 20.9 µs
+ ⚡ 15.3 µs 🐌 25.4 µs
 ```
 
 ## Program stderr:
 ```
 [aiter] start build [module_aiter_enum] under /home/runner/aiter/aiter/jit/build/module_aiter_enum
-[aiter] \u001b[32mfinish build [module_aiter_enum], cost 7.9s \u001b[0m
+[aiter] \u001b[32mfinish build [module_aiter_enum], cost 7.8s \u001b[0m
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 [aiter] import [module_aiter_enum] under /home/runner/aiter/aiter/jit/module_aiter_enum.so
 \u001b[92mSuccessfully preprocessed all matching files.\u001b[0m
 [aiter] start build [module_gemm_common] under /home/runner/aiter/aiter/jit/build/module_gemm_common
-[aiter] \u001b[32mfinish build [module_gemm_common], cost 22.2s \u001b[0m
+[aiter] \u001b[32mfinish build [module_gemm_common], cost 22.7s \u001b[0m
 [aiter] import [module_gemm_common] under /home/runner/aiter/aiter/jit/module_gemm_common.so
 [aiter] type hints mismatch, override to --> get_padded_m(M: int | typing.SupportsIndex, N: int | typing.SupportsIndex, K: int | typing.SupportsIndex, gl: int | typing.SupportsIndex) -> int
 [aiter] shape is M:4, N:2880, K:512, not found tuned config in CKGEMM or asmGEMM, will use default config!
@@ -58,7 +58,7 @@ k: 1536; m: 256; n: 3072; seed: 7856
   pd.set_option(\"future.no_silent_downcasting\", True)
 /home/runner/aiter/hsa/codegen.py:86: Pandas4Warning: The copy keyword is deprecated and will be removed in a future version. Copy-on-Write is active in pandas since 3.0 which utilizes a lazy copy mechanism that defers copies until necessary. Use .copy() to make an eager copy if necessary.
   pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
-[aiter] \u001b[32mfinish build [module_gemm_a4w4_asm], cost 20.1s \u001b[0m
+[aiter] \u001b[32mfinish build [module_gemm_a4w4_asm], cost 20.0s \u001b[0m
 [aiter] import [module_gemm_a4w4_asm] under /home/runner/aiter/aiter/jit/module_gemm_a4w4_asm.so
 [aiter] type hints mismatch, override to --> gemm_a4w4_asm(A: torch.Tensor, B: torch.Tensor, A_scale: torch.Tensor, B_scale: torch.Tensor, out: torch.Tensor, kernelName: str, bias: Optional[torch.Tensor] = None, alpha: float | Optional[typing.SupportsIndex] = 1.0, beta: float | Optional[typing.SupportsIndex] = 0.0, bpreshuffle: Optional[bool] = True, log2_k_split: int | Optional[typing.SupportsIndex] = None) -> torch.Tensor
 [aiter] shape is M:16, N:2112, K:7168, not found tuned config in CKGEMM or asmGEMM, will use default config!

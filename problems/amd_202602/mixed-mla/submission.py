@@ -93,7 +93,7 @@ __device__ __forceinline__ void mla_qkt_mfma(
     const uint8_t q_data[][A_K_HALF],
     const uint8_t q_scale[],
     const uint8_t kv_data[][K_HALF + KV_PAD],
-    const uint8_t kv_scale[][B_SCALE_STRIDE + KV_PAD],
+    const float kv_scale[][B_SCALE_STRIDE],
     float scores[][KV_SUBTILE],
     float sm_scale,
     int lane, int warp_id
@@ -138,7 +138,7 @@ __device__ __forceinline__ void mla_qkt_mfma(
             }
             uint8_t kb_e = 127;
             if (kb_abs < KV_SUBTILE && kb_blk < NUM_BLOCKS)
-                kb_e = kv_scale[kb_abs][kb_blk];
+                kb_e = (uint8_t)(__float_as_uint(kv_scale[kb_abs][kb_blk]) >> 23);
             else
                 kb_reg[0] = kb_reg[1] = kb_reg[2] = kb_reg[3] = 0;
             int32_t kb_sc = mla_broadcast_scale(kb_e);
@@ -164,7 +164,7 @@ __device__ __forceinline__ void mla_qkt_mfma(
 template <int KV_SUBTILE, int K_HALF, int B_SCALE_STRIDE, int BLOCK_SIZE, int KV_PAD = 0>
 __device__ __forceinline__ void mla_load_kv_tile(
     uint8_t kv_buf[][K_HALF + KV_PAD],
-    uint8_t kv_scale_buf[][B_SCALE_STRIDE + KV_PAD],
+    float kv_scale_buf[][B_SCALE_STRIDE],
     const uint8_t kv_src[][K_HALF],
     const uint8_t kv_scale_src[][B_SCALE_STRIDE],
     int kv_row_start, int tid
@@ -195,7 +195,7 @@ __device__ __forceinline__ void mla_load_kv_tile(
     for (int i = tid; i < TOTAL_SC; i += BLOCK_SIZE) {
         const int row = i / B_SCALE_STRIDE;
         const int blk = i % B_SCALE_STRIDE;
-        kv_scale_buf[row][blk] = kv_scale_src[kv_row_start + row][blk];
+        kv_scale_buf[row][blk] = e8m0_to_float_fast(kv_scale_src[kv_row_start + row][blk]);
     }
 }
 
@@ -427,18 +427,8 @@ __device__ __forceinline__ QuantBlock quantize_fp4_block_bf16(const hip_bfloat16
     return result;
 }
 
-// Quantize 32 float values to packed FP4 + E8M0 scale.
-// Uses FP32 hw intrinsic directly (no BF16 intermediate).
-__device__ __forceinline__ QuantBlock quantize_fp4_block(const float vals[32]) {
-    // Find amax in FP32
-    float amax = 0.0f;
-    for (int i = 0; i < 32; i++) {
-        float a = fabsf(vals[i]);
-        amax = (a > amax) ? a : amax;
-    }
-
-    E8M0Scale sc = compute_e8m0_scale_f32(amax);
-
+// Quantize 32 float values with pre-computed amax (skips amax search).
+__device__ __forceinline__ QuantBlock quantize_fp4_block_with_scale(const float vals[32], E8M0Scale sc) {
     uint32_t pack[4];
     for (int j = 0; j < 4; j++) {
         int base = j << 3;
@@ -473,6 +463,7 @@ struct MlaMfmaTraits {
     static constexpr int IK = USE_32x32 ? 64 : 128;
     static constexpr int BPC = IK / 32;
     static constexpr int ACC_SIZE = USE_32x32 ? 16 : 4;
+    static constexpr int VALID_ACC = USE_32x32 ? 8 : 4;
 
     static __device__ __forceinline__ acc_t mfma(
         int8_vec a, int32_t a_sc, int8_vec b, int32_t b_sc, acc_t acc
@@ -488,10 +479,10 @@ struct MlaMfmaTraits {
 
     // Map accumulator element index + lane to head index
     static __device__ __forceinline__ int acc_to_head(int i, int lane) {
-        if constexpr (USE_32x32) {
+        if constexpr (USE_32x32) { // i : [0, 16)
             int half = lane / 32;
             return (i % 4) + 4 * half + 8 * (i / 4);
-        } else {
+        } else {  // i : [0, 4)
             int quad = lane / 16;
             return i + 4 * quad;
         }
@@ -510,10 +501,11 @@ struct MlaMfmaTraits {
     ) {
         int col = lane_to_col(lane);
         int eff_col = batch_col_offset + col;
-        for (int i = 0; i < ACC_SIZE; i++) {
-            int head = acc_to_head(i, lane);
-            if (head < HEADS && eff_col < KV_SUBTILE)
+        if (eff_col < KV_SUBTILE) {
+            for (int i = 0; i < VALID_ACC; i++) {
+                int head = acc_to_head(i, lane);
                 scores[head][eff_col] = acc[i] * sm_scale;
+            }
         }
     }
 
@@ -523,10 +515,9 @@ struct MlaMfmaTraits {
         acc_t v_acc[], int lane, const float rescale[]
     ) {
         for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
-            for (int i = 0; i < ACC_SIZE; i++) {
+            for (int i = 0; i < VALID_ACC; i++) {
                 int head = acc_to_head(i, lane);
-                if (head < HEADS)
-                    v_acc[ci][i] *= rescale[head];
+                v_acc[ci][i] *= rescale[head];
             }
         }
     }
@@ -541,10 +532,10 @@ struct MlaMfmaTraits {
         int col = lane_to_col(lane);
         for (int ci = 0; ci < CHUNKS_PER_WARP; ci++) {
             int chunk = warp_id * CHUNKS_PER_WARP + ci;
-            for (int i = 0; i < ACC_SIZE; i++) {
+            for (int i = 0; i < VALID_ACC; i++) {
                 int head = acc_to_head(i, lane);
                 int v_dim = chunk * IM + col;
-                if (head < HEADS && v_dim < V_DIM) {
+                if (v_dim < V_DIM) {
                     float rs = running_sum_lds[head][0];
                     float inv_sum = (rs > 0.0f) ? (1.0f / rs) : 0.0f;
                     partial_out[out_row][head * V_DIM + v_dim] = v_acc[ci][i] * inv_sum;
@@ -563,7 +554,7 @@ template <typename Traits, int HEADS, int KV_SUBTILE, int K_HALF,
 __device__ __forceinline__ void mla_mfma_attn_v(
     const float scores[][KV_SUBTILE],
     const uint8_t kv_data[][K_HALF + KV_PAD],
-    const uint8_t kv_scale[][B_SCALE_STRIDE + KV_PAD],
+    const float kv_scale[][B_SCALE_STRIDE],
     typename Traits::acc_t v_acc[CHUNKS_PER_WARP],
     int32_t b_sc_one,
     int lane, int warp_id
@@ -579,20 +570,25 @@ __device__ __forceinline__ void mla_mfma_attn_v(
 
     const int mfma_a_row = lane % IM;
     const int mfma_a_kgrp = lane / IM;
-    const int mfma_b_col = lane % IM;
-    const int mfma_b_kgrp = lane / IM;
+    const int mfma_b_col = mfma_a_row;
+    const int mfma_b_kgrp = mfma_a_kgrp;
 
     for (int si = 0; si < SCALE_BLOCKS_PER_WARP; si++) {
         const int vscale_blk = warp_id * SCALE_BLOCKS_PER_WARP + si;
         const int k_base_a = mfma_a_kgrp * 32;
         float scaled_attn[32];
+        float amax = 0.0f;
         for (int j = 0; j < 32; j++) {
             float aw = (IM <= HEADS || mfma_a_row < HEADS)
                 ? scores[mfma_a_row][k_base_a + j] : 0.0f;
-            const float vs = e8m0_to_float_fast(kv_scale[k_base_a + j][vscale_blk]);
-            scaled_attn[j] = aw * vs;
+            const float vs = kv_scale[k_base_a + j][vscale_blk];
+            float val = aw * vs;
+            scaled_attn[j] = val;
+            float a = fabsf(val);
+            amax = (a > amax) ? a : amax;
         }
-        QuantBlock aqb = quantize_fp4_block(scaled_attn);
+        auto scale = compute_e8m0_scale_f32(amax);
+        QuantBlock aqb = quantize_fp4_block_with_scale(scaled_attn, scale);
 
         uint32_t a_reg[8] = {};
         *reinterpret_cast<uint128_vec*>(&a_reg[0]) =
@@ -723,8 +719,8 @@ void mla_fused_attn_kernel(
     // MFMA lane indices (used for both QK^T and V accumulation)
     const int mfma_a_row = lane % IM;
     const int mfma_a_kgrp = lane / IM;
-    const int mfma_b_col = lane % IM;
-    const int mfma_b_kgrp = lane / IM;
+    const int mfma_b_col = mfma_a_row;
+    const int mfma_b_kgrp = mfma_a_kgrp;
     const int32_t b_sc_one = mla_broadcast_scale(127);
 
     // ---- Step 1: Quantize Q from BF16 to MXFP4 directly into LDS ----
@@ -759,7 +755,7 @@ void mla_fused_attn_kernel(
     constexpr int KV_BUFS = (NUM_SUBTILES > 1) ? 2 : 1;
     constexpr int KV_PAD = (KV_SUBTILE >= 64) ? 4 : 0;
     __shared__ uint8_t kv_lds_data[KV_BUFS][KV_SUBTILE][K_HALF + KV_PAD];
-    __shared__ uint8_t kv_lds_scale_tile[KV_BUFS][KV_SUBTILE][B_SCALE_STRIDE + KV_PAD];
+    __shared__ float kv_lds_scale_tile[KV_BUFS][KV_SUBTILE][B_SCALE_STRIDE];
     __shared__ float   scores_lds[HEADS][KV_SUBTILE];
 
     PROFILE_START(t_phase)
@@ -930,8 +926,6 @@ MLA_MXFP4_CPP_SOURCE = r'''
 // and the reduce kernel has per-split overhead
 template <int BATCH_SIZE, int N>
 constexpr int get_fused_kv_split() {
-    // Target: ~256 blocks minimum for good CU utilization (256 CUs on MI355X)
-    // Each block = (batch, split), so blocks = BATCH_SIZE * splits
     if constexpr (BATCH_SIZE == 4 && N == 1024) return 16;
     else if constexpr (BATCH_SIZE == 4 && N == 8192) return 48;
     else if constexpr (BATCH_SIZE == 32 && N == 1024) return 8;
@@ -1110,26 +1104,18 @@ torch::Tensor mla_mxfp4_pipeline(
     //   bs=64/kv=1024: 61.6µs MXFP4 | bs=64/kv=8192: 234µs aiter
     //   bs=256/kv=1024: 143µs MXFP4 | bs=256/kv=8192: 385µs aiter
     //
-    // === CURRENT WINNERS (Trial 4) ===
-    // bs=4, kv=1024: DB=true, BS=256, KV=64 → 35.9µs (Trial 1)
     MLA_FUSED(4, 1024, 18, 256, 64, false);
     MLA_FUSED(4, 1024, 24, 256, 64, false);
-    // bs=4, kv=8192: no-DB, BS=512, KV=128 → 39.4µs (Trial 1)
     MLA_FUSED(4, 8192, 18, 512, 32, false);
     MLA_FUSED(4, 8192, 24, 512, 32, false);
-    // bs=32, kv=1024: BS=512, KV=128
     MLA_FUSED(32, 1024, 18, 512, 128, false);
     MLA_FUSED(32, 1024, 24, 512, 128, false);
-    // bs=32, kv=8192: no-DB, BS=256, KV=128 → 189µs (both trials same)
-    MLA_FUSED(32, 8192, 18, 256, 48, false);
-    MLA_FUSED(32, 8192, 24, 256, 48, false);
-    // bs=64, kv=1024: BS=256, KV=128 → 60.2µs (Trial 1)
+    MLA_FUSED(32, 8192, 18, 256, 96, false);
+    MLA_FUSED(32, 8192, 24, 256, 96, false);
     MLA_FUSED(64, 1024, 18, 256, 128, false);
     MLA_FUSED(64, 1024, 24, 256, 128, false);
-    // bs=64, kv=8192: no-DB, BS=128, KV=128 → 306µs (Trial 1 best)
-    MLA_FUSED(64, 8192, 18, 256, 48, false);
-    MLA_FUSED(64, 8192, 24, 256, 48, false);
-    // bs=256, kv=1024: no-DB, BS=512, KV=128 → 139µs (Trial 2)
+    MLA_FUSED(64, 8192, 18, 256, 96, false);
+    MLA_FUSED(64, 8192, 24, 256, 96, false);
     MLA_FUSED(256, 1024, 18, 512, 128, false);
     MLA_FUSED(256, 1024, 24, 512, 128, false);
     // bs=256, kv=8192: no-DB, BS=128, KV=128 → 1038µs (Trial 1 best)
