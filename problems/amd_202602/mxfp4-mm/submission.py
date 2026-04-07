@@ -254,6 +254,15 @@ __device__ __forceinline__ QuantResult<VALS_PER_THREAD> quantize_block_parallel(
     return result;
 }
 
+// Direct global->LDS 16-byte transfer (bypasses VGPRs)
+// Decomposes into 4x4-byte loads for ROCm 7.1 compatibility (size=16 not supported)
+/*__device__ __forceinline__ void global_load_lds_16(const void* src, void* dst) {
+    __builtin_amdgcn_global_load_lds(src, dst, 4, 0, 0);
+    __builtin_amdgcn_global_load_lds((const char*)src + 4, dst, 4, 4, 0);
+    __builtin_amdgcn_global_load_lds((const char*)src + 8, dst, 4, 8, 0);
+    __builtin_amdgcn_global_load_lds((const char*)src + 12, dst, 4, 12, 0);
+}*/
+
 template <int K, int OUTER_M, int OUTER_K, int WARPS_M, int WARPS_N>
 struct QuantAPerThread {
     static_assert(OUTER_M % WARPS_M == 0);
@@ -263,6 +272,7 @@ struct QuantAPerThread {
     static constexpr int ELEMS_PER_THREAD = 32;
     static constexpr int OK_BLOCKS = OUTER_K / 32;
     static constexpr int K_HALF = K / 2;
+    static constexpr int OK_HALF = OUTER_K / 2;
     static constexpr int NUM_BLOCKS = K / 32;
     static constexpr int SUBTILE_M = OUTER_M / WARPS_M;
     static constexpr int MX_BLOCKS_PER_SUBTILE = OK_BLOCKS / WARPS_N;
@@ -293,7 +303,7 @@ struct QuantAPerThread {
         }
     }
     static __device__ __forceinline__ void store_quant_a_to_lds(
-        uint8_t smem_data[][OUTER_K / 2], uint8_t smem_scale[][OUTER_K / 32],
+        uint8_t smem_data[][OK_HALF], uint8_t smem_scale[][OK_BLOCKS],
         int tid, const data_type data_regs, const scale_type scale_regs
     ) {
         constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
@@ -308,7 +318,7 @@ struct QuantAPerThread {
     }
 
     static __device__ __forceinline__ void store_a_reg_to_lds(
-        uint8_t smem_data[][OUTER_K / 2], uint8_t* smem_scale,
+        uint8_t smem_data[][OK_HALF], uint8_t* smem_scale,
         int tid, const uint32_t* data_regs, const uint8_t* scale_regs
     ) {
         constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
@@ -324,7 +334,7 @@ struct QuantAPerThread {
 
     static __device__ __forceinline__ void quantize_a_to_lds(
         const hip_bfloat16 A[][K],
-        uint8_t smem_data[][OUTER_K / 2], uint8_t smem_scale[][OUTER_K / 32],
+        uint8_t smem_data[][OK_HALF], uint8_t smem_scale[][OK_BLOCKS],
         int outer_m, int tid
     ) {
         data_type data_regs;
@@ -338,10 +348,12 @@ struct QuantAPerThread {
     static __device__ __forceinline__ void load_a_global_to_reg(
         const uint8_t A_data[][K_HALF],
         const uint8_t A_scale[][NUM_BLOCKS],
-        int outer_m, int k_half_base, int blk_base, int tid,
+        int outer_m, int ok, int tid,
         uint32_t* data_regs, uint8_t* scale_regs
     ) {
         constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+        int k_half_base = ok * OK_HALF;
+        int blk_base = ok * OK_BLOCKS;
 
         for (int b = tid, bi = 0; b < TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
             int row = b / OK_BLOCKS;
@@ -356,17 +368,20 @@ struct QuantAPerThread {
     static __device__ __forceinline__ void load_a_to_lds(
         const uint8_t A_data[][K_HALF],
         const uint8_t A_scale[][NUM_BLOCKS],
-        uint8_t smem_data[][OUTER_K / 2], uint8_t* smem_scale,
-        int outer_m, int k_half_base, int blk_base, int tid
+        uint8_t smem_data[][OK_HALF], uint8_t* smem_scale,
+        int outer_m, int ok, int tid
     ) {
         constexpr int TOTAL_BLOCKS = OUTER_M * OK_BLOCKS;
+        int k_half_base = ok * OK_HALF;
+        int blk_base = ok * OK_BLOCKS;
 
         for (int b = tid; b < TOTAL_BLOCKS; b += BLOCK_SIZE) {
             int row = b / OK_BLOCKS;
             int blk = b % OK_BLOCKS;
+            int col = blk * 16;
             int g_m = outer_m + row;
-            *reinterpret_cast<uint128_vec*>(&smem_data[row][blk * 16]) =
-                *reinterpret_cast<const uint128_vec*>(&A_data[g_m][k_half_base + blk * 16]);
+            *reinterpret_cast<uint128_vec*>(&smem_data[row][col]) =
+                *reinterpret_cast<const uint128_vec*>(&A_data[g_m][k_half_base + col]);
             smem_scale[b] = A_scale[g_m][blk_base + blk];
         }
     }
@@ -378,11 +393,11 @@ struct LoadBPerThread {
     static constexpr int OK_BLOCKS = OUTER_K / 32;
     static constexpr int K_HALF = K / 2;
     static constexpr int NUM_BLOCKS = K / 32;
+    static constexpr int OK_HALF = OUTER_K / 2;
 
     static __device__ __forceinline__ void store_b_reg_to_lds(
         uint8_t smem_data[][OUTER_N * 16], uint8_t smem_scale[][OUTER_N],
-        int tid,
-        const uint32_t* data_regs, const uint8_t* scale_regs
+        int tid, const uint32_t* data_regs, const uint8_t* scale_regs
     ) {
         constexpr int B_TOTAL_BLOCKS = OUTER_N * OK_BLOCKS;
 
@@ -398,10 +413,12 @@ struct LoadBPerThread {
     static __device__ __forceinline__ void load_b_global_to_reg(
         const uint8_t B_data[][K_HALF],
         const uint8_t* __restrict__ B_scale,
-        int outer_n, int k_half_base, int blk_base, int tid,
+        int outer_n, int ok, int tid,
         uint32_t* data_regs, uint8_t* scale_regs
     ) {
         constexpr int B_TOTAL_BLOCKS = OUTER_N * OK_BLOCKS;
+        int k_half_base = ok * OK_HALF;
+        int blk_base = ok * OK_BLOCKS;
 
         for (int b = tid, bi = 0; b < B_TOTAL_BLOCKS; b += BLOCK_SIZE, bi++) {
             int row = b / OK_BLOCKS;
@@ -417,9 +434,11 @@ struct LoadBPerThread {
         const uint8_t B_data[][K_HALF],
         const uint8_t* __restrict__ B_scale,
         uint8_t smem_data[][OUTER_N * 16], uint8_t smem_scale[][OUTER_N],
-        int outer_n, int k_half_base, int blk_base, int tid
+        int outer_n, int ok, int tid
     ) {
         constexpr int B_TOTAL_BLOCKS = OUTER_N * OK_BLOCKS;
+        int k_half_base = ok * OK_HALF;
+        int blk_base = ok * OK_BLOCKS;
 
         for (int b = tid; b < B_TOTAL_BLOCKS; b += BLOCK_SIZE) {
             int row = b / OK_BLOCKS;
@@ -1246,13 +1265,13 @@ mfma_fp4_gemm_tiled(
         QA::load_a_to_lds(
             A_data, A_scale,
             smem_a_data[0], reinterpret_cast<uint8_t*>(smem_a_scale[0]),
-            outer_m, 0, 0, tid);
+            outer_m, 0, tid);
     }
 
     QB::load_b_to_lds(
         B_data, B_scale,
         smem_b_data[0], smem_b_scale[0],
-        outer_n, 0, 0, tid);
+        outer_n, 0, tid);
 
     for (int ok = 0; ok < OUTER_K_ITERS - 1; ok++) {
         if constexpr (WARPS > 1) {
@@ -1277,13 +1296,13 @@ mfma_fp4_gemm_tiled(
         } else {
             QA::load_a_global_to_reg(
                 A_data, A_scale,
-                outer_m, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
+                outer_m, next_ok, tid,
                 a_data_regs, a_scale_regs);
         }
 
         QB::load_b_global_to_reg(
             B_data, B_scale,
-            outer_n, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
+            outer_n, next_ok, tid,
             b_data_regs, b_scale_regs);
 
         inner_mfma_loop<OUTER_K, OUTER_N, IM, IN, IK, WARP_TILES_M, WARP_TILES_N>(
@@ -1637,7 +1656,7 @@ __device__ __forceinline__ void tiled_splitk_fused_compute(
     QB::load_b_to_lds(
         B_data, B_scale,
         smem_b_data[0], smem_b_scale[0],
-        outer_n, ok_start * OK_HALF, ok_start * OK_BLOCKS, tid);
+        outer_n, ok_start, tid);
 
     // Main K loop with prefetching
     for (int iter = 0; iter < num_iters - 1; iter++) {
@@ -1655,7 +1674,7 @@ __device__ __forceinline__ void tiled_splitk_fused_compute(
         uint8_t b_scale_regs[B_SCALE_PER_THREAD];
         QB::load_b_global_to_reg(
             B_data, B_scale,
-            outer_n, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
+            outer_n, next_ok, tid,
             b_data_regs, b_scale_regs);
 
         // Compute current tile from LDS
@@ -1882,12 +1901,12 @@ mfma_fp4_gemm_tiled_splitk_coop(
     QA::load_a_to_lds(
         A_data, A_scale,
         smem_a_data[0], reinterpret_cast<uint8_t*>(smem_a_scale[0]),
-        outer_m, ok_start * OK_HALF, ok_start * OK_BLOCKS, tid);
+        outer_m, ok_start, tid);
 
     QB::load_b_to_lds(
         B_data, B_scale,
         smem_b_data[0], smem_b_scale[0],
-        outer_n, ok_start * OK_HALF, ok_start * OK_BLOCKS, tid);
+        outer_n, ok_start, tid);
 
     // Main K loop with prefetching
     for (int iter = 0; iter < num_iters - 1; iter++) {
@@ -1902,7 +1921,7 @@ mfma_fp4_gemm_tiled_splitk_coop(
         uint8_t a_scale_regs[A_SCALE_PER_THREAD];
         QA::load_a_global_to_reg(
             A_data, A_scale,
-            outer_m, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
+            outer_m, next_ok, tid,
             a_data_regs, a_scale_regs);
 
         // Prefetch next B
@@ -1910,7 +1929,7 @@ mfma_fp4_gemm_tiled_splitk_coop(
         uint8_t b_scale_regs[B_SCALE_PER_THREAD];
         QB::load_b_global_to_reg(
             B_data, B_scale,
-            outer_n, next_ok * OK_HALF, next_ok * OK_BLOCKS, tid,
+            outer_n, next_ok, tid,
             b_data_regs, b_scale_regs);
 
         // Compute current tile
@@ -2678,6 +2697,7 @@ void mfma_gemm(
     //SF16(32, 4096, 512, 1, 1) //--> 8.88 BEST
     //ITER2: SF32(32, 4096, 512, 1, 1) --> 14.5
     //ITER3: T(32, 4096, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.0
+    //T(32, 4096, 512, 32, 64, 512, 32, 32, 64, 1, 1, 1) //R5-RUN1: full-K wide tile --> 15.0 TERRIBLE
     SF16(32, 4096, 512, 2, 1) //R3-FINAL: BEST (R4-RUN1: SF16(3,1)-->9.80 WORSE)
     //R2-RUN5: SF16(1,2) WTN=2 --> 9.22 (worse)
     //RUN9: SF16(32, 4096, 512, 1, 1) --> 9.17 (worse)
@@ -2694,6 +2714,7 @@ void mfma_gemm(
     //S32(32, 2880, 512, 1, 1) //--> 11.9
     //ITER1: T(32, 2880, 512, 32, 32, 128, 32, 32, 64, 1, 1, 1) --> 21.1
     //SF16(32, 2880, 512, 1, 1) //--> 8.74 NEW BEST
+    //SF16(32, 2880, 512, 1, 4) //R5-RUN1: WTN=4 --> 9.57 WORSE
     SF16(32, 2880, 512, 2, 1) //R3-FINAL: BEST (R4-RUN1: SF16(1,1)-->9.24 WORSE)
     //RUN8: S16(32, 2880, 512, 2, 1) --> 9.43 (worse)
     //RUN7: SF16(32, 2880, 512, 2, 1) WTM=2 --> 8.99 BEST
@@ -2754,7 +2775,8 @@ void mfma_gemm(
     //RUN1-was: T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //--> 16.3 BEST
     //RUN1: TSKR(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 2, 1, -1) --> 22.3 (worse)
     //RUN2: T(256, 3072, 1536, 32, 64, 128, 32, 32, 64, 1, 1, 1) --> 33.2 (terrible)
-    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //R4-FINAL: BEST (R4: TSKR split-K=3-->22.0; T BUFS=2-->17.6; T OK=256-->29.6)
+    //T(256, 3072, 1536, 64, 64, 256, 32, 32, 64, 1, 1, 1) //R5-RUN3: OK=256 BUFS=1 --> 29.7 CATASTROPHIC
+    T(256, 3072, 1536, 64, 64, 128, 32, 32, 64, 1, 1, 1) //R4-FINAL: BEST ~16.0 (R5: splitK4-->21.5; OK=256-->29.7)
     //R2-RUN4: T(ON=96) --> COMPILE FAIL (non-pow2)
     //R2-RUN3: T(OK=256) --> 29.8 TERRIBLE
     //RUN17: T(64x64,BUFS=1) --> 16.0 confirmed
@@ -2822,7 +2844,8 @@ void mfma_gemm(
     //RUN3: T(64, 7168, 2048, 64, 64, 64, 32, 32, 64, 1, 1, 1) --> INCORRECT (OK=64 broken)
     //RUN5: T(64, 7168, 2048, 64, 64, 256, 32, 32, 64, 1, 1, 1) --> 37.4 (terrible, too much LDS)
     //RUN6: T(64, 7168, 2048, 64, 32, 128, 32, 32, 64, 1, 1, 1) --> 31.7 (ON=32 bad, no B reuse)
-    T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 2) //R4-FINAL: BUFS=2 BEST (R4-RUN2/3/4/5: consistently 18.0-18.1 vs BUFS=1 at 18.3)
+    //T(64, 7168, 2048, 64, 64, 256, 32, 32, 64, 1, 1, 1) //R5-RUN3: OK=256 BUFS=1 --> 38.0 CATASTROPHIC
+    T(64, 7168, 2048, 64, 64, 128, 32, 32, 64, 1, 1, 2) //R4-FINAL: BUFS=2 BEST ~18.0 (R5: OK=256-->38.0; splitK2+bufs2-->22.2; BUFS=3-->18.1)
     //R2-RUN5: TSKR(split-K=4) --> 20.3 (worse)
     //R2-RUN4: T(ON=128,WTN=2) --> NOT TESTED (compile fail)
     //R2-RUN3: T(16x16 MFMA 2x2) --> 20.7 (worse)
@@ -2859,6 +2882,7 @@ void mfma_gemm(
     //RUN2: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 2, -1) --> 13.8 (~same)
     //RUN3: TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 2, 28, 1, -1) --> 14.0 (confirmed)
     //RUN4: TSKF doesn't exist as macro --> COMPILE FAIL
+    //TSKR(16, 2112, 7168, 16, 64, 512, 16, 16, 128, 1, 1, 14, 2, -1) //R5-RUN1: OK=512+bufs=2 --> 12.6 SAME
     TSKR(16, 2112, 7168, 16, 64, 256, 16, 16, 128, 1, 1, 28, 1, -1) //R4-FINAL: BEST (R4: ON=32,bufs=2-->13.6; K=14-->15.1; K=7-->19.7; OK=512,K=14-->12.7; bufs=2-->12.6)
     //R2-RUN4: TSKR(K_SPLITS=14) --> NOT TESTED (compile fail)
     //R2-RUN2: TSKR(K_SPLITS=56) --> INCORRECT

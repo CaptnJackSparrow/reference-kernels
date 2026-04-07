@@ -596,7 +596,7 @@ __device__ __forceinline__ void mla_mfma_attn_v(
         int32_t a_sc = mla_broadcast_scale(aqb.e8m0);
 
         int8_vec a_vec = {(int)a_reg[0], (int)a_reg[1], (int)a_reg[2], (int)a_reg[3],
-                          (int)a_reg[4], (int)a_reg[5], (int)a_reg[6], (int)a_reg[7]};
+                          0, 0, 0, 0};
 
         for (int mi = 0; mi < MFMAS_PER_SCALE; mi++) {
             const int acc_idx = si * MFMAS_PER_SCALE + mi;
@@ -627,7 +627,7 @@ __device__ __forceinline__ void mla_mfma_attn_v(
             }
 
             int8_vec b_vec = {(int)b_reg[0], (int)b_reg[1], (int)b_reg[2], (int)b_reg[3],
-                              (int)b_reg[4], (int)b_reg[5], (int)b_reg[6], (int)b_reg[7]};
+                              0, 0, 0, 0};
             v_acc[acc_idx] = Traits::mfma(a_vec, a_sc, b_vec, b_sc_one, v_acc[acc_idx]);
         }
     }
@@ -966,7 +966,6 @@ torch::Tensor mla_fused_pipeline_impl(
 
     bool need_realloc = (N != last_n || KV_SPLITS != last_splits);
     if (need_realloc) {
-        auto u8opts = torch::TensorOptions().dtype(torch::kUInt8).device(Q_bf16.device());
         auto f32opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q_bf16.device());
 
         partial_v_buf = torch::empty({BATCH_SIZE * KV_SPLITS * NUM_HEADS * V_DIM}, f32opts);
@@ -1011,8 +1010,14 @@ torch::Tensor mla_fused_pipeline_impl(
     if (do_profile) (void)hipEventRecord(e2);
 
     // ---- Step 3: LSE-corrected reduce across splits ----
-    auto output = torch::empty({TOTAL_HEADS, V_DIM},
-        torch::TensorOptions().dtype(torch::kBFloat16).device(Q_bf16.device()));
+    static torch::Tensor output_buf;
+    static int last_total_heads = 0;
+    if (TOTAL_HEADS != last_total_heads) {
+        output_buf = torch::empty({TOTAL_HEADS, V_DIM},
+            torch::TensorOptions().dtype(torch::kBFloat16).device(Q_bf16.device()));
+        last_total_heads = TOTAL_HEADS;
+    }
+    auto output = output_buf;
     {
         constexpr int R_BLOCK = 256;
         dim3 r_grid(BATCH_SIZE, NUM_HEADS);
@@ -1118,7 +1123,6 @@ torch::Tensor mla_mxfp4_pipeline(
     MLA_FUSED(64, 8192, 24, 256, 96, false);
     MLA_FUSED(256, 1024, 18, 512, 128, false);
     MLA_FUSED(256, 1024, 24, 512, 128, false);
-    // bs=256, kv=8192: no-DB, BS=128, KV=128 → 1038µs (Trial 1 best)
     MLA_FUSED(256, 8192, 18, 256, 48, false);
     MLA_FUSED(256, 8192, 24, 256, 48, false);
     TORCH_CHECK(false, "Unsupported batch_size: ", batch_size);
@@ -1201,32 +1205,23 @@ def _try_compile_hip_kernel():
 # Uncomment the line below to enable JIT compilation of HIP kernel
 HAS_HIP_KERNEL = _try_compile_hip_kernel()
 
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
 def custom_kernel(data: input_t) -> output_t:
-    """Dispatch to fused MXFP4 HIP pipeline."""
     return custom_kernel_mxfp4_qkt(data)
 
 
 def custom_kernel_mxfp4_qkt(data):
-    q, kv_data, qo_indptr, kv_indptr, config = data
+    q, kv_data, _, _, config = data
     batch_size = config["batch_size"]
-    num_heads = config["num_heads"]
     kv_seq_len = config["kv_seq_len"]
-    v_head_dim = config["v_head_dim"]
-    sm_scale = config["sm_scale"]
-    PROFILE = False
 
     kv_buffer_mxfp4, kv_scale_mxfp4 = kv_data["mxfp4"]
-    total_q = q.shape[0]
 
-    q_flat = q.view(batch_size * num_heads, 576).contiguous()
-    kv_data_flat = kv_buffer_mxfp4.view(-1, 288).contiguous()
-    kv_scale_flat = kv_scale_mxfp4.view(-1, kv_scale_mxfp4.shape[-1]).contiguous()
+    q_flat = q.reshape(batch_size * 16, 576)
+    kv_data_flat = kv_buffer_mxfp4.reshape(-1, 288)
+    kv_scale_flat = kv_scale_mxfp4.reshape(-1, kv_scale_mxfp4.shape[-1])
 
     output = _torch_hip_module.mla_mxfp4_pipeline(
         q_flat, kv_data_flat, kv_scale_flat,
-        batch_size, kv_seq_len, sm_scale, PROFILE)
+        batch_size, kv_seq_len, config["sm_scale"], False)
 
-    return output.view(total_q, num_heads, v_head_dim)
+    return output.reshape(q.shape[0], 16, 512)
