@@ -5,6 +5,9 @@ B scales read with shuffled offset (from input).
 """
 import torch
 from task import input_t, output_t
+import aiter
+from aiter import QuantType, dtypes
+from aiter.ops.shuffle import shuffle_weight
 
 MXFP4_HIP_SOURCE = b'''
 #include <hip/hip_runtime.h>
@@ -2647,40 +2650,40 @@ void launch_tiled_splitk_coop(torch::Tensor A_bf16,
     }
 }
 
-void mfma_gemm(
+bool mfma_gemm(
     torch::Tensor A_data, torch::Tensor B_data,
     torch::Tensor B_scale, torch::Tensor C,
     int M, int N, int K, bool profile
 ) {
 // Dispatch macro - add WM, WN
 #define CS16(m,n,k) \
-    if(M==m&&N==n&&K==k){return launch_coop_simple<m,n,k,16,16,128>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_coop_simple<m,n,k,16,16,128>(A_data,B_data,B_scale,C, profile); return true;}
 #define CS32(m,n,k) \
-    if(M==m&&N==n&&K==k){return launch_coop_simple<m,n,k,32,32,64>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_coop_simple<m,n,k,32,32,64>(A_data,B_data,B_scale,C, profile); return true;}
 #define S32(m,n,k,wm,wn) \
-    if(M==m&&N==n&&K==k){return launch_simple<m,n,k,32,32,64,wm,wn>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_simple<m,n,k,32,32,64,wm,wn>(A_data,B_data,B_scale,C, profile); return true;}
 #define S16(m,n,k,wm,wn) \
-    if(M==m&&N==n&&K==k){return launch_simple<m,n,k,16,16,128,wm,wn>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_simple<m,n,k,16,16,128,wm,wn>(A_data,B_data,B_scale,C, profile); return true;}
 #define T(m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs) \
-    if(M==m&&N==n&&K==k){return launch_tiled<m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_tiled<m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C, profile); return true;}
 #define F(m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs) \
-    if(M==m&&N==n&&K==k){return launch_tiled_fused<m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C);}
+    if(M==m&&N==n&&K==k){launch_tiled_fused<m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs>(A_data,B_data,B_scale,C); return true;}
 #define F2(m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs,occ) \
-    if(M==m&&N==n&&K==k){return launch_tiled_fused<m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs,occ>(A_data,B_data,B_scale,C);}
+    if(M==m&&N==n&&K==k){launch_tiled_fused<m,n,k,om,on,ok,im,in,ik,wtm,wtn,bufs,occ>(A_data,B_data,B_scale,C); return true;}
 #define SK(m,n,k,im,in,ik,wm,wn,ksplits) \
-    if(M==m&&N==n&&K==k){return launch_splitk<m,n,k,im,in,ik,wm,wn,ksplits>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_splitk<m,n,k,im,in,ik,wm,wn,ksplits>(A_data,B_data,B_scale,C, profile); return true;}
 #define SKF(m,n,k,im,in,ik,wm,wn,ksplits) \
-    if(M==m&&N==n&&K==k){return launch_splitk_fused<m,n,k,im,in,ik,wm,wn,ksplits>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_splitk_fused<m,n,k,im,in,ik,wm,wn,ksplits>(A_data,B_data,B_scale,C, profile); return true;}
 #define SF32(m,n,k,wm,wn) \
-    if(M==m&&N==n&&K==k){return launch_simple_fused<m,n,k,32,32,64,wm,wn>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_simple_fused<m,n,k,32,32,64,wm,wn>(A_data,B_data,B_scale,C, profile); return true;}
 #define SF16(m,n,k,wm,wn) \
-    if(M==m&&N==n&&K==k){return launch_simple_fused<m,n,k,16,16,128,wm,wn>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_simple_fused<m,n,k,16,16,128,wm,wn>(A_data,B_data,B_scale,C, profile); return true;}
 #define TSK(m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ) \
-    if(M==m&&N==n&&K==k){return launch_tiled_splitk_fused<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_tiled_splitk_fused<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile); return true;}
 #define TSKR(m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ) \
-    if(M==m&&N==n&&K==k){return launch_tiled_splitk_fused_reduce<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_tiled_splitk_fused_reduce<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile); return true;}
 #define TSKC(m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ) \
-    if(M==m&&N==n&&K==k){return launch_tiled_splitk_coop<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile);}
+    if(M==m&&N==n&&K==k){launch_tiled_splitk_coop<m,n,k,om,on,ok,im,in,ik,wtm,wtn,ksplits,bufs,occ>(A_data,B_data,B_scale,C, profile); return true;}
 
     // Cooperative Simple - hipLaunchCooperativeKernel too slow (~30-40us dispatch)
     //CS16(4,  2880, 512)
@@ -2807,6 +2810,8 @@ void mfma_gemm(
     //ITER9: S16(4, 2880, 512, 1, 1) --> 9.65
     SF16(8,  2112, 7168, 1, 1) //--> unchanged
     SF16(16, 3072, 1536, 1, 1) //--> unchanged
+    SF16(64, 3072, 1536, 1, 1) // test shape: M=64
+    SF16(256, 2880, 512, 2, 1) // test shape: M=256
     //S32(64, 7168, 2048, 1, 1) --> 21
     //F2(64, 7168, 2048, 16, 16, 1024, 16, 16, 128, 1, 1, 2, 4) --> 80.1
     //TSK(64, 7168, 2048, 16, 32, 1024, 16, 16, 128, 1, 1, 2, 1, 1) --> 34.4
@@ -2912,7 +2917,7 @@ void mfma_gemm(
 #undef T
 #undef SK
 
-    TORCH_CHECK(false, "No template for M=", M, " N=", N, " K=", K);
+    return false;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -3016,9 +3021,15 @@ def custom_kernel(data: input_t) -> output_t:
     B_data = B_q.view(torch.uint8)
     B_sc = B_scale_sh.view(torch.uint8)
 
-    if not HAS_HIP_KERNEL:
-        return
+    if HAS_HIP_KERNEL:
+        C = torch.empty((m, n), dtype=torch.float32, device=A.device)
+        matched = _hip_module.mfma_gemm(A, B_data, B_sc, C, m, n, k, PROFILE)
+        if matched:
+            return C
 
-    C = torch.empty((m, n), dtype=torch.float32, device=A.device)
-    _hip_module.mfma_gemm(A, B_data, B_sc, C, m, n, k, PROFILE)
-    return C
+    quant_func = aiter.get_triton_quant(QuantType.per_1x32)
+    A_q, A_scale_sh = quant_func(A, shuffle=True)
+    return aiter.gemm_a4w4(
+        A_q, B_shuffle, A_scale_sh, B_scale_sh,
+        dtype=dtypes.bf16, bpreshuffle=True,
+    )

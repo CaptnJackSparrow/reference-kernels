@@ -1,0 +1,95 @@
+"**MI355X on GitHub ✅ success**
+> Workflow [24063206582](<https://github.com/gpu-mode/kernelbot/actions/runs/24063206582>) completed
+> Downloading artifacts... done
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ❌ Leaderboard run failed
+
+Running on:
+* GPU: `AMD Instinct MI355X`
+* CPU: `AMD EPYC 9575F 64-Core Processor`
+* Device count: `1`
+* Runtime: `ROCm`
+* Platform: `Linux-6.8.0-60-generic-x86_64-with-glibc2.39`
+* Torch: `2.10.0+rocm7.1`
+* Hostname: `arc-runner-set-hbp2z-runner-ntb9p`
+
+
+## ✅ Passed 3/3 tests:
+```
+✅ bs: 8; seed: 9371; dexpert: 1024; dhidden: 4096; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+> Maximum error: 0.0234375
+✅ bs: 32; seed: 2291; dexpert: 2048; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+> Maximum error: 0.015625
+✅ bs: 128; seed: 81934; dexpert: 1536; dhidden: 4096; nroutedexperts: 64; nsharedexperts: 1; nexpertspertoken: 6
+> Maximum error: 0.015625```
+
+## Benchmarks:
+```
+bs: 16; seed: 9371; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 314 ± 0.8 µs
+ ⚡ 291 µs 🐌 701 µs
+
+bs: 128; seed: 2291; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 470 ± 0.5 µs
+ ⚡ 454 µs 🐌 560 µs
+
+bs: 512; seed: 81934; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 708 ± 0.7 µs
+ ⚡ 693 µs 🐌 888 µs
+
+bs: 16; seed: 2291; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 276 ± 0.6 µs
+ ⚡ 257 µs 🐌 399 µs
+
+bs: 128; seed: 81934; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 366 ± 0.7 µs
+ ⚡ 347 µs 🐌 698 µs
+
+bs: 512; seed: 81934; dexpert: 512; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 900 ± 0.9 µs
+ ⚡ 882 µs 🐌 1043 µs
+
+bs: 512; seed: 81934; dexpert: 2048; dhidden: 7168; nroutedexperts: 32; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 3.16 ± 0.003 ms
+ ⚡ 3.11 ms 🐌 3.26 ms
+```
+
+## Ranked Benchmark:
+```
+bs: 16; seed: 9371; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 370 ± 2.5 µs
+ ⚡ 346 µs 🐌 463 µs
+
+bs: 128; seed: 2291; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8
+ ⏱ 544 ± 3.1 µs
+ ⚡ 511 µs 🐌 712 µs
+
+❌ bs: 512; seed: 81934; dexpert: 256; dhidden: 7168; nroutedexperts: 256; nsharedexperts: 1; nexpertspertoken: 8 failed testing:
+
+Number of mismatched elements: 215\
+ERROR at (471, 80): -0.0771484375 -0.171875\
+ERROR at (471, 164): -0.2353515625 -0.1728515625\
+ERROR at (471, 166): -0.259765625 -0.197265625\
+ERROR at (471, 190): 0.2333984375 0.1708984375\
+ERROR at (471, 207): 0.35546875 0.44921875\
+... and 210 more mismatched elements.
+
+None
+ ⏱ –
+
+None
+ ⏱ –
+
+None
+ ⏱ –
+
+None
+ ⏱ –
+```","**MI355X on GitHub (secret) ✅ success**
+> Workflow [24063206787](<https://github.com/gpu-mode/kernelbot/actions/runs/24063206787>) completed
+> Downloading artifacts... done
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ❌ Leaderboard run failed
+"

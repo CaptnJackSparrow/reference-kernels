@@ -2,7 +2,7 @@
 MXFP4 Mixture-of-Experts (MoE) Fused Kernel — Custom HIP MFMA Implementation.
 
 Implements a DeepSeek-R1 style MoE forward pass on AMD MI355X:
-  - Custom HIP kernel: MFMA 16x16x128 FP4xFP4 matrix multiply
+  - Custom HIP kernel: MFMA FP4xFP4 matrix multiply (16x16x128 or 32x32x64)
   - On-the-fly BF16→MXFP4 activation quantization via software E2M1 conversion
   - Per-expert GEMM with raw (un-shuffled) FP4 weights + E8M0 block scales
   - PyTorch-side MoE token routing, SwiGLU activation, weighted reduction
@@ -26,12 +26,12 @@ HIP_SRC = r'''
 #include <cstdint>
 // ── Type aliases for MFMA instruction operands ──────────────────────
 constexpr int FMT_FP4 = 4;                                    // MFMA data format flag for FP4
-typedef float __attribute__((ext_vector_type(4))) f4;          // 4-float MFMA accumulator (16x16 tile output)
-typedef int __attribute__((ext_vector_type(8))) i8v;           // 8x int32 MFMA source operand (holds 64 FP4 values)
+typedef float __attribute__((ext_vector_type(16))) f16acc;     // 16-float accumulator for 32x32 MFMA
+typedef float __attribute__((ext_vector_type(4))) f4;          // 4-float accumulator for 16x16 MFMA
+typedef int __attribute__((ext_vector_type(8))) i8v;           // 8x int32 MFMA source operand
 typedef uint32_t __attribute__((ext_vector_type(4))) u128;     // 128-bit load type for coalesced FP4 reads
 
 // ── Broadcast E8M0 exponent to all 4 bytes of int32 ────────────────
-// MFMA scale parameter needs same E8M0 in all bytes: 0x7E → 0x7E7E7E7E
 __device__ __forceinline__ int32_t bcast(uint8_t e) { return (int32_t)e * 0x01010101; }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -82,11 +82,11 @@ __global__ void f32_to_bf16_trim_kernel(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Single-launch fused GEMM+SwiGLU for Stage 1 across ALL experts
-// Uses sorted token IDs and per-block expert IDs to dispatch weights
+// Stage 1 fused GEMM+SwiGLU — 16x16x128 MFMA variant
+// 1 wavefront (64 threads) covers 16x16 output, BPC=4, 4 results/lane
 // ═══════════════════════════════════════════════════════════════════════
 template <int N, int K, int NB = K/32, int KH = K/2>
-__global__ void moe_fused_stage1(
+__global__ void moe_fused_stage1_16(
     const uint8_t* __restrict__ A_fp4_base,
     const uint8_t* __restrict__ A_scale_base,
     const uint8_t* __restrict__ B_fp4_base,
@@ -97,8 +97,9 @@ __global__ void moe_fused_stage1(
     int num_valid,
     int M_tokens
 ) {
+    constexpr int TILE = 16;
     const int m_block = blockIdx.x;
-    const int tile_n = blockIdx.y * 16;
+    const int tile_n = blockIdx.y * TILE;
     const int lane = threadIdx.x % 64;
 
     int expert_id = sorted_expert_ids[m_block];
@@ -118,9 +119,9 @@ __global__ void moe_fused_stage1(
 
     for (int ki = 0; ki < KI; ki++) {
         int blk0 = ki * BPC;
-        int sorted_pos = m_block * 16 + (lane % 16);
-        int a_blk = blk0 + (lane / 16);
-        uint32_t a_r[8] = {};
+        int sorted_pos = m_block * TILE + (lane % TILE);
+        int a_blk = blk0 + (lane / TILE);
+        uint32_t a_r[4] = {};
         int32_t a_sc = 0;
         if (sorted_pos < num_valid) {
             int token_id = sorted_token_ids[sorted_pos];
@@ -129,11 +130,11 @@ __global__ void moe_fused_stage1(
                 a_sc = bcast(A_scale[token_id][a_blk]);
             }
         }
-        i8v av = {(int)a_r[0],(int)a_r[1],(int)a_r[2],(int)a_r[3],(int)a_r[4],(int)a_r[5],(int)a_r[6],(int)a_r[7]};
+        i8v av = {(int)a_r[0],(int)a_r[1],(int)a_r[2],(int)a_r[3],0,0,0,0};
 
-        int b_row = tile_n + (lane % 16);
-        int b_blk = blk0 + (lane / 16);
-        uint32_t bg_r[8] = {}, bu_r[8] = {};
+        int b_row = tile_n + (lane % TILE);
+        int b_blk = blk0 + (lane / TILE);
+        uint32_t bg_r[4] = {}, bu_r[4] = {};
         int32_t bg_sc = 0, bu_sc = 0;
         if (b_row < N) {
             *reinterpret_cast<u128*>(&bg_r[0]) = *reinterpret_cast<const u128*>(&B_gate[b_row][b_blk * 16]);
@@ -141,16 +142,17 @@ __global__ void moe_fused_stage1(
             *reinterpret_cast<u128*>(&bu_r[0]) = *reinterpret_cast<const u128*>(&B_up[b_row][b_blk * 16]);
             bu_sc = bcast(B_up_s[b_row][b_blk]);
         }
-        i8v bgv = {(int)bg_r[0],(int)bg_r[1],(int)bg_r[2],(int)bg_r[3],(int)bg_r[4],(int)bg_r[5],(int)bg_r[6],(int)bg_r[7]};
-        i8v buv = {(int)bu_r[0],(int)bu_r[1],(int)bu_r[2],(int)bu_r[3],(int)bu_r[4],(int)bu_r[5],(int)bu_r[6],(int)bu_r[7]};
+        i8v bgv = {(int)bg_r[0],(int)bg_r[1],(int)bg_r[2],(int)bg_r[3],0,0,0,0};
+        i8v buv = {(int)bu_r[0],(int)bu_r[1],(int)bu_r[2],(int)bu_r[3],0,0,0,0};
 
         acc_gate = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(av, bgv, acc_gate, FMT_FP4, FMT_FP4, 0, a_sc, 0, bg_sc);
         acc_up = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(av, buv, acc_up, FMT_FP4, FMT_FP4, 0, a_sc, 0, bu_sc);
     }
 
-    int col = lane % 16, quad = lane / 16;
+    int col = lane % TILE;
     for (int i = 0; i < 4; i++) {
-        int gm = m_block * 16 + i + 4*quad, gn = tile_n + col;
+        int row = i + 4 * (lane / TILE);
+        int gm = m_block * TILE + row, gn = tile_n + col;
         if (gm < num_valid && gn < N) {
             float g = acc_gate[i], u = acc_up[i];
             output[gm * N + gn] = (g / (1.f + expf(-g))) * u;
@@ -158,8 +160,240 @@ __global__ void moe_fused_stage1(
     }
 }
 
-// Single-launch MoE Stage 2: GEMM + weighted scatter-add (non-templated)
-__global__ void moe_fused_stage2(
+// ═══════════════════════════════════════════════════════════════════════
+// Stage 1 fused GEMM+SwiGLU — 32x32x64 MFMA variant
+// 1 wavefront (64 threads) covers 32x32 output, BPC=2, 16 results/lane
+// ═══════════════════════════════════════════════════════════════════════
+template <int N, int K, int NB = K/32, int KH = K/2>
+__global__ void moe_fused_stage1_32(
+    const uint8_t* __restrict__ A_fp4_base,
+    const uint8_t* __restrict__ A_scale_base,
+    const uint8_t* __restrict__ B_fp4_base,
+    const uint8_t* __restrict__ B_scale_base,
+    float* __restrict__ output,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ sorted_expert_ids,
+    int num_valid,
+    int M_tokens
+) {
+    constexpr int TILE = 32;
+    const int m_block = blockIdx.x;
+    const int tile_n = blockIdx.y * TILE;
+    const int lane = threadIdx.x % 64;
+
+    int expert_id = sorted_expert_ids[m_block];
+
+    int64_t w_offset = (int64_t)expert_id * 2 * N;
+    const uint8_t (*B_gate)[KH] = reinterpret_cast<const uint8_t(*)[KH]>(B_fp4_base + w_offset * KH);
+    const uint8_t (*B_gate_s)[NB] = reinterpret_cast<const uint8_t(*)[NB]>(B_scale_base + w_offset * NB);
+    const uint8_t (*B_up)[KH] = reinterpret_cast<const uint8_t(*)[KH]>(B_fp4_base + (w_offset + N) * KH);
+    const uint8_t (*B_up_s)[NB] = reinterpret_cast<const uint8_t(*)[NB]>(B_scale_base + (w_offset + N) * NB);
+
+    const uint8_t (*A_fp4)[KH] = reinterpret_cast<const uint8_t(*)[KH]>(A_fp4_base);
+    const uint8_t (*A_scale)[NB] = reinterpret_cast<const uint8_t(*)[NB]>(A_scale_base);
+
+    constexpr int BPC = 2;
+    constexpr int KI = NB / BPC;
+    f16acc acc_gate = {}, acc_up = {};
+
+    for (int ki = 0; ki < KI; ki++) {
+        int blk0 = ki * BPC;
+        int sorted_pos = m_block * TILE + (lane % TILE);
+        int a_blk = blk0 + (lane / TILE);
+        uint32_t a_r[4] = {};
+        int32_t a_sc = 0;
+        if (sorted_pos < num_valid) {
+            int token_id = sorted_token_ids[sorted_pos];
+            if (token_id >= 0 && token_id < M_tokens) {
+                *reinterpret_cast<u128*>(&a_r[0]) = *reinterpret_cast<const u128*>(&A_fp4[token_id][a_blk * 16]);
+                a_sc = bcast(A_scale[token_id][a_blk]);
+            }
+        }
+        i8v av = {(int)a_r[0],(int)a_r[1],(int)a_r[2],(int)a_r[3],0,0,0,0};
+
+        int b_row = tile_n + (lane % TILE);
+        int b_blk = blk0 + (lane / TILE);
+        uint32_t bg_r[4] = {}, bu_r[4] = {};
+        int32_t bg_sc = 0, bu_sc = 0;
+        if (b_row < N) {
+            *reinterpret_cast<u128*>(&bg_r[0]) = *reinterpret_cast<const u128*>(&B_gate[b_row][b_blk * 16]);
+            bg_sc = bcast(B_gate_s[b_row][b_blk]);
+            *reinterpret_cast<u128*>(&bu_r[0]) = *reinterpret_cast<const u128*>(&B_up[b_row][b_blk * 16]);
+            bu_sc = bcast(B_up_s[b_row][b_blk]);
+        }
+        i8v bgv = {(int)bg_r[0],(int)bg_r[1],(int)bg_r[2],(int)bg_r[3],0,0,0,0};
+        i8v buv = {(int)bu_r[0],(int)bu_r[1],(int)bu_r[2],(int)bu_r[3],0,0,0,0};
+
+        acc_gate = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(av, bgv, acc_gate, FMT_FP4, FMT_FP4, 0, a_sc, 0, bg_sc);
+        acc_up = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(av, buv, acc_up, FMT_FP4, FMT_FP4, 0, a_sc, 0, bu_sc);
+    }
+
+    int col = lane % TILE, half = lane / TILE;
+    for (int i = 0; i < 16; i++) {
+        int row = (i % 4) + 4 * half + 8 * (i / 4);
+        int gm = m_block * TILE + row, gn = tile_n + col;
+        if (gm < num_valid && gn < N) {
+            float g = acc_gate[i], u = acc_up[i];
+            output[gm * N + gn] = (g / (1.f + expf(-g))) * u;
+        }
+    }
+}
+
+// GPU kernel to build padded sorted arrays with configurable alignment per expert
+__global__ void moe_build_padded(
+    const int32_t* __restrict__ raw_token_ids,
+    const float* __restrict__ raw_weights,
+    int32_t* __restrict__ pad_token_ids,
+    float* __restrict__ pad_weights,
+    int32_t* __restrict__ pad_expert_blocks,
+    const int64_t* __restrict__ raw_offsets,    // [E] inclusive prefix sum of raw counts
+    const int64_t* __restrict__ pad_offsets,    // [E] inclusive prefix sum of padded counts
+    int E, int total_padded, int sentinel, int tile_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_padded) return;
+
+    // Binary search: find which expert this padded position belongs to
+    int lo = 0, hi = E;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (pad_offsets[mid] <= idx) lo = mid + 1;
+        else hi = mid;
+    }
+    int eid = lo;
+
+    int pad_start = (eid == 0) ? 0 : (int)pad_offsets[eid - 1];
+    int raw_start = (eid == 0) ? 0 : (int)raw_offsets[eid - 1];
+    int raw_end = (int)raw_offsets[eid];
+    int local_idx = idx - pad_start;
+    int raw_count = raw_end - raw_start;
+
+    if (local_idx < raw_count) {
+        pad_token_ids[idx] = raw_token_ids[raw_start + local_idx];
+        pad_weights[idx] = raw_weights[raw_start + local_idx];
+    } else {
+        pad_token_ids[idx] = sentinel;
+        pad_weights[idx] = 0.0f;
+    }
+
+    if (idx % tile_size == 0) {
+        pad_expert_blocks[idx / tile_size] = eid;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Stage 1 split-K GEMM (NO SwiGLU) — 16x16x128 MFMA variant
+// Accumulates gate and up projections separately into workspace [ts, 2*N]
+// via atomicAdd across K_SPLITS. SwiGLU applied by a separate kernel.
+// ═══════════════════════════════════════════════════════════════════════
+template <int N, int K, int K_SPLITS, int NB = K/32, int KH = K/2>
+__global__ void moe_splitk_stage1_16(
+    const uint8_t* __restrict__ A_fp4_base,
+    const uint8_t* __restrict__ A_scale_base,
+    const uint8_t* __restrict__ B_fp4_base,
+    const uint8_t* __restrict__ B_scale_base,
+    float* __restrict__ workspace,           // [total_sorted, 2*N] — gate+up concatenated
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ sorted_expert_ids,
+    int num_valid,
+    int M_tokens
+) {
+    constexpr int TILE = 16;
+    const int m_block = blockIdx.x;
+    const int tile_n = blockIdx.y * TILE;
+    const int k_split = blockIdx.z;
+    const int lane = threadIdx.x % 64;
+
+    int expert_id = sorted_expert_ids[m_block];
+
+    int64_t w_offset = (int64_t)expert_id * 2 * N;
+    const uint8_t (*B_gate)[KH] = reinterpret_cast<const uint8_t(*)[KH]>(B_fp4_base + w_offset * KH);
+    const uint8_t (*B_gate_s)[NB] = reinterpret_cast<const uint8_t(*)[NB]>(B_scale_base + w_offset * NB);
+    const uint8_t (*B_up)[KH] = reinterpret_cast<const uint8_t(*)[KH]>(B_fp4_base + (w_offset + N) * KH);
+    const uint8_t (*B_up_s)[NB] = reinterpret_cast<const uint8_t(*)[NB]>(B_scale_base + (w_offset + N) * NB);
+
+    const uint8_t (*A_fp4)[KH] = reinterpret_cast<const uint8_t(*)[KH]>(A_fp4_base);
+    const uint8_t (*A_scale)[NB] = reinterpret_cast<const uint8_t(*)[NB]>(A_scale_base);
+
+    constexpr int BPC = 4;
+    constexpr int TOTAL_KI = NB / BPC;
+    constexpr int KI_PER_SPLIT = (TOTAL_KI + K_SPLITS - 1) / K_SPLITS;
+    int ki_start = k_split * KI_PER_SPLIT;
+    int ki_end_val = ki_start + KI_PER_SPLIT;
+    if (ki_end_val > TOTAL_KI) ki_end_val = TOTAL_KI;
+
+    f4 acc_gate = {}, acc_up = {};
+
+    for (int ki = ki_start; ki < ki_end_val; ki++) {
+        int blk0 = ki * BPC;
+        int sorted_pos = m_block * TILE + (lane % TILE);
+        int a_blk = blk0 + (lane / TILE);
+        uint32_t a_r[4] = {};
+        int32_t a_sc = 0;
+        if (sorted_pos < num_valid) {
+            int token_id = sorted_token_ids[sorted_pos];
+            if (token_id >= 0 && token_id < M_tokens) {
+                *reinterpret_cast<u128*>(&a_r[0]) = *reinterpret_cast<const u128*>(&A_fp4[token_id][a_blk * 16]);
+                a_sc = bcast(A_scale[token_id][a_blk]);
+            }
+        }
+        i8v av = {(int)a_r[0],(int)a_r[1],(int)a_r[2],(int)a_r[3],0,0,0,0};
+
+        int b_row = tile_n + (lane % TILE);
+        int b_blk = blk0 + (lane / TILE);
+        uint32_t bg_r[4] = {}, bu_r[4] = {};
+        int32_t bg_sc = 0, bu_sc = 0;
+        if (b_row < N) {
+            *reinterpret_cast<u128*>(&bg_r[0]) = *reinterpret_cast<const u128*>(&B_gate[b_row][b_blk * 16]);
+            bg_sc = bcast(B_gate_s[b_row][b_blk]);
+            *reinterpret_cast<u128*>(&bu_r[0]) = *reinterpret_cast<const u128*>(&B_up[b_row][b_blk * 16]);
+            bu_sc = bcast(B_up_s[b_row][b_blk]);
+        }
+        i8v bgv = {(int)bg_r[0],(int)bg_r[1],(int)bg_r[2],(int)bg_r[3],0,0,0,0};
+        i8v buv = {(int)bu_r[0],(int)bu_r[1],(int)bu_r[2],(int)bu_r[3],0,0,0,0};
+
+        acc_gate = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(av, bgv, acc_gate, FMT_FP4, FMT_FP4, 0, a_sc, 0, bg_sc);
+        acc_up = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(av, buv, acc_up, FMT_FP4, FMT_FP4, 0, a_sc, 0, bu_sc);
+    }
+
+    // atomicAdd partial results to workspace [total_sorted, 2*N]
+    int col = lane % TILE;
+    int two_N = 2 * N;
+    for (int i = 0; i < 4; i++) {
+        int row = i + 4 * (lane / TILE);
+        int gm = m_block * TILE + row, gn = tile_n + col;
+        if (gm < num_valid && gn < N) {
+            unsafeAtomicAdd(&workspace[gm * two_N + gn], acc_gate[i]);         // gate column
+            unsafeAtomicAdd(&workspace[gm * two_N + N + gn], acc_up[i]);       // up column
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SwiGLU kernel: reads accumulated [total_sorted, 2*N] workspace,
+// applies SiLU(gate) * up, writes [total_sorted, N] output
+// ═══════════════════════════════════════════════════════════════════════
+__global__ void swiglu_kernel(
+    const float* __restrict__ workspace,  // [total_sorted, 2*N]
+    float* __restrict__ output,           // [total_sorted, N]
+    int total_sorted,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_sorted * N) return;
+    int row = idx / N;
+    int col = idx % N;
+    int two_N = 2 * N;
+    float g = workspace[row * two_N + col];
+    float u = workspace[row * two_N + N + col];
+    output[row * N + col] = (g / (1.f + expf(-g))) * u;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Stage 2 fused GEMM + weighted scatter-add — 16x16x128 MFMA variant
+// 1 wavefront (64 threads) covers 16x16 output, BPC=4, 4 results/lane
+// ═══════════════════════════════════════════════════════════════════════
+__global__ void moe_fused_stage2_16(
     const uint8_t* __restrict__ A_fp4_base,
     const uint8_t* __restrict__ A_scale_base,
     const uint8_t* __restrict__ B_fp4_base,
@@ -173,10 +407,11 @@ __global__ void moe_fused_stage2(
     int N,
     int K
 ) {
+    constexpr int TILE = 16;
     const int KH = K / 2;
     const int NB = K / 32;
     const int m_block = blockIdx.x;
-    const int tile_n = blockIdx.y * 16;
+    const int tile_n = blockIdx.y * TILE;
     const int lane = threadIdx.x % 64;
 
     int expert_id = sorted_expert_ids[m_block];
@@ -190,31 +425,104 @@ __global__ void moe_fused_stage2(
 
     for (int ki = 0; ki < KI; ki++) {
         int blk0 = ki * BPC;
-        int sorted_pos = m_block * 16 + (lane % 16);
-        int a_blk = blk0 + (lane / 16);
-        uint32_t a_r[8] = {};
+        int sorted_pos = m_block * TILE + (lane % TILE);
+        int a_blk = blk0 + (lane / TILE);
+        uint32_t a_r[4] = {};
         int32_t a_sc = 0;
         if (sorted_pos < num_valid) {
             *reinterpret_cast<u128*>(&a_r[0]) = *reinterpret_cast<const u128*>(&A_fp4_base[(int64_t)sorted_pos * KH + a_blk * 16]);
             a_sc = bcast(A_scale_base[(int64_t)sorted_pos * NB + a_blk]);
         }
-        int b_row = tile_n + (lane % 16);
-        int b_blk = blk0 + (lane / 16);
-        uint32_t b_r[8] = {};
+        int b_row = tile_n + (lane % TILE);
+        int b_blk = blk0 + (lane / TILE);
+        uint32_t b_r[4] = {};
         int32_t b_sc = 0;
         if (b_row < N) {
             int64_t brow_abs = w_row_offset + b_row;
             *reinterpret_cast<u128*>(&b_r[0]) = *reinterpret_cast<const u128*>(&B_fp4_base[brow_abs * KH + b_blk * 16]);
             b_sc = bcast(B_scale_base[brow_abs * NB + b_blk]);
         }
-        i8v av = {(int)a_r[0],(int)a_r[1],(int)a_r[2],(int)a_r[3],(int)a_r[4],(int)a_r[5],(int)a_r[6],(int)a_r[7]};
-        i8v bv = {(int)b_r[0],(int)b_r[1],(int)b_r[2],(int)b_r[3],(int)b_r[4],(int)b_r[5],(int)b_r[6],(int)b_r[7]};
+        i8v av = {(int)a_r[0],(int)a_r[1],(int)a_r[2],(int)a_r[3],0,0,0,0};
+        i8v bv = {(int)b_r[0],(int)b_r[1],(int)b_r[2],(int)b_r[3],0,0,0,0};
         acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(av, bv, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
     }
 
-    int col = lane % 16, quad = lane / 16;
+    int col = lane % TILE;
     for (int i = 0; i < 4; i++) {
-        int gm = m_block * 16 + i + 4*quad, gn = tile_n + col;
+        int row = i + 4 * (lane / TILE);
+        int gm = m_block * TILE + row, gn = tile_n + col;
+        if (gm < num_valid && gn < N) {
+            int token_id = sorted_token_ids[gm];
+            if (token_id >= 0 && token_id < M_tokens) {
+                float w = sorted_weights[gm];
+                atomicAdd(&output[token_id * N + gn], w * acc[i]);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Stage 2 fused GEMM + weighted scatter-add — 32x32x64 MFMA variant
+// 1 wavefront (64 threads) covers 32x32 output, BPC=2, 16 results/lane
+// ═══════════════════════════════════════════════════════════════════════
+__global__ void moe_fused_stage2_32(
+    const uint8_t* __restrict__ A_fp4_base,
+    const uint8_t* __restrict__ A_scale_base,
+    const uint8_t* __restrict__ B_fp4_base,
+    const uint8_t* __restrict__ B_scale_base,
+    float* __restrict__ output,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    int num_valid,
+    int M_tokens,
+    int N,
+    int K
+) {
+    constexpr int TILE = 32;
+    const int KH = K / 2;
+    const int NB = K / 32;
+    const int m_block = blockIdx.x;
+    const int tile_n = blockIdx.y * TILE;
+    const int lane = threadIdx.x % 64;
+
+    int expert_id = sorted_expert_ids[m_block];
+    if (expert_id >= 0x7FFFFFFF) return;
+
+    int64_t w_row_offset = (int64_t)expert_id * N;
+
+    constexpr int BPC = 2;
+    int KI = NB / BPC;
+    f16acc acc = {};
+
+    for (int ki = 0; ki < KI; ki++) {
+        int blk0 = ki * BPC;
+        int sorted_pos = m_block * TILE + (lane % TILE);
+        int a_blk = blk0 + (lane / TILE);
+        uint32_t a_r[4] = {};
+        int32_t a_sc = 0;
+        if (sorted_pos < num_valid) {
+            *reinterpret_cast<u128*>(&a_r[0]) = *reinterpret_cast<const u128*>(&A_fp4_base[(int64_t)sorted_pos * KH + a_blk * 16]);
+            a_sc = bcast(A_scale_base[(int64_t)sorted_pos * NB + a_blk]);
+        }
+        int b_row = tile_n + (lane % TILE);
+        int b_blk = blk0 + (lane / TILE);
+        uint32_t b_r[4] = {};
+        int32_t b_sc = 0;
+        if (b_row < N) {
+            int64_t brow_abs = w_row_offset + b_row;
+            *reinterpret_cast<u128*>(&b_r[0]) = *reinterpret_cast<const u128*>(&B_fp4_base[brow_abs * KH + b_blk * 16]);
+            b_sc = bcast(B_scale_base[brow_abs * NB + b_blk]);
+        }
+        i8v av = {(int)a_r[0],(int)a_r[1],(int)a_r[2],(int)a_r[3],0,0,0,0};
+        i8v bv = {(int)b_r[0],(int)b_r[1],(int)b_r[2],(int)b_r[3],0,0,0,0};
+        acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(av, bv, acc, FMT_FP4, FMT_FP4, 0, a_sc, 0, b_sc);
+    }
+
+    int col = lane % TILE, half = lane / TILE;
+    for (int i = 0; i < 16; i++) {
+        int row = (i % 4) + 4 * half + 8 * (i / 4);
+        int gm = m_block * TILE + row, gn = tile_n + col;
         if (gm < num_valid && gn < N) {
             int token_id = sorted_token_ids[gm];
             if (token_id >= 0 && token_id < M_tokens) {
@@ -253,7 +561,7 @@ void moe_forward(
     torch::Tensor topk_weights,
     torch::Tensor topk_ids,
     torch::Tensor output,
-    int E, int dep, int dhp, bool profile
+    int E, int dep, int dhp, bool profile, int tile_size
 ) {
     auto device = hidden_padded.device();
     int M = hidden_padded.size(0);
@@ -274,24 +582,28 @@ void moe_forward(
         (void)hipEventRecord(ev_total_start);
     }
 
-    // ── Token sorting with GPU-side 16-alignment padding ──
+    int ts_mask = tile_size - 1;
+
+    // ── Token sorting with GPU-side tile_size-alignment padding ──
     auto topk_ids_flat = topk_ids.reshape({-1});
     auto sort_result = torch::sort(topk_ids_flat, /*dim=*/0, /*descending=*/false);
     auto sorted_experts_flat = std::get<0>(sort_result).to(torch::kInt32);
     auto sort_indices = std::get<1>(sort_result);
 
-    auto sorted_token_ids_raw = (sort_indices / top_k).to(torch::kInt32);
+    auto sorted_token_ids_raw = torch::div(sort_indices, top_k, "trunc").to(torch::kInt32);
     auto topk_weights_flat = topk_weights.reshape({-1});
     auto sorted_weights_raw = topk_weights_flat.index({sort_indices}).to(torch::kFloat32);
 
-    // Compute per-expert counts, then pad each to multiple of 16
+    // Compute per-expert counts and prefix sums on GPU
     auto expert_counts = torch::bincount(sorted_experts_flat.to(torch::kInt64), {}, E);
-    auto padded_counts = ((expert_counts + 15) / 16).to(torch::kInt64) * 16;
-    auto padded_offsets = torch::cumsum(padded_counts, 0);  // [E] cumulative padded
-    auto raw_offsets = torch::cumsum(expert_counts, 0);     // [E] cumulative raw
+    auto raw_offsets = torch::cumsum(expert_counts, 0);       // [E] inclusive prefix sum
+    auto padded_counts = torch::div(expert_counts + ts_mask, tile_size, "trunc") * tile_size;
+    auto pad_offsets = torch::cumsum(padded_counts, 0);        // [E] inclusive prefix sum
 
-    int total_sorted = padded_offsets[-1].item<int>();  // 1 scalar GPU→CPU sync
-    int num_m_blocks = total_sorted / 16;
+    int64_t total_sorted = pad_offsets[-1].item<int64_t>();  // 1 scalar GPU→CPU sync
+    int64_t num_m_blocks = total_sorted / tile_size;
+
+    if (num_m_blocks == 0) return;
 
     // Allocate padded arrays (sentinel token = M → skipped by bounds checks)
     auto sorted_token_ids = torch::full({total_sorted}, M,
@@ -301,32 +613,22 @@ void moe_forward(
     auto sorted_expert_ids_blocks = torch::zeros({num_m_blocks},
         torch::TensorOptions().dtype(torch::kInt32).device(device));
 
-    // CPU loop over experts to scatter raw→padded with 16-alignment
-    // One GPU→CPU sync for offsets (small tensors), then 3 GPU ops per active expert
-    {
-        auto raw_offsets_cpu = raw_offsets.cpu();
-        auto padded_offsets_cpu = padded_offsets.cpu();
-        auto expert_counts_cpu = expert_counts.cpu();
-        auto ro = raw_offsets_cpu.data_ptr<int64_t>();
-        auto po = padded_offsets_cpu.data_ptr<int64_t>();
-        auto ec = expert_counts_cpu.data_ptr<int64_t>();
-
-        for (int e = 0; e < E; e++) {
-            int cnt = (int)ec[e];
-            if (cnt == 0) continue;
-            int rs = (e == 0) ? 0 : (int)ro[e-1];
-            int ps = (e == 0) ? 0 : (int)po[e-1];
-            sorted_token_ids.slice(0, ps, ps+cnt).copy_(sorted_token_ids_raw.slice(0, rs, rs+cnt));
-            sorted_weights_gpu.slice(0, ps, ps+cnt).copy_(sorted_weights_raw.slice(0, rs, rs+cnt));
-            int pcnt = ((cnt + 15) / 16) * 16;
-            int block_start = ps / 16;
-            int block_count = pcnt / 16;
-            sorted_expert_ids_blocks.slice(0, block_start, block_start + block_count).fill_(e);
-        }
-    }
+    // Single GPU kernel to build padded arrays (no CPU loop / GPU→CPU sync)
+    moe_build_padded<<<(total_sorted + 255) / 256, 256>>>(
+        sorted_token_ids_raw.data_ptr<int32_t>(),
+        sorted_weights_raw.data_ptr<float>(),
+        sorted_token_ids.data_ptr<int32_t>(),
+        sorted_weights_gpu.data_ptr<float>(),
+        sorted_expert_ids_blocks.data_ptr<int32_t>(),
+        raw_offsets.data_ptr<int64_t>(),
+        pad_offsets.data_ptr<int64_t>(),
+        E, (int)total_sorted, M, tile_size);
 
     // ── Stage 1: Quantize ALL activations at once ──
     if (do_profile) (void)hipEventRecord(ev0);
+
+    int ts = (int)total_sorted;
+    int nmb = (int)num_m_blocks;
 
     auto a1_fp4 = torch::empty({M, dhp/2}, torch::dtype(torch::kUInt8).device(device));
     auto a1_scale = torch::empty({M, dhp/32}, torch::dtype(torch::kUInt8).device(device));
@@ -343,6 +645,8 @@ void moe_forward(
     if (do_profile) (void)hipEventRecord(ev1);
 
     // ── Stage 1 GEMM+SwiGLU: Single launch across ALL experts ──
+    // For large K (dhp >= 4096), use split-K GEMM + separate SwiGLU kernel.
+    // For small K, use the existing fused GEMM+SwiGLU kernel.
     auto gu_w_contig = gate_up_weight.view(torch::kUInt8).contiguous();
     auto gu_s_contig = gate_up_weight_scale.reshape({-1, dhp/32}).view(torch::kUInt8).contiguous();
 
@@ -353,29 +657,59 @@ void moe_forward(
     auto sorted_token_ids_ptr = sorted_token_ids.data_ptr<int32_t>();
     auto sorted_expert_ids_ptr = reinterpret_cast<const int32_t*>(sorted_expert_ids_blocks.data_ptr());
 
-    auto inter_all = torch::empty({total_sorted, dep}, torch::dtype(torch::kFloat32).device(device));
+    auto inter_all = torch::empty({ts, dep}, torch::dtype(torch::kFloat32).device(device));
     auto inter_ptr = reinterpret_cast<float*>(inter_all.data_ptr());
 
-    {
-        dim3 grid(num_m_blocks, (dep+15)/16);
-#define D(nn,kk) if(dep==nn&&dhp==kk){hipLaunchKernelGGL((moe_fused_stage1<nn,kk>),grid,dim3(64),0,0,A_fp4_ptr,A_scale_ptr,B_fp4_ptr,B_scale_ptr,inter_ptr,sorted_token_ids_ptr,sorted_expert_ids_ptr,total_sorted,M);goto s1done;}
-        D(256,7168) D(512,7168) D(1024,4096) D(1536,4096) D(2048,7168)
-#undef D
+    // Determine split-K factor based on K dimension
+    int k_splits = (dhp >= 7168) ? 4 : (dhp >= 4096) ? 2 : 1;
+
+    if (k_splits > 1 && tile_size == 16) {
+        // Split-K path: GEMM accumulates gate+up into workspace, then SwiGLU
+        auto workspace = torch::zeros({(int64_t)ts, (int64_t)(2 * dep)},
+            torch::dtype(torch::kFloat32).device(device));
+        auto ws_ptr = reinterpret_cast<float*>(workspace.data_ptr());
+
+        // Launch split-K GEMM: grid = (num_m_blocks, ceil(dep/16), k_splits)
+        dim3 sk_grid(nmb, (dep + 15) / 16, k_splits);
+        bool s1_matched = false;
+#define SK16(nn,kk,ks) if(dep==nn&&dhp==kk&&k_splits==ks){hipLaunchKernelGGL((moe_splitk_stage1_16<nn,kk,ks>),sk_grid,dim3(64),0,0,A_fp4_ptr,A_scale_ptr,B_fp4_ptr,B_scale_ptr,ws_ptr,sorted_token_ids_ptr,sorted_expert_ids_ptr,ts,M);s1_matched=true;}
+        SK16(256,7168,4) SK16(512,7168,4) SK16(2048,7168,4)
+        SK16(1024,4096,2) SK16(1536,4096,2)
+#undef SK16
+
+        if (s1_matched) {
+            // Apply SwiGLU: workspace [ts, 2*dep] -> inter_all [ts, dep]
+            int swiglu_total = ts * dep;
+            hipLaunchKernelGGL(swiglu_kernel, dim3((swiglu_total + 255) / 256), dim3(256), 0, 0,
+                ws_ptr, inter_ptr, ts, dep);
+        }
+    } else {
+        // Non-split-K path: use existing fused GEMM+SwiGLU kernels
+        dim3 grid(nmb, (dep + ts_mask) / tile_size);
+        if (tile_size == 16) {
+#define D16(nn,kk) if(dep==nn&&dhp==kk){hipLaunchKernelGGL((moe_fused_stage1_16<nn,kk>),grid,dim3(64),0,0,A_fp4_ptr,A_scale_ptr,B_fp4_ptr,B_scale_ptr,inter_ptr,sorted_token_ids_ptr,sorted_expert_ids_ptr,ts,M);goto s1done;}
+            D16(256,7168) D16(512,7168) D16(1024,4096) D16(1536,4096) D16(2048,7168)
+#undef D16
+        } else {
+#define D32(nn,kk) if(dep==nn&&dhp==kk){hipLaunchKernelGGL((moe_fused_stage1_32<nn,kk>),grid,dim3(64),0,0,A_fp4_ptr,A_scale_ptr,B_fp4_ptr,B_scale_ptr,inter_ptr,sorted_token_ids_ptr,sorted_expert_ids_ptr,ts,M);goto s1done;}
+            D32(256,7168) D32(512,7168) D32(1024,4096) D32(1536,4096) D32(2048,7168)
+#undef D32
+        }
         s1done:;
     }
 
     if (do_profile) (void)hipEventRecord(ev2);
 
     // ── Stage 2: Quantize ALL intermediates at once ──
-    auto inter_bf16 = inter_all.to(torch::kBFloat16).contiguous();
-    auto a2_fp4 = torch::empty({total_sorted, dep/2}, torch::dtype(torch::kUInt8).device(device));
-    auto a2_scale = torch::empty({total_sorted, dep/32}, torch::dtype(torch::kUInt8).device(device));
+    auto inter_bf16 = inter_all.to(torch::kBFloat16);
+    auto a2_fp4 = torch::empty({ts, dep/2}, torch::dtype(torch::kUInt8).device(device));
+    auto a2_scale = torch::empty({ts, dep/32}, torch::dtype(torch::kUInt8).device(device));
     [&](){
-        int t = total_sorted * (dep/32);
+        int t = ts * (dep/32);
         auto a_ptr = reinterpret_cast<const hip_bfloat16*>(inter_bf16.data_ptr());
         auto fp4_ptr = reinterpret_cast<uint8_t*>(a2_fp4.data_ptr());
         auto sc_ptr = reinterpret_cast<uint8_t*>(a2_scale.data_ptr());
-#define D(k) if(dep==k){hipLaunchKernelGGL((mxfp4_quant_sw_bf16<k>),dim3((t+255)/256),dim3(256),0,0,a_ptr,fp4_ptr,sc_ptr,total_sorted);return;}
+#define D(k) if(dep==k){hipLaunchKernelGGL((mxfp4_quant_sw_bf16<k>),dim3((t+255)/256),dim3(256),0,0,a_ptr,fp4_ptr,sc_ptr,ts);return;}
         D(4096) D(7168) D(1024) D(2048) D(1536) D(256) D(512)
 #undef D
     }();
@@ -386,8 +720,12 @@ void moe_forward(
     {
         auto dn_w_flat = down_weight.view(torch::kUInt8).reshape({-1, dep/2}).contiguous();
         auto dn_s_flat = down_weight_scale.view(torch::kUInt8).reshape({-1, dep/32}).contiguous();
-        dim3 grid(num_m_blocks, (dhp+15)/16);
-        hipLaunchKernelGGL(moe_fused_stage2,grid,dim3(64),0,0,reinterpret_cast<const uint8_t*>(a2_fp4.data_ptr()),reinterpret_cast<const uint8_t*>(a2_scale.data_ptr()),reinterpret_cast<const uint8_t*>(dn_w_flat.data_ptr()),reinterpret_cast<const uint8_t*>(dn_s_flat.data_ptr()),reinterpret_cast<float*>(output.data_ptr()),sorted_token_ids.data_ptr<int32_t>(),sorted_expert_ids_blocks.data_ptr<int32_t>(),sorted_weights_gpu.data_ptr<float>(),total_sorted,M,dhp,dep);
+        dim3 grid(nmb, (dhp + ts_mask) / tile_size);
+        if (tile_size == 16) {
+            hipLaunchKernelGGL(moe_fused_stage2_16,grid,dim3(64),0,0,reinterpret_cast<const uint8_t*>(a2_fp4.data_ptr()),reinterpret_cast<const uint8_t*>(a2_scale.data_ptr()),reinterpret_cast<const uint8_t*>(dn_w_flat.data_ptr()),reinterpret_cast<const uint8_t*>(dn_s_flat.data_ptr()),reinterpret_cast<float*>(output.data_ptr()),sorted_token_ids.data_ptr<int32_t>(),sorted_expert_ids_blocks.data_ptr<int32_t>(),sorted_weights_gpu.data_ptr<float>(),ts,M,dhp,dep);
+        } else {
+            hipLaunchKernelGGL(moe_fused_stage2_32,grid,dim3(64),0,0,reinterpret_cast<const uint8_t*>(a2_fp4.data_ptr()),reinterpret_cast<const uint8_t*>(a2_scale.data_ptr()),reinterpret_cast<const uint8_t*>(dn_w_flat.data_ptr()),reinterpret_cast<const uint8_t*>(dn_s_flat.data_ptr()),reinterpret_cast<float*>(output.data_ptr()),sorted_token_ids.data_ptr<int32_t>(),sorted_expert_ids_blocks.data_ptr<int32_t>(),sorted_weights_gpu.data_ptr<float>(),ts,M,dhp,dep);
+        }
     }
 
     if (do_profile) (void)hipEventRecord(ev4);
@@ -447,7 +785,7 @@ def _compile():
         rh = os.environ.get('ROCM_HOME', '/opt/rocm')
         os.environ['PYTORCH_ROCM_ARCH'] = 'gfx950'
         t0 = time.time()
-        _mod = load_inline(name='moe_hip_v9', cpp_sources='', cuda_sources=[HIP_SRC+'\n'+CPP_SRC],
+        _mod = load_inline(name='moe_hip_v10', cpp_sources='', cuda_sources=[HIP_SRC+'\n'+CPP_SRC],
             extra_cflags=['-O3'],
             extra_cuda_cflags=['-O3','-ffast-math','-munsafe-fp-atomics','--offload-arch=gfx950'],
             extra_include_paths=[f'{rh}/include'], verbose=True)
@@ -462,6 +800,7 @@ def _compile():
 def custom_kernel(data: input_t) -> output_t:
     """MoE forward pass using custom HIP MFMA FP4xFP4 kernels."""
     PROFILE = True
+    TILE_SIZE = 16  # 16 = 16x16x128 MFMA (robust), 32 = 32x32x64 MFMA (throughput)
 
     (hidden_states, gate_up_weight, down_weight,
      gate_up_weight_scale, down_weight_scale,
@@ -490,7 +829,7 @@ def custom_kernel(data: input_t) -> output_t:
         hidden_padded, gate_up_weight, down_weight,
         gate_up_weight_scale, down_weight_scale,
         topk_weights, topk_ids, output,
-        E, dep, dhp, PROFILE)
+        E, dep, dhp, PROFILE, TILE_SIZE)
 
     result = torch.empty(M, dh, dtype=torch.bfloat16, device=device)
     _mod.f32_to_bf16_trim(output, result, M, dhp, dh)
