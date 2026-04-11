@@ -1,0 +1,25 @@
+"**A100 on Modal ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Compilation successful
+> ✅ Benchmarking successful
+
+Running on:
+* GPU: `NVIDIA A100-SXM4-80GB`
+* CPU: `GenuineIntel`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.39`
+* Torch: `2.11.0+cu129`
+* Hostname: `modal`
+
+
+## Benchmarks:
+```
+seed: 54352; size: 16384
+ ⏱ 895 ± 0.6 µs
+ ⚡ 894 µs 🐌 896 µs
+```
+
+## Program stdout:
+```
+ninja: no work to do.```"

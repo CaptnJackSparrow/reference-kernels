@@ -1,0 +1,44 @@
+"**A100 on Modal ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+
+Running on:
+* GPU: `NVIDIA A100-SXM4-80GB`
+* CPU: `GenuineIntel`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.39`
+* Torch: `2.11.0+cu129`
+* Hostname: `modal`
+
+
+## ✅ Passed 5/5 tests:
+```
+✅ seed: 4242; size: 127
+✅ seed: 5236; size: 128
+✅ seed: 1001; size: 129
+✅ seed: 5531; size: 256
+✅ seed: 9173; size: 512```
+
+## Benchmarks:
+```
+seed: 54352; size: 16384
+ ⏱ 895 ± 0.3 µs
+ ⚡ 895 µs 🐌 896 µs
+```
+
+## Ranked Benchmark:
+```
+seed: 54352; size: 16384
+ ⏱ 895 ± 0.3 µs
+ ⚡ 895 µs 🐌 896 µs
+```","**A100 on Modal (secret) ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+"
