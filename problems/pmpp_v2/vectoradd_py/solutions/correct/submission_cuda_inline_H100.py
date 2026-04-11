@@ -13,8 +13,8 @@ add_kernel_vec(const float4* __restrict__ A,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     for (; idx < N4; idx += stride) {
-        float4 a = __ldg(&A[idx]);
-        float4 b = __ldg(&B[idx]);
+        float4 a = A[idx];
+        float4 b = B[idx];
         half2* a_h = reinterpret_cast<half2*>(&a);
         half2* b_h = reinterpret_cast<half2*>(&b);
         float4 c;

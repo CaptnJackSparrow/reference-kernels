@@ -5,7 +5,7 @@ from task import input_t, output_t
 add_cuda_source = """
 #include <cuda_fp16.h>
 
-__global__ void __launch_bounds__(512, 2)
+__global__ void __launch_bounds__(512)
 add_kernel_vec(const float4* __restrict__ A,
                const float4* __restrict__ B,
                float4* __restrict__ C,
@@ -77,7 +77,7 @@ add_module = load_inline(
     cuda_sources=add_cuda_source,
     functions=['add_cuda'],
     verbose=True,
-    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode', 'arch=compute_90,code=sm_90'],
+    extra_cuda_cflags=['-O3', '--use_fast_math'],
 )
 
 def custom_kernel(data: input_t) -> output_t:
