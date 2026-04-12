@@ -1,0 +1,44 @@
+"**H100 on Modal ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+
+Running on:
+* GPU: `NVIDIA H100 80GB HBM3`
+* CPU: `GenuineIntel`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.39`
+* Torch: `2.11.0+cu129`
+* Hostname: `modal`
+
+
+## ✅ Passed 5/5 tests:
+```
+✅ seed: 4242; size: 1023
+✅ seed: 5236; size: 1024
+✅ seed: 1001; size: 1025
+✅ seed: 5531; size: 2048
+✅ seed: 9173; size: 4096```
+
+## Benchmarks:
+```
+seed: 6252; size: 100000000
+ ⏱ 2.04 ± 0.001 ms
+ ⚡ 2.04 ms 🐌 2.04 ms
+```
+
+## Ranked Benchmark:
+```
+seed: 6252; size: 100000000
+ ⏱ 2.04 ± 0.001 ms
+ ⚡ 2.04 ms 🐌 2.05 ms
+```","**H100 on Modal (secret) ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+"
