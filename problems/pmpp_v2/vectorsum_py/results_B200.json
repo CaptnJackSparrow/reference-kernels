@@ -1,0 +1,44 @@
+"**B200 on Modal ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+
+Running on:
+* GPU: `NVIDIA B200`
+* CPU: `GenuineIntel`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.39`
+* Torch: `2.11.0+cu129`
+* Hostname: `modal`
+
+
+## ✅ Passed 5/5 tests:
+```
+✅ seed: 4242; size: 1023
+✅ seed: 5236; size: 1024
+✅ seed: 1001; size: 1025
+✅ seed: 5531; size: 2048
+✅ seed: 9173; size: 4096```
+
+## Benchmarks:
+```
+seed: 12345; size: 52428800
+ ⏱ 54.7 ± 0.09 µs
+ ⚡ 53.6 µs 🐌 56.4 µs
+```
+
+## Ranked Benchmark:
+```
+seed: 12345; size: 52428800
+ ⏱ 54.8 ± 0.11 µs
+ ⚡ 53.9 µs 🐌 61.5 µs
+```","**B200 on Modal (secret) ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Compilation successful
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+"
